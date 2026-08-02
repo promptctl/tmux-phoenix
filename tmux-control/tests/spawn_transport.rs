@@ -220,36 +220,8 @@ fn nonexistent_binary_returns_an_error_not_a_panic() {
 // Live tmux integration
 // ---------------------------------------------------------------------------
 
-/// Isolated throw-away socket path + a guard that tears the session down via
-/// `kill-session` on drop.
-struct IsolatedTmux {
-    socket: String,
-    session: String,
-}
-
-impl IsolatedTmux {
-    fn new(name: &str) -> Self {
-        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
-        let session = format!("phoenix-test-{name}");
-        // Pre-create the session out-of-band (not through the transport
-        // under test) so `attach-session` below has something real to
-        // attach to, exactly like a daemon attaching to a live server.
-        let status = std::process::Command::new("tmux")
-            .args(["-S", &socket, "new-session", "-d", "-s", &session])
-            .status()
-            .expect("failed to run tmux new-session");
-        assert!(status.success(), "tmux new-session failed");
-        Self { socket, session }
-    }
-}
-
-impl Drop for IsolatedTmux {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
-            .args(["-S", &self.socket, "kill-session", "-t", &self.session])
-            .status();
-    }
-}
+mod support;
+use support::IsolatedTmux;
 
 /// A control client attached to the harness's session.
 fn attach(harness: &IsolatedTmux) -> SpawnTransport {
