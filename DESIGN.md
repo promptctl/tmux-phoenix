@@ -241,9 +241,18 @@ struct Pane    { index: PaneIndex, cwd: Utf8PathBuf,
   it for windows and panes; for sessions, capture enforces it (§5).
 - A single `active: WindowIndex` that must resolve to a member — not a per-child
   `bool` that could encode two-active-or-none (`[LAW:one-source-of-truth]`,
-  validated at parse time).
+  validated at parse time). Enforced by keeping `active` private on `Session`/
+  `Window` behind a validating `new()`, not just at construction time — public
+  fields would let a caller swap in a bad index afterward.
 - Every type here is phoenix-core's own (`Layout` included, not `tmux-control`'s), so
   the crate depends on nothing; capture's fold parses tmux's strings into them.
+
+**Implementation note:** this environment has no network access to fetch
+external crates (`cargo add` against crates.io stalls and times out), so
+`phoenix-core` is std-only, same as `tmux-control`. `OffsetDateTime` and
+`Utf8PathBuf` above are hand-rolled std-only stand-ins for `time`'s and
+`camino`'s types of the same name, not the external crates themselves.
+Revisit the stand-ins for the real crates if network access becomes available.
 
 ---
 
