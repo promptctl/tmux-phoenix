@@ -31,7 +31,7 @@ use phoenix_restore::{
     apply, default_rules_path, load_rules_file, plan, resolve_non_interactive, ApplyError,
 };
 use phoenix_store::{Store, StoreError};
-use tmux_control::{Client, SpawnOptions, SpawnTransport, TmuxError};
+use tmux_control::{socket_args, Client, SpawnOptions, SpawnTransport, TmuxError};
 
 const BOOTSTRAP_SESSION: &str = "phoenix-boot";
 
@@ -96,9 +96,7 @@ fn spawn_options(socket: Option<String>) -> SpawnOptions {
 /// doesn't need to make (either way, we're the one bootstrapping).
 fn count_existing_sessions(socket: Option<&str>) -> usize {
     let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.args(["-S", s]);
-    }
+    cmd.args(socket_args(socket));
     cmd.args(["list-sessions", "-F", "#{session_name}"]);
     match cmd.output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
@@ -111,9 +109,7 @@ fn count_existing_sessions(socket: Option<&str>) -> usize {
 
 fn run_tmux(socket: Option<&str>, args: &[&str]) -> std::io::Result<bool> {
     let mut cmd = Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.args(["-S", s]);
-    }
+    cmd.args(socket_args(socket));
     cmd.args(args);
     Ok(cmd.status()?.success())
 }

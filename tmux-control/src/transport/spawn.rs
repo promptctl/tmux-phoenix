@@ -49,18 +49,27 @@ enum State {
     Closed,
 }
 
+/// The socket-selector arguments alone (no `-C`, no user command): a path
+/// containing `/` is `-S <path>`, a bare name is `-L <name>`, `None` is no
+/// arguments at all. Public and reused by any caller that needs to talk to
+/// the *same* tmux server this transport would via a plain (non-control-mode)
+/// `tmux` invocation — e.g. `phoenix-daemon`'s pre-connect `list-sessions`
+/// check — so the socket-selection rule has exactly one implementation
+/// (`[LAW:one-source-of-truth]`) instead of being duplicated and risking the
+/// two copies drifting apart.
+pub fn socket_args(socket: Option<&str>) -> Vec<String> {
+    match socket {
+        None => Vec::new(),
+        Some(socket) if socket.contains('/') => vec!["-S".to_string(), socket.to_string()],
+        Some(socket) => vec!["-L".to_string(), socket.to_string()],
+    }
+}
+
 /// `-C` plus the socket selector plus the caller's own tmux command/args, in
 /// that order (mirrors the reference transport's `buildArgv`).
 fn build_argv(socket: Option<&str>, user_args: &[&str]) -> Vec<String> {
     let mut argv = vec!["-C".to_string()];
-    if let Some(socket) = socket {
-        if socket.contains('/') {
-            argv.push("-S".to_string());
-        } else {
-            argv.push("-L".to_string());
-        }
-        argv.push(socket.to_string());
-    }
+    argv.extend(socket_args(socket));
     argv.extend(user_args.iter().map(|s| s.to_string()));
     argv
 }
@@ -138,5 +147,60 @@ impl Transport for SpawnTransport {
 impl Drop for SpawnTransport {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_args_is_empty_for_no_socket() {
+        assert_eq!(socket_args(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn socket_args_uses_dash_l_for_a_bare_name() {
+        assert_eq!(
+            socket_args(Some("phoenix-verify")),
+            vec!["-L".to_string(), "phoenix-verify".to_string()]
+        );
+    }
+
+    #[test]
+    fn socket_args_uses_dash_s_for_a_path() {
+        assert_eq!(
+            socket_args(Some("/tmp/some/socket")),
+            vec!["-S".to_string(), "/tmp/some/socket".to_string()]
+        );
+    }
+
+    #[test]
+    fn socket_args_uses_dash_s_for_a_relative_path() {
+        assert_eq!(
+            socket_args(Some("./relative/socket")),
+            vec!["-S".to_string(), "./relative/socket".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_argv_has_no_socket_selector_when_socket_is_none() {
+        assert_eq!(
+            build_argv(None, &["list-sessions"]),
+            vec!["-C".to_string(), "list-sessions".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_argv_places_the_socket_selector_between_dash_c_and_user_args() {
+        assert_eq!(
+            build_argv(Some("phoenix-verify"), &["attach-session"]),
+            vec![
+                "-C".to_string(),
+                "-L".to_string(),
+                "phoenix-verify".to_string(),
+                "attach-session".to_string(),
+            ]
+        );
     }
 }
