@@ -3,10 +3,11 @@
 //! diagnostic goes to stderr, prefixed with the subcommand so `phoenix save`
 //! and `phoenix list` output can be told apart in a combined log.
 
+use std::io::{self, Write};
 use std::path::Path;
 
-use phoenix_core::Snapshot;
-use phoenix_restore::RestorePolicy;
+use phoenix_core::{CapturedProgram, Snapshot};
+use phoenix_restore::PaneLocation;
 use phoenix_store::Store;
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
@@ -155,9 +156,76 @@ fn load_snapshot(file: Option<&str>) -> Result<Snapshot, String> {
     }
 }
 
+/// tmux-permissions-16s's rules file is loaded best-effort: a missing/
+/// unreadable file is never fatal to `restore` itself (it just means every
+/// pane's relaunch decision starts from "ask", same as an empty ruleset
+/// would) — the whole point of the consent-gated ruleset is that it's an
+/// optional refinement on top of the always-safe cwd+shell default, not a
+/// dependency the core restore path needs to succeed.
+fn load_ruleset_for_restore() -> phoenix_restore::RuleSet {
+    match phoenix_restore::default_rules_path().and_then(|p| phoenix_restore::load_rules_file(&p)) {
+        Ok((ruleset, warnings)) => {
+            for warning in warnings {
+                eprintln!("phoenix restore: relaunch rules file: {warning}");
+            }
+            ruleset
+        }
+        Err(e) => {
+            eprintln!(
+                "phoenix restore: couldn't load relaunch rules ({e}); starting from an empty ruleset"
+            );
+            phoenix_restore::RuleSet::default()
+        }
+    }
+}
+
+/// The one place this crate reads stdin — everywhere else is either
+/// machine-parseable stdout or diagnostic stderr. Prompt text goes to
+/// stderr so piping `phoenix restore`'s stdout never captures prompt noise.
+/// EOF on stdin (not a real terminal — piped, redirected, backgrounded)
+/// falls back to `No` rather than looping forever: DESIGN.md §6's "never
+/// prompt-blocks" applies here too, not just to boot restore.
+fn interactive_ask(
+    location: &PaneLocation,
+    program: &CapturedProgram,
+) -> phoenix_restore::PromptChoice {
+    use phoenix_restore::PromptChoice;
+    let default = phoenix_restore::default_choice_for(&program.command);
+    let default_label = match default {
+        PromptChoice::AlwaysExact => "always-exact",
+        PromptChoice::AlwaysLike => "always-like",
+        PromptChoice::Once | PromptChoice::No => {
+            unreachable!("default_choice_for only returns AlwaysExact or AlwaysLike")
+        }
+    };
+    let cmdline = program.argv.join(" ");
+    loop {
+        eprint!(
+            "phoenix restore: relaunch {}:{}.{} ({cmdline})? [o]nce / [e]xact / [l]ike / [n]o (default: {default_label}) ",
+            location.session, location.window.0, location.pane.0
+        );
+        let _ = io::stderr().flush();
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => return PromptChoice::No,
+            Err(_) => return PromptChoice::No,
+            Ok(_) => {}
+        }
+        if input.trim().is_empty() {
+            return default;
+        }
+        match phoenix_restore::parse_prompt_choice(&input) {
+            Some(choice) => return choice,
+            None => eprintln!("phoenix restore: unrecognized choice {input:?}, try again"),
+        }
+    }
+}
+
 /// `--dry-run` prints exactly the tmux command lines that would run and
 /// executes nothing — DESIGN.md §6's safety property for a tool that can
-/// `send-keys` into live shells.
+/// `send-keys` into live shells. Dry-run never prompts either (it's meant
+/// to be safe to run non-interactively/in scripts): an `Ask` there is
+/// reported to stderr and resolved as `Skip`, the same as boot restore.
 pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) -> i32 {
     let snapshot = match load_snapshot(file.as_deref()) {
         Ok(s) => s,
@@ -167,7 +235,27 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
         }
     };
 
-    let restore_plan = phoenix_restore::plan(&snapshot, &RestorePolicy);
+    let mut ruleset = load_ruleset_for_restore();
+    let policy = if dry_run {
+        phoenix_restore::resolve_non_interactive(&snapshot, &ruleset, |location, program| {
+            eprintln!(
+                "phoenix restore: {}:{}.{} ({}) would need consent to relaunch; --dry-run never prompts, showing cwd+shell only",
+                location.session, location.window.0, location.pane.0, program.command
+            );
+        })
+    } else {
+        phoenix_restore::resolve_interactive(&snapshot, &mut ruleset, interactive_ask)
+    };
+
+    if !dry_run {
+        if let Err(e) = phoenix_restore::default_rules_path()
+            .and_then(|p| phoenix_restore::save_rules_file(&p, &ruleset))
+        {
+            eprintln!("phoenix restore: warning: failed to save learned relaunch rules: {e}");
+        }
+    }
+
+    let restore_plan = phoenix_restore::plan(&snapshot, &policy);
 
     if dry_run {
         // Render the whole plan before printing any of it: a plan holding an

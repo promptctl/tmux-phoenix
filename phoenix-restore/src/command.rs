@@ -91,6 +91,19 @@ pub enum PlanStep {
         window: WindowIndex,
         lines: Vec<String>,
     },
+    /// Relaunches a pane's captured program (tmux-permissions-16s: only for
+    /// panes the consent-gated ruleset resolved to `Restore` — see
+    /// `crate::permission`). Same current-pane targeting as `SplitWindow`/
+    /// `ReplayContent` and the same reason: no addressable pane index, so
+    /// this must be issued immediately after the pane's creation, right
+    /// after any `ReplayContent` for it (captured scrollback is shown first,
+    /// then the program that produced it is actually restarted on top —
+    /// same ordering tmux-resurrect used).
+    RelaunchProgram {
+        session: SessionName,
+        window: WindowIndex,
+        argv: Vec<String>,
+    },
 }
 
 impl From<TmuxCommand> for PlanStep {
@@ -189,6 +202,22 @@ impl TmuxCommand {
                 let target = window_target(session, *window);
                 CommandLine::new("select-window", ["-t", &target])
             }
+            TmuxCommand::RelaunchProgram {
+                session,
+                window,
+                argv,
+            } => {
+                let target = window_target(session, *window);
+                // What tmux types into the pane is parsed by a shell, not by
+                // tmux, so each captured word is shell-quoted inside the one
+                // argument tmux itself sees.
+                let shell_command = argv
+                    .iter()
+                    .map(|a| shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                CommandLine::new("send-keys", ["-t", &target, &shell_command, "Enter"])
+            }
         }
     }
 }
@@ -233,6 +262,40 @@ mod tests {
         assert_eq!(
             cmd.to_command_line().unwrap().as_str(),
             "new-window -t main:3 -n editor -c /proj"
+        );
+    }
+
+    #[test]
+    fn relaunch_program_sends_a_send_keys_targeting_the_current_pane() {
+        let cmd = TmuxCommand::RelaunchProgram {
+            session: SessionName::parse("main").unwrap(),
+            window: WindowIndex(1),
+            argv: vec!["vim".to_string(), "DESIGN.md".to_string()],
+        };
+        let rendered = cmd.to_command_line().unwrap();
+        assert!(rendered.as_str().starts_with("send-keys -t main:1 "));
+        assert!(rendered.as_str().ends_with(" Enter"));
+    }
+
+    #[test]
+    fn relaunch_program_preserves_spaces_within_a_single_argv_element() {
+        // A single captured argument containing a space (e.g. `grep "hello
+        // world" file.txt`) must reach the pane's shell as one word, not
+        // split into two by either layer of quoting.
+        let cmd = TmuxCommand::RelaunchProgram {
+            session: SessionName::parse("main").unwrap(),
+            window: WindowIndex(0),
+            argv: vec![
+                "grep".to_string(),
+                "hello world".to_string(),
+                "file.txt".to_string(),
+            ],
+        };
+        let rendered = cmd.to_command_line().unwrap();
+        assert!(
+            rendered.as_str().contains(r"'hello world'"),
+            "the argument should reach the shell single-quoted, in {:?}",
+            rendered.as_str()
         );
     }
 

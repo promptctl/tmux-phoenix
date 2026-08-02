@@ -5,18 +5,17 @@
 use phoenix_core::{Pane, Session, Snapshot, Window, WindowIndex};
 
 use crate::command::{PlanStep, TmuxCommand};
-use crate::policy::RestorePolicy;
+use crate::policy::{PaneLocation, RestorePolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlan {
     pub commands: Vec<PlanStep>,
 }
 
-/// `_policy` isn't read yet — see [`RestorePolicy`]'s doc comment for why.
-pub fn plan(snapshot: &Snapshot, _policy: &RestorePolicy) -> RestorePlan {
+pub fn plan(snapshot: &Snapshot, policy: &RestorePolicy) -> RestorePlan {
     let mut commands = Vec::new();
     for session in snapshot.sessions.iter() {
-        plan_session(session, &mut commands);
+        plan_session(session, policy, &mut commands);
     }
     RestorePlan { commands }
 }
@@ -41,7 +40,7 @@ fn panes_active_last(window: &Window) -> Vec<&Pane> {
     ordered
 }
 
-fn plan_session(session: &Session, commands: &mut Vec<PlanStep>) {
+fn plan_session(session: &Session, policy: &RestorePolicy, commands: &mut Vec<PlanStep>) {
     let mut windows = session.windows().iter();
     let first_window = windows
         .next()
@@ -66,15 +65,16 @@ fn plan_session(session: &Session, commands: &mut Vec<PlanStep>) {
         window: first_window.index(),
     }));
     // The implicit first pane is current right now, immediately after
-    // creation — the only moment `ReplayContent`'s "current pane" targeting
-    // can reach it (see its doc comment).
-    maybe_replay_content(
+    // creation — the only moment `ReplayContent`/`RelaunchProgram`'s
+    // "current pane" targeting can reach it (see their doc comments).
+    plan_pane_extras(
         session,
         first_window.index(),
         first_window_panes[0],
+        policy,
         commands,
     );
-    plan_remaining_panes(session, first_window, &first_window_panes, commands);
+    plan_remaining_panes(session, first_window, &first_window_panes, policy, commands);
 
     for window in windows {
         let window_panes = panes_active_last(window);
@@ -84,8 +84,8 @@ fn plan_session(session: &Session, commands: &mut Vec<PlanStep>) {
             name: window.name().clone(),
             cwd: window_panes[0].cwd.clone(),
         }));
-        maybe_replay_content(session, window.index(), window_panes[0], commands);
-        plan_remaining_panes(session, window, &window_panes, commands);
+        plan_pane_extras(session, window.index(), window_panes[0], policy, commands);
+        plan_remaining_panes(session, window, &window_panes, policy, commands);
     }
 
     commands.push(PlanStep::Command(TmuxCommand::SelectWindow {
@@ -101,6 +101,7 @@ fn plan_remaining_panes(
     session: &Session,
     window: &Window,
     ordered_panes: &[&Pane],
+    policy: &RestorePolicy,
     commands: &mut Vec<PlanStep>,
 ) {
     for pane in &ordered_panes[1..] {
@@ -112,7 +113,7 @@ fn plan_remaining_panes(
         // Still the current pane of `window` right after this split — see
         // `PlanStep::ReplayContent`'s doc comment for why this can't be
         // deferred to later.
-        maybe_replay_content(session, window.index(), pane, commands);
+        plan_pane_extras(session, window.index(), pane, policy, commands);
     }
 
     if ordered_panes.len() > 1 {
@@ -122,6 +123,23 @@ fn plan_remaining_panes(
             layout: window.layout().clone(),
         }));
     }
+}
+
+/// Everything that targets `pane` as the window's *current* pane, right
+/// after it was created: captured scrollback first (so it's visible history
+/// by the time the program that produced it, if any, gets relaunched on top
+/// — same ordering tmux-resurrect used), then a program relaunch
+/// (tmux-permissions-16s) if `policy` resolved this exact pane to
+/// `Restore`.
+fn plan_pane_extras(
+    session: &Session,
+    window: WindowIndex,
+    pane: &Pane,
+    policy: &RestorePolicy,
+    commands: &mut Vec<TmuxCommand>,
+) {
+    maybe_replay_content(session, window, pane, commands);
+    maybe_relaunch_program(session, window, pane, policy, commands);
 }
 
 /// Emits `ReplayContent` for `pane` if (and only if) it has captured
@@ -141,6 +159,33 @@ fn maybe_replay_content(
             session: session.name().clone(),
             window,
             lines: content.scrollback.clone(),
+        });
+    }
+}
+
+/// Emits `RelaunchProgram` for `pane` only if `policy.relaunch` names this
+/// exact `(session, window, pane index)` — the consent-gated ruleset
+/// (tmux-permissions-16s) already decided *which* panes qualify before
+/// `plan` ever ran (see `crate::permission::resolve_interactive`/
+/// `resolve_non_interactive`); `plan` itself makes no relaunch decisions,
+/// it only renders ones already made.
+fn maybe_relaunch_program(
+    session: &Session,
+    window: WindowIndex,
+    pane: &Pane,
+    policy: &RestorePolicy,
+    commands: &mut Vec<TmuxCommand>,
+) {
+    let location = PaneLocation {
+        session: session.name().clone(),
+        window,
+        pane: pane.index,
+    };
+    if let Some(argv) = policy.relaunch.get(&location) {
+        commands.push(TmuxCommand::RelaunchProgram {
+            session: session.name().clone(),
+            window,
+            argv: argv.clone(),
         });
     }
 }
@@ -191,7 +236,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         assert_eq!(
             plan.commands,
@@ -223,7 +271,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         let splits: Vec<_> = plan
             .commands
@@ -253,7 +304,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
         assert!(!plan
             .commands
             .iter()
@@ -273,7 +327,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         // new-session must not have swallowed the active pane's cwd as the
         // implicit first pane.
@@ -307,7 +364,10 @@ mod tests {
             WindowIndex(5),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         assert!(plan
             .commands
@@ -338,7 +398,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         for cmd in &plan.commands {
             let rendered = cmd.describe().unwrap();
@@ -358,7 +421,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
         assert!(!plan
             .commands
             .iter()
@@ -382,7 +448,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         // NewSession creates the one pane; ReplayContent must immediately
         // follow it (before anything else could shift "current" away).
@@ -431,7 +500,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::singleton(session)),
+            &RestorePolicy::default(),
+        );
 
         let replayed: Vec<&str> = plan
             .commands
@@ -483,7 +555,10 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(&snapshot(NonEmpty::new(s0, vec![s1])), &RestorePolicy);
+        let plan = plan(
+            &snapshot(NonEmpty::new(s0, vec![s1])),
+            &RestorePolicy::default(),
+        );
 
         let new_sessions: Vec<_> = plan
             .commands

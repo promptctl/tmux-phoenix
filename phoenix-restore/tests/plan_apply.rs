@@ -115,7 +115,7 @@ fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_live_server() {
         sessions: NonEmpty::singleton(session),
     };
 
-    let restore_plan = plan(&snapshot, &RestorePolicy);
+    let restore_plan = plan(&snapshot, &RestorePolicy::default());
     let outcome = apply(&mut client, &restore_plan).expect("apply failed");
     assert_eq!(
         outcome.executed + outcome.skipped_move_window,

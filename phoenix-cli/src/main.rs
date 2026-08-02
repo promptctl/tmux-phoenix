@@ -20,8 +20,11 @@ be fully recovered (the snapshot is still saved), 1 on failure.
 list: one saved generation per line on stdout, tab-separated
 (captured_at_unix, format_version, path), newest first.
 restore: rebuilds the latest (or --file) snapshot into a new tmux session,
-shell + cwd only — never blind-replays a captured program. --dry-run prints
-the exact tmux commands that would run and runs nothing.
+shell + cwd only by default — never blind-replays a captured program. May
+prompt once per pane whether to actually relaunch its captured program
+(once / always-exact / always-like / no); grants are remembered in
+${XDG_CONFIG_HOME}/tmux-phoenix/relaunch.rules. --dry-run never prompts and
+prints the exact tmux commands that would run without running them.
 daemon: runs foreground (for supervision, wrap this in a launchd/systemd
 unit). Saves once activity has been quiet for --debounce seconds, with a
 --max-interval backstop so long-idle sessions still checkpoint.

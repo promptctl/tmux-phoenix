@@ -333,6 +333,59 @@ it. No separate policy toggle — a pane with captured content always gets repla
 one with `content: None` is simply left as a fresh idle shell, unchanged from the
 "cwd + shell only" default.
 
+**Consent-gated program relaunch (tmux-permissions-16s):** the ruleset
+(`phoenix-restore::permission`) is a `Vec<Rule>` of `Matcher` (`Exact` — a pane's
+argv rejoined with single spaces, an opaque comparison key that's never re-split
+back into arguments — or `Basename`, tmux's own `pane_current_command`) + `Verdict`
+(`Restore`/`Skip`), resolved to `Restore`/`Skip`/`Ask` by a pure function
+(`RuleSet::resolve`); an `Exact` rule always wins over a `Basename` one. A pane
+with empty `argv` (best-effort `ps` recovery failed for it) always resolves to
+`Skip`, before any rule is even consulted — there's no known command to relaunch,
+let alone ask about. Deciding happens entirely *before* `plan` runs (`plan` stays
+pure): `resolve_interactive`/`resolve_non_interactive` walk the snapshot and build
+a `RestorePolicy { relaunch: HashMap<PaneLocation, Vec<String>> }`, keyed by the
+snapshot's own captured `(session, window index, pane index)` rather than
+`PaneId` — the stable identity available at decision time regardless of whether
+content capture ran, since `plan` never targets a pane by index on the *target*
+server either way (see `panes_active_last` above). `TmuxCommand::RelaunchProgram`
+renders directly (unlike `ReplayContent`, it needs no temp file — the argv is
+shell-quoted element-by-element and joined, so an argument containing spaces
+round-trips as one shell word) and is interleaved right after `ReplayContent` for
+the same pane, so captured history is visible before the program that produced it
+is restarted on top (same ordering tmux-resurrect used).
+
+Interactively (`phoenix restore`, not `--dry-run`): an `Ask` prints the pane's
+location and command line to stderr and reads one line from stdin — `once` /
+`always-exact` / `always-like` / `no` (letters or full words, case-insensitive), a
+blank line picks the default. A recognized interpreter's basename (`python`,
+`bash`, `node`, …) defaults to `always-exact`, not `always-like` — granting "always
+relaunch any `python` invocation" is a much wider consent than one script's
+argument, so reaching that grant requires deliberately typing it rather than just
+hitting Enter; anything else defaults to `always-like`. `once` resolves that pane
+only; `always-*` additionally appends a new `Restore` rule and the whole ruleset is
+re-saved after the restore's decisions are made. EOF on stdin (piped/redirected,
+not a real terminal) falls back to `no` rather than blocking forever — the same
+"never prompt-blocks" property boot restore has, extended to the interactive path
+too. `--dry-run` never prompts either, for the same reason: an `Ask` there is
+reported to stderr and resolved as `Skip`, so it stays safe to run
+non-interactively.
+
+Non-interactively (boot restore, `phoenix-daemon`'s `connect_and_boot`): an
+already-learned rule is still honored (verified live — `tmux-daemon-b0h.3`'s test
+suite gained a case proving a granted program actually relaunches on boot), but an
+`Ask` never prompts (there's nobody to ask) — it falls straight to `Skip` and is
+reported through the daemon's existing `on_log` line, never silently escalated to
+`Restore`. Loading the rules file is best-effort everywhere it's used: a
+missing/unreadable file (or one with some malformed lines) is never fatal to a
+restore — it just means every undecided pane falls to `Ask`'s safe default, same as
+an empty ruleset would; malformed lines are reported but don't drop the rest of the
+file's valid rules. Rules persist as one human-editable file
+(`${XDG_CONFIG_HOME}/tmux-phoenix/relaunch.rules`, config rather than
+`phoenix-store`'s data directory since this one is meant to be hand-edited): one
+line per rule, `<restore|skip> <exact|basename> <value>`, `value` unsplit after the
+second space so an `Exact` value's internal spacing round-trips exactly; written
+with the same temp+rename atomicity `phoenix-store` uses for its own files.
+
 ---
 
 ## 7. Persistence

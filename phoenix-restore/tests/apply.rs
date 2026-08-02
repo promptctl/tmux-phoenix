@@ -10,7 +10,7 @@ use phoenix_core::{
     CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneContent, PaneId,
     PaneIndex, Session, SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
-use phoenix_restore::{apply, plan, RestorePolicy};
+use phoenix_restore::{apply, plan, PaneLocation, RestorePolicy};
 
 fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
@@ -63,7 +63,7 @@ fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
         sessions: NonEmpty::singleton(session),
     };
 
-    let restore_plan = plan(&snapshot, &RestorePolicy);
+    let restore_plan = plan(&snapshot, &RestorePolicy::default());
     let outcome = apply(&mut client, &restore_plan).expect("apply failed");
     assert_eq!(
         outcome.executed + outcome.skipped_move_window,
@@ -140,7 +140,7 @@ fn apply_replays_each_panes_captured_content_distinctly() {
         sessions: NonEmpty::singleton(session),
     };
 
-    let restore_plan = plan(&snapshot, &RestorePolicy);
+    let restore_plan = plan(&snapshot, &RestorePolicy::default());
     apply(&mut client, &restore_plan).expect("apply failed");
 
     // Give the shells a moment to actually run their `cat` before capturing.
@@ -184,6 +184,118 @@ fn apply_replays_each_panes_captured_content_distinctly() {
 
     client
         .execute(&line("kill-session", ["-t", "restored-content"]))
+        .expect("cleanup kill-session failed");
+    client.close();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn apply_relaunches_only_the_pane_the_policy_names() {
+    let harness = IsolatedTmux::new("restore-apply-relaunch");
+    let mut client = connect(&harness);
+
+    let base = std::env::temp_dir().join(format!(
+        "phoenix-restore-apply-relaunch-live-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let base = base.canonicalize().unwrap();
+
+    let mut pane_a = pane(0, base.to_str().unwrap());
+    pane_a.program = CapturedProgram::new(
+        "echo",
+        vec![
+            "echo".to_string(),
+            "DISTINCTIVE-RELAUNCH-MARKER".to_string(),
+        ],
+    );
+    let pane_b = pane(1, base.to_str().unwrap());
+
+    let panes = NonEmpty::new(pane_a, vec![pane_b]);
+    let window = Window::new(
+        WindowIndex(0),
+        WindowName::parse("shell").unwrap(),
+        Layout::parse("c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]").unwrap(),
+        panes,
+        PaneIndex(0),
+    )
+    .unwrap();
+    let session = Session::new(
+        SessionName::parse("restored-relaunch").unwrap(),
+        NonEmpty::singleton(window),
+        WindowIndex(0),
+    )
+    .unwrap();
+    let snapshot = Snapshot {
+        format_version: FormatVersion::CURRENT,
+        tmux_version: TmuxVersion { major: 3, minor: 5 },
+        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
+        sessions: NonEmpty::singleton(session),
+    };
+
+    // Only pane 0 (the "echo" one) is named in the policy — pane 1 must
+    // stay a plain idle shell, proving the consent-gated grant is per-pane,
+    // not "relaunch every captured program."
+    let mut relaunch = std::collections::HashMap::new();
+    relaunch.insert(
+        PaneLocation {
+            session: SessionName::parse("restored-relaunch").unwrap(),
+            window: WindowIndex(0),
+            pane: PaneIndex(0),
+        },
+        vec![
+            "echo".to_string(),
+            "DISTINCTIVE-RELAUNCH-MARKER".to_string(),
+        ],
+    );
+    let policy = RestorePolicy { relaunch };
+
+    let restore_plan = plan(&snapshot, &policy);
+    assert_eq!(
+        restore_plan
+            .commands
+            .iter()
+            .filter(|c| matches!(c, phoenix_restore::TmuxCommand::RelaunchProgram { .. }))
+            .count(),
+        1,
+        "exactly one pane was granted a relaunch"
+    );
+    apply(&mut client, &restore_plan).expect("apply failed");
+
+    // The granted pane (snapshot index 0) was also the *active* one, so
+    // `panes_active_last` splits it last — its target-side pane index isn't
+    // necessarily 0 (this crate never targets panes by index at all, see
+    // `panes_active_last`'s doc comment). Enumerate live pane indices
+    // instead of assuming one, same as the content-replay test above.
+    let mut found_marker = false;
+    for _ in 0..30 {
+        let panes_out = client
+            .execute("list-panes -t restored-relaunch:0 -F '#{pane_index}'")
+            .unwrap();
+        let mut all_text = String::new();
+        for line in &panes_out.lines {
+            let idx = String::from_utf8_lossy(line);
+            let out = client
+                .execute(&format!("capture-pane -p -t 'restored-relaunch:0.{idx}'"))
+                .unwrap();
+            for line in &out.lines {
+                all_text.push_str(&String::from_utf8_lossy(line));
+                all_text.push('\n');
+            }
+        }
+        if all_text.contains("DISTINCTIVE-RELAUNCH-MARKER") {
+            found_marker = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        found_marker,
+        "the granted pane's program should have actually run"
+    );
+
+    client
+        .execute("kill-session -t restored-relaunch")
         .expect("cleanup kill-session failed");
     client.close();
     let _ = std::fs::remove_dir_all(&base);
