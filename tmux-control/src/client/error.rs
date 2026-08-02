@@ -1,9 +1,11 @@
 use crate::client::ConnectionState;
 use crate::protocol::Guard;
+use crate::version::TmuxVersion;
 use std::fmt;
 use std::io;
 
-/// Everything `Client::execute`/`connect`/`reconnect` can fail with.
+/// Everything `Client::execute`/`connect`/`reconnect`, and the free
+/// functions in [`crate::commands`], can fail with.
 #[derive(Debug)]
 pub enum TmuxError {
     /// `execute()` was called while `Client::state()` wasn't `Ready` — a
@@ -27,6 +29,17 @@ pub enum TmuxError {
     /// leaving it open forever; this is that failure made observable to
     /// the caller who was waiting on it.
     Protocol { command_number: u32, line: Vec<u8> },
+    /// An operation requires a tmux version newer than the connected
+    /// server's (IMPL.md §2.2) — a typed precondition failure instead of
+    /// tmux's raw `%error` for an unrecognized flag.
+    UnsupportedTmuxVersion {
+        operation: String,
+        required: TmuxVersion,
+        have: TmuxVersion,
+    },
+    /// [`crate::commands::query_tmux_version`]'s reply didn't contain a
+    /// recognizable `<major>.<minor>` version string.
+    VersionProbeFailed { output: Vec<Vec<u8>> },
 }
 
 impl fmt::Display for TmuxError {
@@ -54,6 +67,27 @@ impl fmt::Display for TmuxError {
                     f,
                     "malformed guard terminator for command {command_number}: {}",
                     String::from_utf8_lossy(line)
+                )
+            }
+            TmuxError::UnsupportedTmuxVersion {
+                operation,
+                required,
+                have,
+            } => {
+                write!(
+                    f,
+                    "{operation} requires tmux {}.{}+, connected server is {}.{}",
+                    required.major, required.minor, have.major, have.minor
+                )
+            }
+            TmuxError::VersionProbeFailed { output } => {
+                write!(
+                    f,
+                    "could not determine tmux version from reply: {:?}",
+                    output
+                        .iter()
+                        .map(|l| String::from_utf8_lossy(l))
+                        .collect::<Vec<_>>()
                 )
             }
         }

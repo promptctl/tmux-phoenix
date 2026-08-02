@@ -6,12 +6,16 @@
 //! transport, and a correlation client.
 
 pub mod client;
+pub mod commands;
 pub mod protocol;
 pub mod transport;
+pub mod version;
 
 pub use client::{Client, CloseReason, CommandOutput, ConnectionState, TmuxError};
+pub use commands::PaneAction;
 pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
     SessionId, WindowId,
 };
 pub use transport::{SpawnOptions, SpawnTransport, Transport};
+pub use version::{TmuxVersion, MIN_TMUX_VERSION};
