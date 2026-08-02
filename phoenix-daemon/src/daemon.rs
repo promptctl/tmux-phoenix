@@ -10,6 +10,7 @@ use phoenix_core::Snapshot;
 use phoenix_store::{SaveOutcome, Store};
 use tmux_control::{Client, ServerMessage, TmuxError, Transport};
 
+use crate::boot::connect_and_boot;
 use crate::debounce::{DebouncePolicy, DebounceState};
 
 /// The structure-change indicator subscribed to (DESIGN.md §8's "structure
@@ -83,6 +84,21 @@ fn capture_and_save<T: Transport>(
     Ok((snapshot, outcome))
 }
 
+/// Whether `e` means the connection itself is gone (tmux exited, the pipe
+/// broke) rather than just this one command failing — the distinction
+/// `run`'s heartbeat handling needs to stop hammering a dead transport with
+/// the same error every poll cycle and hand control back to
+/// [`run_resilient`] instead.
+fn is_connection_dead(e: &TmuxError) -> bool {
+    matches!(
+        e,
+        TmuxError::Send(_)
+            | TmuxError::Read(_)
+            | TmuxError::TransportClosed
+            | TmuxError::NotReady(_)
+    )
+}
+
 /// Runs until `should_continue` returns `false` (checked once per poll
 /// cycle — a test-friendly hook for bounded runs; real callers pass
 /// `|| true` and rely on the process being killed to stop). Sets
@@ -125,7 +141,17 @@ pub fn run<T: Transport>(
 
     while should_continue() {
         if let Err(e) = client.execute("display-message -p \"\"") {
-            on_error(&DaemonError::Tmux(e));
+            let fatal = is_connection_dead(&e);
+            let err = DaemonError::Tmux(e);
+            on_error(&err);
+            if fatal {
+                // No point looping on a dead transport, spamming on_error
+                // every poll cycle forever — hand it back to the caller
+                // (DESIGN.md §8: "if tmux isn't running the connection
+                // sits in Closed/Reconnecting" — reconnecting is
+                // `run_resilient`'s job, not this loop's).
+                return Err(err);
+            }
         } else {
             let activity = client
                 .drain_notifications()
@@ -150,4 +176,140 @@ pub fn run<T: Transport>(
     }
 
     Ok(())
+}
+
+/// Runs indefinitely (until `should_continue` returns `false`), reconnecting
+/// — including boot restore — whenever the connection is lost or was never
+/// established in the first place. DESIGN.md §8: "Independent of the tmux
+/// server — if tmux isn't running the connection sits in
+/// `Closed`/`Reconnecting` and the daemon idles." A service-supervised
+/// daemon can start before the user has ever touched tmux, or keep running
+/// across a tmux server restart; it must not just exit and leave recovery
+/// entirely to launchd/systemd respawning the whole process.
+///
+/// Concretely typed to `tmux_control::SpawnTransport` (unlike [`run`], generic over any
+/// `Transport` for testability) because reconnecting means spawning a brand
+/// new `tmux -C` process, which is [`crate::boot::connect_and_boot`]'s job
+/// and that function is itself concrete for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct RunConfig {
+    pub policy: DebouncePolicy,
+    pub poll_interval: Duration,
+    pub reconnect_interval: Duration,
+    pub keep_generations: usize,
+}
+
+pub fn run_resilient(
+    socket: Option<String>,
+    store: &Store,
+    config: &RunConfig,
+    mut on_log: impl FnMut(&str),
+    mut should_continue: impl FnMut() -> bool,
+) {
+    while should_continue() {
+        match connect_and_boot(socket.clone(), store, &mut on_log) {
+            Ok(mut client) => {
+                on_log("connected");
+                let result = run(
+                    &mut client,
+                    store,
+                    &config.policy,
+                    config.poll_interval,
+                    config.keep_generations,
+                    |e| on_log(&format!("save cycle error: {e}")),
+                    &mut should_continue,
+                );
+                client.close();
+                if let Err(e) = result {
+                    on_log(&format!("connection lost ({e}); will retry"));
+                }
+            }
+            Err(e) => on_log(&format!("could not connect ({e}); will retry")),
+        }
+
+        if should_continue() {
+            std::thread::sleep(config.reconnect_interval);
+        }
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io;
+
+    struct DeadTransport;
+
+    impl Transport for DeadTransport {
+        fn send(&mut self, _command: &str) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "dead"))
+        }
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn a_dead_transport_makes_run_return_promptly_instead_of_looping_forever() {
+        let mut client = Client::new(DeadTransport);
+        let policy = DebouncePolicy {
+            debounce: Duration::from_secs(3600),
+            max_interval: Duration::from_secs(3600),
+        };
+        let store = {
+            let dir = std::env::temp_dir().join(format!(
+                "phoenix-daemon-dead-transport-test-{}",
+                std::process::id()
+            ));
+            Store::new(dir)
+        };
+
+        let error_count = RefCell::new(0);
+        let result = run(
+            &mut client,
+            &store,
+            &policy,
+            Duration::from_millis(1),
+            5,
+            |_e| *error_count.borrow_mut() += 1,
+            || true, // would spin forever if `run` didn't return on a dead connection
+        );
+
+        assert!(
+            result.is_err(),
+            "a dead transport should surface as an error, not loop silently"
+        );
+        assert!(
+            *error_count.borrow() <= 1,
+            "a dead connection should be reported once and returned, not spammed every poll cycle"
+        );
+    }
+
+    #[test]
+    fn detects_every_connection_dead_variant() {
+        assert!(is_connection_dead(&TmuxError::Send(io::Error::other("x"))));
+        assert!(is_connection_dead(&TmuxError::Read(io::Error::other("x"))));
+        assert!(is_connection_dead(&TmuxError::TransportClosed));
+        assert!(is_connection_dead(&TmuxError::NotReady(
+            tmux_control::ConnectionState::Closed {
+                reason: tmux_control::CloseReason::TransportError
+            }
+        )));
+    }
+
+    #[test]
+    fn command_level_failures_are_not_connection_dead() {
+        use tmux_control::protocol::Guard;
+        let guard = Guard {
+            timestamp: 0,
+            command_number: 1,
+            flags: 0,
+        };
+        assert!(!is_connection_dead(&TmuxError::Command {
+            guard,
+            lines: vec![b"nope".to_vec()],
+        }));
+    }
 }

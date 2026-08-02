@@ -219,14 +219,13 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
 
 /// Runs foreground (DESIGN.md §8: "`phoenix daemon` runs it foreground for
 /// debugging"); a service-supervised background run is `tmux-daemon-b0h.3`'s
-/// job (writing the launchd/systemd unit that invokes this same
-/// subcommand), not a separate code path here. Never returns on success —
-/// only exits on a fatal setup failure (can't connect, can't boot-restore,
-/// can't set `no-output`/subscribe); a single save cycle failing is logged
-/// to stderr and the daemon keeps running (`phoenix_daemon::run`'s own
-/// contract). Boot restore (`phoenix_daemon::connect_and_boot`) runs before
-/// the save loop starts — DESIGN.md §8: apply `latest` only if the server
-/// had no sessions at all, never touching an already-live one.
+/// `install`-generated unit invoking this same subcommand, not a separate
+/// code path here. Never returns — `phoenix_daemon::run_resilient` reconnects
+/// (including boot restore) whenever the connection is lost or was never
+/// established in the first place, so tmux not being up yet (or going away
+/// mid-run) doesn't end the process; only `phoenix daemon` itself being
+/// killed does. A single save cycle failing is logged to stderr and the
+/// daemon keeps running.
 pub fn run_daemon(
     keep: usize,
     debounce_secs: u64,
@@ -240,36 +239,75 @@ pub fn run_daemon(
             return EXIT_FAIL;
         }
     };
-    let mut client = match phoenix_daemon::connect_and_boot(socket, &store, |line| {
-        eprintln!("phoenix daemon: {line}")
-    }) {
-        Ok(c) => c,
+
+    let config = phoenix_daemon::RunConfig {
+        policy: phoenix_daemon::DebouncePolicy {
+            debounce: std::time::Duration::from_secs(debounce_secs),
+            max_interval: std::time::Duration::from_secs(max_interval_secs),
+        },
+        poll_interval: std::time::Duration::from_secs(1),
+        reconnect_interval: std::time::Duration::from_secs(5),
+        keep_generations: keep,
+    };
+
+    phoenix_daemon::run_resilient(
+        socket,
+        &store,
+        &config,
+        |line| eprintln!("phoenix daemon: {line}"),
+        || true,
+    );
+
+    EXIT_OK
+}
+
+/// Writes a launchd/systemd service definition and prints the command to
+/// activate it — never runs that command itself (DESIGN.md §8/§9: starting a
+/// persistent, reboot-surviving background process is the user's call, not
+/// a side effect of writing a config file).
+pub fn run_install(keep: usize, debounce_secs: u64, max_interval_secs: u64) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("phoenix daemon: boot failed: {e}");
+            eprintln!("phoenix install: couldn't determine this binary's path: {e}");
+            return EXIT_FAIL;
+        }
+    };
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => {
+            eprintln!("phoenix install: HOME is not set");
             return EXIT_FAIL;
         }
     };
 
-    let policy = phoenix_daemon::DebouncePolicy {
-        debounce: std::time::Duration::from_secs(debounce_secs),
-        max_interval: std::time::Duration::from_secs(max_interval_secs),
+    let plan = match crate::install::plan_for_this_platform(
+        &exe,
+        &home,
+        keep,
+        debounce_secs,
+        max_interval_secs,
+    ) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                    "phoenix install: unsupported platform (only macOS launchd and Linux systemd --user are supported)"
+                );
+            return EXIT_FAIL;
+        }
     };
 
-    let result = phoenix_daemon::run(
-        &mut client,
-        &store,
-        &policy,
-        std::time::Duration::from_secs(1),
-        keep,
-        |e| eprintln!("phoenix daemon: save cycle failed: {e}"),
-        || true,
-    );
-    client.close();
-
-    match result {
-        Ok(()) => EXIT_OK,
+    match crate::install::write(&plan) {
+        Ok(()) => {
+            println!("wrote {}", plan.file_path.display());
+            println!("to enable now: {}", plan.enable_hint);
+            EXIT_OK
+        }
         Err(e) => {
-            eprintln!("phoenix daemon: {e}");
+            eprintln!(
+                "phoenix install: failed to write {}: {e}",
+                plan.file_path.display()
+            );
             EXIT_FAIL
         }
     }

@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod install;
 
 use cli::Command;
 
@@ -11,6 +12,7 @@ USAGE:
     phoenix list
     phoenix restore [--dry-run] [--file PATH] [--socket PATH]
     phoenix daemon [--keep N] [--debounce SECS] [--max-interval SECS] [--socket PATH]
+    phoenix install [--keep N] [--debounce SECS] [--max-interval SECS]
     phoenix --help
 
 save: exit 0 on a clean save, 3 if some pane's foreground program couldn't
@@ -22,7 +24,10 @@ shell + cwd only — never blind-replays a captured program. --dry-run prints
 the exact tmux commands that would run and runs nothing.
 daemon: runs foreground (for supervision, wrap this in a launchd/systemd
 unit). Saves once activity has been quiet for --debounce seconds, with a
---max-interval backstop so long-idle sessions still checkpoint.";
+--max-interval backstop so long-idle sessions still checkpoint.
+install: writes a launchd user agent (macOS) or systemd --user unit (Linux)
+that runs \"phoenix daemon\", and prints the command to activate it. Never
+activates the service itself.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -53,6 +58,11 @@ fn main() {
             max_interval_secs,
             socket,
         } => commands::run_daemon(keep, debounce_secs, max_interval_secs, socket),
+        Command::Install {
+            keep,
+            debounce_secs,
+            max_interval_secs,
+        } => commands::run_install(keep, debounce_secs, max_interval_secs),
     };
 
     std::process::exit(code);

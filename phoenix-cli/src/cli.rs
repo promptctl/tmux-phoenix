@@ -25,6 +25,11 @@ pub enum Command {
         max_interval_secs: u64,
         socket: Option<String>,
     },
+    Install {
+        keep: usize,
+        debounce_secs: u64,
+        max_interval_secs: u64,
+    },
     Help,
 }
 
@@ -39,9 +44,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         }
         Some("restore") => parse_restore(&args[1..]),
         Some("daemon") => parse_daemon(&args[1..]),
+        Some("install") => parse_install(&args[1..]),
         Some("--help") | Some("-h") | None => Ok(Command::Help),
         Some(other) => Err(format!(
-            "unknown subcommand {other:?} (try \"save\", \"list\", \"restore\", or \"daemon\")"
+            "unknown subcommand {other:?} (try \"save\", \"list\", \"restore\", \"daemon\", or \"install\")"
         )),
     }
 }
@@ -139,6 +145,49 @@ fn parse_daemon(args: &[String]) -> Result<Command, String> {
         debounce_secs,
         max_interval_secs,
         socket,
+    })
+}
+
+/// No `--socket`: the generated service invokes plain `phoenix daemon`
+/// (default tmux socket), matching how a user runs it interactively.
+/// `--socket` is a testing/multi-server override, not a fit for a
+/// once-and-for-all-time installed service definition.
+fn parse_install(args: &[String]) -> Result<Command, String> {
+    let mut keep = DEFAULT_KEEP_GENERATIONS;
+    let mut debounce_secs = DEFAULT_DEBOUNCE_SECS;
+    let mut max_interval_secs = DEFAULT_MAX_INTERVAL_SECS;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--keep" => {
+                i += 1;
+                let value = args.get(i).ok_or("--keep requires a value")?;
+                keep = value
+                    .parse()
+                    .map_err(|_| format!("--keep: {value:?} is not a non-negative integer"))?;
+            }
+            "--debounce" => {
+                i += 1;
+                let value = args.get(i).ok_or("--debounce requires a value")?;
+                debounce_secs = value
+                    .parse()
+                    .map_err(|_| format!("--debounce: {value:?} is not a non-negative integer"))?;
+            }
+            "--max-interval" => {
+                i += 1;
+                let value = args.get(i).ok_or("--max-interval requires a value")?;
+                max_interval_secs = value.parse().map_err(|_| {
+                    format!("--max-interval: {value:?} is not a non-negative integer")
+                })?;
+            }
+            other => return Err(format!("install: unknown argument {other:?}")),
+        }
+        i += 1;
+    }
+    Ok(Command::Install {
+        keep,
+        debounce_secs,
+        max_interval_secs,
     })
 }
 
@@ -296,5 +345,48 @@ mod tests {
     #[test]
     fn daemon_rejects_unknown_flags() {
         assert!(parse_args(&args(&["daemon", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn bare_install_uses_defaults() {
+        assert_eq!(
+            parse_args(&args(&["install"])).unwrap(),
+            Command::Install {
+                keep: DEFAULT_KEEP_GENERATIONS,
+                debounce_secs: DEFAULT_DEBOUNCE_SECS,
+                max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn install_with_all_flags() {
+        assert_eq!(
+            parse_args(&args(&[
+                "install",
+                "--keep",
+                "3",
+                "--debounce",
+                "5",
+                "--max-interval",
+                "120"
+            ]))
+            .unwrap(),
+            Command::Install {
+                keep: 3,
+                debounce_secs: 5,
+                max_interval_secs: 120,
+            }
+        );
+    }
+
+    #[test]
+    fn install_rejects_a_socket_flag() {
+        assert!(parse_args(&args(&["install", "--socket", "/tmp/s"])).is_err());
+    }
+
+    #[test]
+    fn install_rejects_unknown_flags() {
+        assert!(parse_args(&args(&["install", "--nope"])).is_err());
     }
 }

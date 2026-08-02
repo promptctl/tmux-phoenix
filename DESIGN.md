@@ -438,6 +438,24 @@ torn down by reconnecting onto a real restored session first (closing the old
 transport just *detaches*; the bootstrap session survives that, unattended), then
 killing the now-unattended bootstrap session from a fresh connection.
 
+**Resilience and install implementation notes (tmux-daemon-b0h.3):** `phoenix
+daemon` never exits just because tmux went away or was never up in the first
+place — `phoenix_daemon::run_resilient` wraps the one-connection `run` loop above
+in an outer reconnect loop (`connect_and_boot` again, so a reconnect after tmux
+comes back is itself a boot restore), sleeping `reconnect_interval` between
+attempts. A connection is distinguished from a mere command failure by
+`is_connection_dead` (`TmuxError::{Send,Read,TransportClosed,NotReady}`), so a
+one-off command error doesn't get treated as the server dying. `phoenix install`
+(`phoenix-cli/src/install.rs`) writes the launchd plist / systemd unit but
+deliberately never runs `launchctl load`/`systemctl --user enable` itself — it
+prints the exact command and leaves activating a persistent, reboot-surviving
+background process to the user. The generated unit's `ExecStart`/`ProgramArguments`
+embeds `std::env::current_exe()`'s absolute path rather than relying on `phoenix`
+being on `$PATH` inside the constrained launchd/systemd environment. Plan
+construction (which file, what content) is kept pure and unit-tested; only the
+final `fs::write` is effectful, verified live on this (macOS) machine with
+`plutil -lint` against the actual generated plist.
+
 ---
 
 ## 9. CLI, failure philosophy, milestones
