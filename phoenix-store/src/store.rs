@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 
 use phoenix_core::Snapshot;
 
+use crate::blob_store::BlobStore;
 use crate::error::StoreError;
 use crate::header::{decode_file, decode_header, encode_file};
 
 const GENERATION_PREFIX: &str = "snapshot-";
 const GENERATION_SUFFIX: &str = ".phnx";
 const LATEST_NAME: &str = "latest";
+const BLOBS_DIR: &str = "blobs";
 
 /// Deletions [`Store::prune`] made, and ones it tried and failed to make.
 type PruneResult = (Vec<PathBuf>, Vec<(PathBuf, io::Error)>);
@@ -78,6 +80,14 @@ impl Store {
         self.dir.join(LATEST_NAME)
     }
 
+    /// Content blobs (tmux-content-dos.2) live in their own subdirectory,
+    /// shared across every generation in this store — that sharing is the
+    /// whole point of content-addressing (an unchanged pane's scrollback
+    /// blob is written once and referenced by every generation that has it).
+    fn blob_store(&self) -> BlobStore {
+        BlobStore::new(self.dir.join(BLOBS_DIR))
+    }
+
     /// Save `snapshot`, then prune down to `keep_generations` (the newest
     /// `keep_generations` files survive; `0` means "keep only this one").
     pub fn save(
@@ -93,7 +103,7 @@ impl Store {
             .dir
             .join(format!(".tmp-save-{}-{generation}", std::process::id()));
 
-        let bytes = encode_file(snapshot);
+        let bytes = encode_file(snapshot, &self.blob_store())?;
         {
             let mut f = fs::File::create(&tmp_path)?;
             io::Write::write_all(&mut f, &bytes)?;
@@ -148,17 +158,17 @@ impl Store {
                 StoreError::Io(e)
             }
         })?;
-        decode_file(&bytes)
+        decode_file(&bytes, &self.blob_store())
     }
 
     /// Loads a specific generation file directly by path — for `restore
-    /// --file <path>` (DESIGN.md §9), independent of this store's own
-    /// `latest`/generation bookkeeping. Not a method on a particular
-    /// generation since the path need not even be inside this store's `dir`
-    /// (e.g. a snapshot copied in from elsewhere).
-    pub fn load_file(path: &Path) -> Result<Snapshot, StoreError> {
+    /// --file <path>` (DESIGN.md §9). `path` need not be this store's own
+    /// `latest` (e.g. an older, already-pruned generation), but its content
+    /// blobs (tmux-content-dos.2) are still resolved against *this* store's
+    /// blob directory, since a bare generation file has no blobs of its own.
+    pub fn load_file(&self, path: &Path) -> Result<Snapshot, StoreError> {
         let bytes = fs::read(path)?;
-        decode_file(&bytes)
+        decode_file(&bytes, &self.blob_store())
     }
 
     /// Every generation's id, newest first.
@@ -298,7 +308,7 @@ mod tests {
         let snapshot = snapshot_at(1_700_000_000);
 
         let outcome = store.save(&snapshot, 5).unwrap();
-        let loaded = Store::load_file(&outcome.path).unwrap();
+        let loaded = store.load_file(&outcome.path).unwrap();
         assert_eq!(loaded, snapshot);
     }
 

@@ -52,31 +52,6 @@ impl Writer {
             write_item(self, item);
         }
     }
-
-    /// Like [`Self::write_vec`], but for a known-length iterator rather than
-    /// a slice — `phoenix_core::NonEmpty<T>` exposes `iter()` + `len()`, not
-    /// `as_slice()`.
-    pub fn write_seq<T>(
-        &mut self,
-        len: usize,
-        items: impl Iterator<Item = T>,
-        mut write_item: impl FnMut(&mut Self, T),
-    ) {
-        self.write_u32(len as u32);
-        for item in items {
-            write_item(self, item);
-        }
-    }
-
-    pub fn write_option<T>(&mut self, item: &Option<T>, mut write_some: impl FnMut(&mut Self, &T)) {
-        match item {
-            None => self.write_u8(0),
-            Some(v) => {
-                self.write_u8(1);
-                write_some(self, v);
-            }
-        }
-    }
 }
 
 pub struct Reader<'a> {
@@ -135,17 +110,6 @@ impl<'a> Reader<'a> {
         (0..len).map(|_| read_item(self)).collect()
     }
 
-    pub fn read_option<T>(
-        &mut self,
-        read_some: impl FnOnce(&mut Self) -> Result<T, StoreError>,
-    ) -> Result<Option<T>, StoreError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(read_some(self)?)),
-            value => Err(StoreError::InvalidOptionTag { value }),
-        }
-    }
-
     /// Everything not yet consumed — used to confirm a decode consumed
     /// exactly the body, no more and no less.
     pub fn remaining(&self) -> &'a [u8] {
@@ -164,8 +128,7 @@ mod tests {
         w.write_u32(0xdead_beef);
         w.write_i64(-12345);
         w.write_str("hello");
-        w.write_option(&Some(9u8), |w, v| w.write_u8(*v));
-        w.write_option(&None::<u8>, |w, v| w.write_u8(*v));
+        w.write_u64(0xdead_beef_dead_beef);
         w.write_vec(&[1u32, 2, 3], |w, v| w.write_u32(*v));
 
         let bytes = w.into_bytes();
@@ -174,8 +137,7 @@ mod tests {
         assert_eq!(r.read_u32().unwrap(), 0xdead_beef);
         assert_eq!(r.read_i64().unwrap(), -12345);
         assert_eq!(r.read_str().unwrap(), "hello");
-        assert_eq!(r.read_option(|r| r.read_u8()).unwrap(), Some(9));
-        assert_eq!(r.read_option(|r| r.read_u8()).unwrap(), None);
+        assert_eq!(r.read_u64().unwrap(), 0xdead_beef_dead_beef);
         assert_eq!(r.read_vec(|r| r.read_u32()).unwrap(), vec![1, 2, 3]);
         assert!(r.remaining().is_empty());
     }

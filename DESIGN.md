@@ -347,6 +347,24 @@ one-way (encode-only) JSON writer over the same tree; nothing reads JSON back in
 `list` can read a quick per-generation summary without decoding the whole tree.
 Revisit with real `serde`+`rmp-serde`+`zstd` if network access becomes available.
 
+**Content-addressed blob store (tmux-content-dos.2):** a pane's `scrollback`/`visible`
+text is stored as a blob under its own hash in `${store_dir}/blobs/`, not inline in the
+generation file — the generation file just holds the 16-byte hash. Two saves whose pane
+content is byte-identical (the common case for an unchanged pane, since
+`phoenix-capture`'s dirty-tracking carries the same scrollback bytes forward verbatim)
+write the same blob file twice, and the second write is a no-op: deduplication and
+"unchanged panes become pointer copies" both fall out of content-addressing for free.
+Blobs are written with the same temp+fsync+rename atomicity as generation files;
+concurrent writers racing to store the *same* blob need no locking, since same hash
+implies same content and whichever writer's rename lands last still leaves the correct
+bytes at that path. No crypto-hash crate is available (same network constraint as
+above), and a checksum-grade hash isn't enough here — two different blobs colliding
+would silently return the wrong pane content for one of them — so the hash is a
+128-bit combination of two independent, differently-salted FNV-1a-64 passes: adequate
+collision resistance for a single-user, non-adversarial content store, not a
+cryptographic guarantee. Blob garbage collection (pruning blobs no surviving generation
+still references) is deferred to a later ticket.
+
 ---
 
 ## 8. The daemon

@@ -34,6 +34,11 @@ pub enum StoreError {
     Snapshot(SnapshotError),
     /// No snapshot exists yet at this store's `latest` pointer.
     NoLatest,
+    /// A generation file referenced a content blob (tmux-content-dos.2) that
+    /// isn't in the blob store — a torn save (blob write succeeded but the
+    /// generation file referencing it didn't, or vice versa) or the blob
+    /// store was pruned/damaged independently of the generation files.
+    BlobNotFound,
 }
 
 impl fmt::Display for StoreError {
@@ -60,6 +65,7 @@ impl fmt::Display for StoreError {
             StoreError::InvalidName => write!(f, "snapshot body had an empty name/layout field"),
             StoreError::Snapshot(e) => write!(f, "{e}"),
             StoreError::NoLatest => write!(f, "no snapshot has been saved yet"),
+            StoreError::BlobNotFound => write!(f, "referenced content blob is missing"),
         }
     }
 }

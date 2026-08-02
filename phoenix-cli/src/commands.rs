@@ -144,16 +144,14 @@ pub fn run_list() -> i32 {
 /// `file`: load that snapshot file directly (DESIGN.md §9's `restore
 /// --file`); otherwise load the store's `latest`.
 fn load_snapshot(file: Option<&str>) -> Result<Snapshot, String> {
+    let store = open_store()?;
     match file {
-        Some(path) => {
-            Store::load_file(Path::new(path)).map_err(|e| format!("failed to load {path:?}: {e}"))
-        }
-        None => {
-            let store = open_store()?;
-            store
-                .load_latest()
-                .map_err(|e| format!("failed to load the latest snapshot: {e}"))
-        }
+        Some(path) => store
+            .load_file(Path::new(path))
+            .map_err(|e| format!("failed to load {path:?}: {e}")),
+        None => store
+            .load_latest()
+            .map_err(|e| format!("failed to load the latest snapshot: {e}")),
     }
 }
 

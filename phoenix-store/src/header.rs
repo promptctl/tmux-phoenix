@@ -8,6 +8,7 @@
 
 use phoenix_core::{FormatVersion, OffsetDateTime, Snapshot};
 
+use crate::blob_store::BlobStore;
 use crate::checksum::fnv1a_64;
 use crate::codec::{decode_body, encode_body};
 use crate::error::StoreError;
@@ -22,8 +23,8 @@ pub struct Header {
     pub checksum: u64,
 }
 
-pub fn encode_file(snapshot: &Snapshot) -> Vec<u8> {
-    let body = encode_body(snapshot);
+pub fn encode_file(snapshot: &Snapshot, blobs: &BlobStore) -> Result<Vec<u8>, StoreError> {
+    let body = encode_body(snapshot, blobs)?;
     let checksum = fnv1a_64(&body);
 
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
@@ -33,7 +34,7 @@ pub fn encode_file(snapshot: &Snapshot) -> Vec<u8> {
     out.extend_from_slice(&(body.len() as u64).to_le_bytes());
     out.extend_from_slice(&checksum.to_le_bytes());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
 /// Header-only decode (for a fast `list`) — does not touch or validate the
@@ -59,7 +60,7 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, StoreError> {
 
 /// Full decode: validates magic, format version, length, and checksum
 /// before handing the body to [`decode_body`].
-pub fn decode_file(bytes: &[u8]) -> Result<Snapshot, StoreError> {
+pub fn decode_file(bytes: &[u8], blobs: &BlobStore) -> Result<Snapshot, StoreError> {
     let header = decode_header(bytes)?;
 
     if header.format_version != FormatVersion::CURRENT.0 {
@@ -78,7 +79,7 @@ pub fn decode_file(bytes: &[u8]) -> Result<Snapshot, StoreError> {
 
     let format_version = FormatVersion(header.format_version);
     let captured_at = OffsetDateTime::from_unix_timestamp(header.captured_at);
-    decode_body(body, format_version, captured_at)
+    decode_body(body, format_version, captured_at, blobs)
 }
 
 #[cfg(test)]
@@ -88,6 +89,38 @@ mod tests {
         CapturedProgram, Layout, NonEmpty, Pane, PaneIndex, Session, SessionName, TmuxVersion,
         Window, WindowIndex, WindowName,
     };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestBlobDir(PathBuf);
+
+    impl TestBlobDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "phoenix-header-test-blobs-{name}-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn store(&self) -> BlobStore {
+            BlobStore::new(&self.0)
+        }
+    }
+
+    impl Drop for TestBlobDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn sample_snapshot() -> Snapshot {
         let pane = Pane {
@@ -120,16 +153,18 @@ mod tests {
 
     #[test]
     fn round_trips_through_the_full_file_format() {
+        let blob_dir = TestBlobDir::new("round-trip");
         let snapshot = sample_snapshot();
-        let bytes = encode_file(&snapshot);
-        let decoded = decode_file(&bytes).unwrap();
+        let bytes = encode_file(&snapshot, &blob_dir.store()).unwrap();
+        let decoded = decode_file(&bytes, &blob_dir.store()).unwrap();
         assert_eq!(decoded, snapshot);
     }
 
     #[test]
     fn header_only_decode_reads_captured_at_without_the_body() {
+        let blob_dir = TestBlobDir::new("header-only");
         let snapshot = sample_snapshot();
-        let bytes = encode_file(&snapshot);
+        let bytes = encode_file(&snapshot, &blob_dir.store()).unwrap();
         let header = decode_header(&bytes).unwrap();
         assert_eq!(header.captured_at, 1_700_000_000);
         assert_eq!(header.format_version, FormatVersion::CURRENT.0);
@@ -137,16 +172,21 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
-        let mut bytes = encode_file(&sample_snapshot());
+        let blob_dir = TestBlobDir::new("bad-magic");
+        let mut bytes = encode_file(&sample_snapshot(), &blob_dir.store()).unwrap();
         bytes[0] = b'X';
-        assert!(matches!(decode_file(&bytes), Err(StoreError::BadMagic)));
+        assert!(matches!(
+            decode_file(&bytes, &blob_dir.store()),
+            Err(StoreError::BadMagic)
+        ));
     }
 
     #[test]
     fn rejects_unsupported_format_version_without_touching_the_body() {
-        let mut bytes = encode_file(&sample_snapshot());
+        let blob_dir = TestBlobDir::new("unsupported-version");
+        let mut bytes = encode_file(&sample_snapshot(), &blob_dir.store()).unwrap();
         bytes[4..8].copy_from_slice(&999u32.to_le_bytes());
-        let err = decode_file(&bytes).unwrap_err();
+        let err = decode_file(&bytes, &blob_dir.store()).unwrap_err();
         assert!(matches!(
             err,
             StoreError::UnsupportedFormatVersion { found: 999 }
@@ -155,19 +195,24 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_body_via_checksum_mismatch() {
-        let mut bytes = encode_file(&sample_snapshot());
+        let blob_dir = TestBlobDir::new("checksum-mismatch");
+        let mut bytes = encode_file(&sample_snapshot(), &blob_dir.store()).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         assert!(matches!(
-            decode_file(&bytes),
+            decode_file(&bytes, &blob_dir.store()),
             Err(StoreError::ChecksumMismatch)
         ));
     }
 
     #[test]
     fn rejects_a_truncated_file() {
-        let bytes = encode_file(&sample_snapshot());
+        let blob_dir = TestBlobDir::new("truncated");
+        let bytes = encode_file(&sample_snapshot(), &blob_dir.store()).unwrap();
         let truncated = &bytes[..bytes.len() - 5];
-        assert!(matches!(decode_file(truncated), Err(StoreError::Truncated)));
+        assert!(matches!(
+            decode_file(truncated, &blob_dir.store()),
+            Err(StoreError::Truncated)
+        ));
     }
 }

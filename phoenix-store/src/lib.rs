@@ -2,6 +2,7 @@
 //! `phoenix-core` `Snapshot` (DESIGN.md §7).
 
 mod binary;
+mod blob_store;
 mod checksum;
 mod codec;
 mod error;
