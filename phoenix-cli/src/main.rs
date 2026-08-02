@@ -4,12 +4,13 @@ mod commands;
 use cli::Command;
 
 const HELP: &str = "\
-phoenix — save, inspect, and restore tmux session snapshots
+phoenix — save, inspect, restore, and continuously checkpoint tmux sessions
 
 USAGE:
     phoenix save [--keep N] [--socket PATH]
     phoenix list
     phoenix restore [--dry-run] [--file PATH] [--socket PATH]
+    phoenix daemon [--keep N] [--debounce SECS] [--max-interval SECS] [--socket PATH]
     phoenix --help
 
 save: exit 0 on a clean save, 3 if some pane's foreground program couldn't
@@ -18,7 +19,10 @@ list: one saved generation per line on stdout, tab-separated
 (captured_at_unix, format_version, path), newest first.
 restore: rebuilds the latest (or --file) snapshot into a new tmux session,
 shell + cwd only — never blind-replays a captured program. --dry-run prints
-the exact tmux commands that would run and runs nothing.";
+the exact tmux commands that would run and runs nothing.
+daemon: runs foreground (for supervision, wrap this in a launchd/systemd
+unit). Saves once activity has been quiet for --debounce seconds, with a
+--max-interval backstop so long-idle sessions still checkpoint.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +47,12 @@ fn main() {
             file,
             socket,
         } => commands::run_restore(dry_run, file, socket),
+        Command::Daemon {
+            keep,
+            debounce_secs,
+            max_interval_secs,
+            socket,
+        } => commands::run_daemon(keep, debounce_secs, max_interval_secs, socket),
     };
 
     std::process::exit(code);

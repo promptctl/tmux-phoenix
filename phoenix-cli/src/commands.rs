@@ -217,6 +217,59 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
     }
 }
 
+/// Runs foreground (DESIGN.md §8: "`phoenix daemon` runs it foreground for
+/// debugging"); a service-supervised background run is `tmux-daemon-b0h.3`'s
+/// job (writing the launchd/systemd unit that invokes this same
+/// subcommand), not a separate code path here. Never returns on success —
+/// only exits on a fatal setup failure (can't connect, can't set
+/// `no-output`/subscribe); a single save cycle failing is logged to stderr
+/// and the daemon keeps running (`phoenix_daemon::run`'s own contract).
+pub fn run_daemon(
+    keep: usize,
+    debounce_secs: u64,
+    max_interval_secs: u64,
+    socket: Option<String>,
+) -> i32 {
+    let mut client = match connect(socket) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("phoenix daemon: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("phoenix daemon: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    let policy = phoenix_daemon::DebouncePolicy {
+        debounce: std::time::Duration::from_secs(debounce_secs),
+        max_interval: std::time::Duration::from_secs(max_interval_secs),
+    };
+
+    let result = phoenix_daemon::run(
+        &mut client,
+        &store,
+        &policy,
+        std::time::Duration::from_secs(1),
+        keep,
+        |e| eprintln!("phoenix daemon: save cycle failed: {e}"),
+        || true,
+    );
+    client.close();
+
+    match result {
+        Ok(()) => EXIT_OK,
+        Err(e) => {
+            eprintln!("phoenix daemon: {e}");
+            EXIT_FAIL
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

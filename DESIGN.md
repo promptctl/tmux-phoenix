@@ -398,6 +398,25 @@ subscriptions, and owns *when to save* as explicit state
   if tmux isn't running the connection sits in `Closed`/`Reconnecting` and the daemon
   idles.
 
+**Implementation notes (tmux-daemon-b0h.1):** the structure subscription is one
+`refresh-client -B <name>:@*:#{window_layout}` (all windows, tracking each one's
+layout string) — verified live that it fires on pane split/close/resize and window
+add/remove. The debounce/max-interval *decision* (`phoenix_daemon::DebounceState`)
+is pure, driven by explicit timestamps the caller supplies, not the wall clock
+directly — testable with synthetic time, no real sleeping in the unit tests. The
+run loop itself has no separate "wait with a timeout" primitive: `tmux-control`'s
+`Client::execute` already reads and dispatches a full batch of arrived notifications
+before returning (the same batch-draining behavior `tmux-control-mode-1ju` built), so
+a cheap heartbeat command (`display-message -p ""`) issued once per short poll
+interval both drains pending `%subscription-changed` events and gives the loop a
+natural, bounded wake-up cadence — no raw `poll(2)`/threading needed. A single
+capture-or-save failure is logged and the loop continues; only a failure setting up
+`no-output`/the subscription at startup is fatal. This closes the "content capture
+isn't wired into `save`" gap `tmux-content-dos.2` left open: the daemon holds the
+previous capture's per-pane content in memory across its own save cycles (seeded
+from `latest` on startup), which `phoenix save` (one-shot, no natural "previous" to
+hold) doesn't have a clean way to do.
+
 ---
 
 ## 9. CLI, failure philosophy, milestones
