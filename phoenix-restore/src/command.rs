@@ -67,6 +67,27 @@ pub enum TmuxCommand {
         session: SessionName,
         window: WindowIndex,
     },
+    /// Replays a pane's captured content (tmux-content-dos.3: "the
+    /// authoritative grid comes from capture-pane, not a re-emulated
+    /// stream") so the pane looks as it did when captured. Like
+    /// `SplitWindow`, this deliberately targets `session:window` (the
+    /// window's *current* pane) rather than a pane index — see
+    /// [`crate::plan::panes_active_last`]'s doc comment — so it must be
+    /// issued immediately after the pane it targets is created, before any
+    /// later split shifts "current" away.
+    ///
+    /// **Not a literal tmux command**: unlike every other variant,
+    /// [`TmuxCommand::to_command_string`] can't render this one verbatim —
+    /// replaying arbitrary-length content needs a temp file that only
+    /// exists at apply time, which a pure `plan()` can't create. The
+    /// executor (tmux-restore-qll.2's `apply`) special-cases this variant;
+    /// `to_command_string` returns a human-readable summary for `--dry-run`
+    /// instead of runnable syntax.
+    ReplayContent {
+        session: SessionName,
+        window: WindowIndex,
+        lines: Vec<String>,
+    },
 }
 
 /// A window's `session:index` target — one argument, not two tokens.
@@ -138,6 +159,15 @@ impl TmuxCommand {
                 let target = window_target(session, *window);
                 CommandLine::new("select-window", ["-t", &target])
             }
+            TmuxCommand::ReplayContent {
+                session,
+                window,
+                lines,
+            } => format!(
+                "# replay {} line(s) of captured content into {}'s active pane",
+                lines.len(),
+                window_target(session, *window)
+            ),
         }
     }
 }

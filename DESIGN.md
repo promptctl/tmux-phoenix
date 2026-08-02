@@ -321,6 +321,18 @@ recently split pane stays active through a following `select-layout`), which mea
 `select-pane` never actually appears in a plan despite being one of the tmux
 primitives this milestone's ticket named.
 
+**Content replay (tmux-content-dos.3):** "the authoritative grid comes from
+capture-pane, not a re-emulated stream" — a pane's captured `scrollback` (not the raw
+bytes that produced it, which were never captured) is replayed by sending
+`cat <tempfile>` into the pane immediately after it's created, using the same
+current-pane targeting `SplitWindow` relies on (a pane still has no addressable
+index — see above). This is the one `TmuxCommand` variant that isn't a literal tmux
+command line: it needs a temp file that only exists at apply time, so `plan` (pure)
+can't render it verbatim the way every other variant can, and `apply` special-cases
+it. No separate policy toggle — a pane with captured content always gets replayed;
+one with `content: None` is simply left as a fresh idle shell, unchanged from the
+"cwd + shell only" default.
+
 ---
 
 ## 7. Persistence

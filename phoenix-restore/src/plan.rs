@@ -2,7 +2,7 @@
 //! no I/O, unit-testable with no tmux running. `tmux-restore-qll.2` executes
 //! the resulting ordered [`TmuxCommand`]s.
 
-use phoenix_core::{Pane, Session, Snapshot, Window};
+use phoenix_core::{Pane, Session, Snapshot, Window, WindowIndex};
 
 use crate::command::TmuxCommand;
 use crate::policy::RestorePolicy;
@@ -65,6 +65,15 @@ fn plan_session(session: &Session, commands: &mut Vec<TmuxCommand>) {
         session: session.name().clone(),
         window: first_window.index(),
     });
+    // The implicit first pane is current right now, immediately after
+    // creation — the only moment `ReplayContent`'s "current pane" targeting
+    // can reach it (see its doc comment).
+    maybe_replay_content(
+        session,
+        first_window.index(),
+        first_window_panes[0],
+        commands,
+    );
     plan_remaining_panes(session, first_window, &first_window_panes, commands);
 
     for window in windows {
@@ -75,6 +84,7 @@ fn plan_session(session: &Session, commands: &mut Vec<TmuxCommand>) {
             name: window.name().clone(),
             cwd: window_panes[0].cwd.clone(),
         });
+        maybe_replay_content(session, window.index(), window_panes[0], commands);
         plan_remaining_panes(session, window, &window_panes, commands);
     }
 
@@ -99,6 +109,10 @@ fn plan_remaining_panes(
             window: window.index(),
             cwd: pane.cwd.clone(),
         });
+        // Still the current pane of `window` right after this split — see
+        // `TmuxCommand::ReplayContent`'s doc comment for why this can't be
+        // deferred to later.
+        maybe_replay_content(session, window.index(), pane, commands);
     }
 
     if ordered_panes.len() > 1 {
@@ -110,12 +124,33 @@ fn plan_remaining_panes(
     }
 }
 
+/// Emits `ReplayContent` for `pane` if (and only if) it has captured
+/// content — a pane with `content: None` (structure-only capture, or a
+/// degraded pane) is simply left as a fresh idle shell, unchanged from
+/// today's "cwd + shell only" default. No separate policy toggle: whether
+/// replay happens is entirely driven by whether the snapshot itself has
+/// content to replay.
+fn maybe_replay_content(
+    session: &Session,
+    window: WindowIndex,
+    pane: &Pane,
+    commands: &mut Vec<TmuxCommand>,
+) {
+    if let Some(content) = &pane.content {
+        commands.push(TmuxCommand::ReplayContent {
+            session: session.name().clone(),
+            window,
+            lines: content.scrollback.clone(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use phoenix_core::{
-        CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, PaneIndex, SessionName,
-        TmuxVersion, WindowIndex, WindowName,
+        CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, PaneContent, PaneId,
+        PaneIndex, SessionName, TmuxVersion, WindowIndex, WindowName,
     };
 
     fn pane(index: u32, cwd: &str) -> Pane {
@@ -309,6 +344,116 @@ mod tests {
                 "plan leaked a captured program into: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn a_pane_with_no_captured_content_gets_no_replay_command() {
+        let win = window(0, "shell", NonEmpty::singleton(pane(0, "/a")), 0);
+        let session = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::singleton(win),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+        assert!(!plan
+            .commands
+            .iter()
+            .any(|c| matches!(c, TmuxCommand::ReplayContent { .. })));
+    }
+
+    #[test]
+    fn a_pane_with_captured_content_gets_a_replay_command_right_after_its_creation() {
+        let mut p = pane(0, "/a");
+        p.content = Some(PaneContent::new(
+            PaneId(7),
+            10,
+            512,
+            vec!["captured line".to_string()],
+            vec!["captured line".to_string()],
+        ));
+        let win = window(0, "shell", NonEmpty::singleton(p), 0);
+        let session = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::singleton(win),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+
+        // NewSession creates the one pane; ReplayContent must immediately
+        // follow it (before anything else could shift "current" away).
+        assert_eq!(plan.commands.len(), 4, "{:?}", plan.commands);
+        assert!(matches!(plan.commands[0], TmuxCommand::NewSession { .. }));
+        assert!(matches!(plan.commands[1], TmuxCommand::MoveWindow { .. }));
+        match &plan.commands[2] {
+            TmuxCommand::ReplayContent { lines, .. } => {
+                assert_eq!(lines, &vec!["captured line".to_string()])
+            }
+            other => panic!("expected ReplayContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_pane_in_a_multi_pane_window_gets_its_own_content_replayed() {
+        let mut p0 = pane(0, "/a");
+        p0.content = Some(PaneContent::new(
+            PaneId(1),
+            1,
+            1,
+            vec!["from pane a".to_string()],
+            vec![],
+        ));
+        let mut p1 = pane(1, "/b");
+        p1.content = Some(PaneContent::new(
+            PaneId(2),
+            2,
+            2,
+            vec!["from pane b".to_string()],
+            vec![],
+        ));
+        let panes = NonEmpty::new(p0, vec![p1]);
+        // active = 1 (pane b), so panes_active_last reorders pane b to be
+        // split *last* — pane a stays first (the implicit new-session pane).
+        let win = window(0, "shell", panes, 1);
+        let session = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::singleton(win),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
+
+        let replayed: Vec<&str> = plan
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                TmuxCommand::ReplayContent { lines, .. } => Some(lines[0].as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed, vec!["from pane a", "from pane b"]);
+
+        // The second pane's SplitWindow must come before its ReplayContent
+        // (current-pane targeting requires the pane to exist first), and
+        // that ReplayContent must come before SelectLayout.
+        let split_pos = plan
+            .commands
+            .iter()
+            .position(|c| matches!(c, TmuxCommand::SplitWindow { .. }))
+            .unwrap();
+        let second_replay_pos = plan
+            .commands
+            .iter()
+            .position(|c| matches!(c, TmuxCommand::ReplayContent { lines, .. } if lines[0] == "from pane b"))
+            .unwrap();
+        let layout_pos = plan
+            .commands
+            .iter()
+            .position(|c| matches!(c, TmuxCommand::SelectLayout { .. }))
+            .unwrap();
+        assert!(split_pos < second_replay_pos);
+        assert!(second_replay_pos < layout_pos);
     }
 
     #[test]
