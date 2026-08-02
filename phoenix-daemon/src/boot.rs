@@ -1,0 +1,232 @@
+//! Boot restore (DESIGN.md §8, tmux-daemon-b0h.2): "On start, if the server
+//! has only the default empty session, apply `latest`; if sessions already
+//! exist, log and stay in save mode — never clobber a live server."
+//!
+//! **Verified live, and both surprising enough to be worth recording:**
+//! - Bare `tmux -C` (no session target) does *not* attach to an existing
+//!   session when one is already there — it unconditionally creates a brand
+//!   new one, every time. So "does the server already have sessions" has to
+//!   be checked with a plain, non-control-mode `list-sessions` *before*
+//!   opening any control-mode connection at all; a bare `tmux -C` can't be
+//!   used as that check without side effects.
+//! - Killing the session a control-mode client is currently attached to
+//!   ends that client's connection (`%exit`) — there's no way to "stay
+//!   connected" through your own session's death. So the throwaway
+//!   bootstrap session this module creates (only when the server had zero
+//!   sessions) can't be torn down from the same connection that's attached
+//!   to it; this reconnects to a real, restored session first (closing the
+//!   old transport, which merely *detaches* — the bootstrap session
+//!   survives that, unattended), then kills the now-unattended bootstrap
+//!   session from the outside.
+//! - A structure subscription (`tmux-daemon-b0h.1`'s `@*` scope) only
+//!   observes the *attached* session's windows, not the whole server —
+//!   verified live: a change in a second, non-attached session never fired
+//!   the subscription. This is why reconnecting to a real restored session
+//!   (rather than leaving the client parked on the dead-end bootstrap one)
+//!   matters for the ongoing daemon loop, not just for cleanliness.
+
+use std::process::Command;
+
+use phoenix_restore::{apply, plan, ApplyError, RestorePolicy};
+use phoenix_store::{Store, StoreError};
+use tmux_control::{Client, SpawnOptions, SpawnTransport, TmuxError};
+
+const BOOTSTRAP_SESSION: &str = "phoenix-boot";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootDecision {
+    /// No sessions existed; a snapshot exists to restore into the
+    /// bootstrap session's place.
+    RestoreLatest,
+    /// No sessions existed, and there's nothing saved to restore either.
+    NothingToRestore,
+    /// Sessions already existed — DESIGN.md's "never clobber a live
+    /// server": no restore attempted at all.
+    StayInSaveMode { existing_session_count: usize },
+}
+
+/// Pure: the actual session-listing and snapshot-loading are effectful
+/// (`boot`, below), but the *decision* they feed into is a plain function of
+/// two facts, directly testable without tmux or a store.
+pub fn decide(existing_session_count: usize, has_snapshot: bool) -> BootDecision {
+    if existing_session_count > 0 {
+        BootDecision::StayInSaveMode {
+            existing_session_count,
+        }
+    } else if has_snapshot {
+        BootDecision::RestoreLatest
+    } else {
+        BootDecision::NothingToRestore
+    }
+}
+
+#[derive(Debug)]
+pub enum BootError {
+    Io(std::io::Error),
+    Tmux(TmuxError),
+    Store(StoreError),
+    Restore(ApplyError),
+}
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootError::Io(e) => write!(f, "{e}"),
+            BootError::Tmux(e) => write!(f, "{e}"),
+            BootError::Store(e) => write!(f, "{e}"),
+            BootError::Restore(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BootError {}
+
+fn spawn_options(socket: Option<String>) -> SpawnOptions {
+    SpawnOptions {
+        socket,
+        ..Default::default()
+    }
+}
+
+/// A plain (non-control-mode) `list-sessions` — doesn't attach, doesn't
+/// create anything. `Ok(0)` covers both "server doesn't exist yet" and "no
+/// sessions" identically, which is exactly the distinction this module
+/// doesn't need to make (either way, we're the one bootstrapping).
+fn count_existing_sessions(socket: Option<&str>) -> usize {
+    let mut cmd = Command::new("tmux");
+    if let Some(s) = socket {
+        cmd.args(["-S", s]);
+    }
+    cmd.args(["list-sessions", "-F", "#{session_name}"]);
+    match cmd.output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
+fn run_tmux(socket: Option<&str>, args: &[&str]) -> std::io::Result<bool> {
+    let mut cmd = Command::new("tmux");
+    if let Some(s) = socket {
+        cmd.args(["-S", s]);
+    }
+    cmd.args(args);
+    Ok(cmd.status()?.success())
+}
+
+/// Connects for the daemon's ongoing run, performing boot restore first —
+/// DESIGN.md §8's contract (see the module doc comment for the mechanics
+/// that made this trickier than the one-sentence spec text suggests).
+/// `on_log` receives one line describing which `BootDecision` was made and
+/// what happened.
+pub fn connect_and_boot(
+    socket: Option<String>,
+    store: &Store,
+    mut on_log: impl FnMut(&str),
+) -> Result<Client<SpawnTransport>, BootError> {
+    let existing = count_existing_sessions(socket.as_deref());
+    let latest = store.load_latest();
+    let has_snapshot = !matches!(latest, Err(StoreError::NoLatest));
+
+    match decide(existing, has_snapshot) {
+        BootDecision::StayInSaveMode {
+            existing_session_count,
+        } => {
+            on_log(&format!(
+                "server already has {existing_session_count} session(s); staying in save mode"
+            ));
+            connect(socket)
+        }
+        BootDecision::NothingToRestore => {
+            on_log("no sessions and no saved snapshot; starting fresh");
+            run_tmux(
+                socket.as_deref(),
+                &["new-session", "-d", "-s", BOOTSTRAP_SESSION],
+            )
+            .map_err(BootError::Io)?;
+            connect_to(socket, BOOTSTRAP_SESSION)
+        }
+        BootDecision::RestoreLatest => {
+            let snapshot = latest.map_err(BootError::Store)?;
+            run_tmux(
+                socket.as_deref(),
+                &["new-session", "-d", "-s", BOOTSTRAP_SESSION],
+            )
+            .map_err(BootError::Io)?;
+            let mut client = connect_to(socket.clone(), BOOTSTRAP_SESSION)?;
+
+            let restore_plan = plan(&snapshot, &RestorePolicy);
+            apply(&mut client, &restore_plan).map_err(BootError::Restore)?;
+            let restored_sessions = snapshot.sessions.len();
+
+            // Reconnect onto a real restored session before tearing down
+            // the bootstrap one — see the module doc comment for why this
+            // order is load-bearing, not just tidy.
+            let target = snapshot.sessions.first().name().as_str().to_string();
+            let fresh_transport = SpawnTransport::spawn(
+                &["attach-session", "-t", &target],
+                &spawn_options(socket.clone()),
+            )
+            .map_err(BootError::Io)?;
+            client
+                .reconnect(fresh_transport, 0)
+                .map_err(BootError::Tmux)?;
+
+            let _ = run_tmux(
+                socket.as_deref(),
+                &["kill-session", "-t", BOOTSTRAP_SESSION],
+            );
+
+            on_log(&format!(
+                "restored {restored_sessions} session(s) from the latest snapshot"
+            ));
+            Ok(client)
+        }
+    }
+}
+
+fn connect(socket: Option<String>) -> Result<Client<SpawnTransport>, BootError> {
+    let transport = SpawnTransport::spawn(&["attach-session"], &spawn_options(socket))
+        .map_err(BootError::Io)?;
+    Client::connect(transport).map_err(BootError::Tmux)
+}
+
+fn connect_to(socket: Option<String>, session: &str) -> Result<Client<SpawnTransport>, BootError> {
+    let transport =
+        SpawnTransport::spawn(&["attach-session", "-t", session], &spawn_options(socket))
+            .map_err(BootError::Io)?;
+    Client::connect(transport).map_err(BootError::Tmux)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_sessions_always_means_stay_in_save_mode() {
+        assert_eq!(
+            decide(1, true),
+            BootDecision::StayInSaveMode {
+                existing_session_count: 1
+            }
+        );
+        assert_eq!(
+            decide(3, false),
+            BootDecision::StayInSaveMode {
+                existing_session_count: 3
+            }
+        );
+    }
+
+    #[test]
+    fn no_sessions_and_a_snapshot_means_restore() {
+        assert_eq!(decide(0, true), BootDecision::RestoreLatest);
+    }
+
+    #[test]
+    fn no_sessions_and_no_snapshot_means_nothing_to_restore() {
+        assert_eq!(decide(0, false), BootDecision::NothingToRestore);
+    }
+}

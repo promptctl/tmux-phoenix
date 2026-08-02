@@ -7,5 +7,6 @@ description = "Subscription-driven, debounced save daemon for tmux-phoenix"
 [dependencies]
 phoenix-capture = { path = "../phoenix-capture" }
 phoenix-core = { path = "../phoenix-core" }
+phoenix-restore = { path = "../phoenix-restore" }
 phoenix-store = { path = "../phoenix-store" }
 tmux-control = { path = "../tmux-control" }

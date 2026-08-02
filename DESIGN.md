@@ -417,6 +417,27 @@ previous capture's per-pane content in memory across its own save cycles (seeded
 from `latest` on startup), which `phoenix save` (one-shot, no natural "previous" to
 hold) doesn't have a clean way to do.
 
+**Note (limitation found while building boot restore, `tmux-daemon-b0h.2`):** the
+structure subscription above is scoped to the client's *attached* session only —
+verified live that a change in a second, non-attached session never fires it. A
+multi-session server therefore relies more on the max-interval backstop than the
+debounce path for sessions other than the one the daemon happens to be attached to.
+Not fixed here (out of scope for daemon-core); worth revisiting if that gap matters
+in practice.
+
+**Boot restore implementation notes (tmux-daemon-b0h.2, verified live — each one
+surprising enough that the one-sentence spec text above doesn't capture it):** bare
+`tmux -C` (no session target) does *not* attach to an existing session when one is
+already there — it unconditionally creates a brand new one every time, so "does the
+server already have sessions" has to be checked with a plain, non-control-mode
+`list-sessions` *before* opening any control-mode connection at all. Killing the
+session a control-mode client is attached to ends that client's connection
+(`%exit`) — there's no way to survive your own session's death — so the throwaway
+bootstrap session boot restore creates (only when the server had zero sessions) is
+torn down by reconnecting onto a real restored session first (closing the old
+transport just *detaches*; the bootstrap session survives that, unattended), then
+killing the now-unattended bootstrap session from a fresh connection.
+
 ---
 
 ## 9. CLI, failure philosophy, milestones

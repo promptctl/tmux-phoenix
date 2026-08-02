@@ -221,26 +221,31 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
 /// debugging"); a service-supervised background run is `tmux-daemon-b0h.3`'s
 /// job (writing the launchd/systemd unit that invokes this same
 /// subcommand), not a separate code path here. Never returns on success —
-/// only exits on a fatal setup failure (can't connect, can't set
-/// `no-output`/subscribe); a single save cycle failing is logged to stderr
-/// and the daemon keeps running (`phoenix_daemon::run`'s own contract).
+/// only exits on a fatal setup failure (can't connect, can't boot-restore,
+/// can't set `no-output`/subscribe); a single save cycle failing is logged
+/// to stderr and the daemon keeps running (`phoenix_daemon::run`'s own
+/// contract). Boot restore (`phoenix_daemon::connect_and_boot`) runs before
+/// the save loop starts — DESIGN.md §8: apply `latest` only if the server
+/// had no sessions at all, never touching an already-live one.
 pub fn run_daemon(
     keep: usize,
     debounce_secs: u64,
     max_interval_secs: u64,
     socket: Option<String>,
 ) -> i32 {
-    let mut client = match connect(socket) {
-        Ok(c) => c,
+    let store = match open_store() {
+        Ok(s) => s,
         Err(msg) => {
             eprintln!("phoenix daemon: {msg}");
             return EXIT_FAIL;
         }
     };
-    let store = match open_store() {
-        Ok(s) => s,
-        Err(msg) => {
-            eprintln!("phoenix daemon: {msg}");
+    let mut client = match phoenix_daemon::connect_and_boot(socket, &store, |line| {
+        eprintln!("phoenix daemon: {line}")
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("phoenix daemon: boot failed: {e}");
             return EXIT_FAIL;
         }
     };
