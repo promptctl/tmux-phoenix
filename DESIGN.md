@@ -304,6 +304,17 @@ last N generations. Body is MessagePack + zstd-compressed pane content by defaul
 inspection (`[LAW:one-type-per-behavior]`). A versioned header with a checksum; an
 unknown `format_version` is refused loudly, never guessed (`[LAW:no-mode-explosion]`).
 
+**Implementation note:** no `serde`/`rmp-serde`/`zstd` — same network constraint as
+§4. The default body format is a hand-rolled, length-prefixed little-endian binary
+encoding built directly on `phoenix-core`'s public constructors (so a corrupt file
+can produce a decode error but never an invalid `Snapshot`), with an FNV-1a-64
+checksum in place of a cryptographic one — this only needs to catch local
+corruption, not defend against tampering. `--format=json` is a hand-rolled,
+one-way (encode-only) JSON writer over the same tree; nothing reads JSON back in.
+`captured_at`/`format_version` live in a fixed 32-byte header ahead of the body, so
+`list` can read a quick per-generation summary without decoding the whole tree.
+Revisit with real `serde`+`rmp-serde`+`zstd` if network access becomes available.
+
 ---
 
 ## 8. The daemon

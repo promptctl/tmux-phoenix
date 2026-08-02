@@ -15,5 +15,12 @@ name = "phoenix-core"
 version = "0.1.0"
 
 [[package]]
+name = "phoenix-store"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+]
+
+[[package]]
 name = "tmux-control"
 version = "0.1.0"
