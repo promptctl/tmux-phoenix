@@ -11,6 +11,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-cli"
+version = "0.1.0"
+dependencies = [
+ "phoenix-capture",
+ "phoenix-core",
+ "phoenix-store",
+ "tmux-control",
+]
+
+[[package]]
 name = "phoenix-core"
 version = "0.1.0"
 
