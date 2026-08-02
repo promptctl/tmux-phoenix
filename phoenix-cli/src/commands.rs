@@ -64,7 +64,12 @@ pub fn run_save(keep: usize, socket: Option<String>) -> i32 {
         }
     };
 
-    let snapshot = match phoenix_capture::capture(&mut client) {
+    // Content capture (tmux-content-dos.1) isn't wired into `save` yet —
+    // that needs a way to load the previous save's per-pane content for
+    // dirty-tracking, which belongs with whichever ticket does the
+    // content-addressed persistence side (tmux-content-dos.2).
+    let snapshot = match phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("phoenix save: capture failed: {e}");

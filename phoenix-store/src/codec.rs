@@ -8,7 +8,7 @@
 //! (see [`crate::header`]), not here — this only encodes the body.
 
 use phoenix_core::{
-    CapturedProgram, Layout, NonEmpty, Pane, PaneContent, PaneIndex, Session, SessionName,
+    CapturedProgram, Layout, NonEmpty, Pane, PaneContent, PaneId, PaneIndex, Session, SessionName,
     Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
 
@@ -52,7 +52,11 @@ fn encode_pane(w: &mut Writer, pane: &Pane) {
     w.write_str(&pane.program.command);
     w.write_vec(&pane.program.argv, |w, arg| w.write_str(arg));
     w.write_option(&pane.content, |w, content| {
-        w.write_vec(&content.lines, |w, line| w.write_str(line));
+        w.write_u32(content.pane_id.0);
+        w.write_u64(content.history_size);
+        w.write_u64(content.history_bytes);
+        w.write_vec(&content.scrollback, |w, line| w.write_str(line));
+        w.write_vec(&content.visible, |w, line| w.write_str(line));
     });
 }
 
@@ -109,8 +113,18 @@ fn decode_pane(r: &mut Reader) -> Result<Pane, StoreError> {
     let command = r.read_str()?;
     let argv = r.read_vec(Reader::read_str)?;
     let content = r.read_option(|r| {
-        let lines = r.read_vec(Reader::read_str)?;
-        Ok(PaneContent::new(lines))
+        let pane_id = PaneId(r.read_u32()?);
+        let history_size = r.read_u64()?;
+        let history_bytes = r.read_u64()?;
+        let scrollback = r.read_vec(Reader::read_str)?;
+        let visible = r.read_vec(Reader::read_str)?;
+        Ok(PaneContent::new(
+            pane_id,
+            history_size,
+            history_bytes,
+            scrollback,
+            visible,
+        ))
     })?;
     Ok(Pane {
         index,
@@ -136,10 +150,13 @@ mod tests {
             index: PaneIndex(1),
             cwd: "/home/user/proj".into(),
             program: CapturedProgram::new("vim", vec!["vim".to_string(), "DESIGN.md".to_string()]),
-            content: Some(PaneContent::new(vec![
-                "line one".to_string(),
-                "line two".to_string(),
-            ])),
+            content: Some(PaneContent::new(
+                PaneId(1),
+                42,
+                4096,
+                vec!["line one".to_string(), "line two".to_string()],
+                vec!["line two".to_string()],
+            )),
         };
         let window = Window::new(
             WindowIndex(0),

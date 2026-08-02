@@ -3,9 +3,11 @@
 
 mod argv;
 mod capture;
+mod content;
 mod fold;
 mod row;
 
-pub use capture::{capture, CaptureError};
+pub use capture::{capture, CaptureError, ContentCapture};
+pub use content::PreviousPaneContent;
 pub use fold::FoldError;
 pub use row::{format_string, parse_row, PaneRow, RowParseError};

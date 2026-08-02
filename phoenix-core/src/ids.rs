@@ -53,6 +53,18 @@ pub struct WindowIndex(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneIndex(pub u32);
 
+/// tmux's own globally-assigned pane identifier (`%N` on the wire —
+/// `tmux_control::protocol::ids::PaneId` is the same idea at the protocol
+/// layer, deliberately a separate type here for the same reason
+/// `phoenix_core::TmuxVersion` is separate from `tmux_control`'s: this
+/// crate depends on nothing tmux-control-specific, see `version.rs`).
+/// Unlike [`PaneIndex`] (a window-relative position that shifts if a
+/// sibling pane is added or removed), `PaneId` is stable for a pane's whole
+/// lifetime — the correlator content-capture's dirty-tracking needs to
+/// recognize "the same pane as last capture" across saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PaneId(pub u32);
+
 #[cfg(test)]
 mod tests {
     use super::*;

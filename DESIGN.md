@@ -273,6 +273,23 @@ is best-effort per pane: an unresponsive pane degrades *that* pane's content to 
 with a recorded warning and marks the save `degraded` — never nukes the snapshot, never
 pretends (`[LAW:no-silent-failure]`).
 
+**Content capture implementation notes (tmux-content-dos.1, verified live):**
+`#{history_size}`/`#{history_bytes}` are stable while a pane is idle and move on any
+output, so one `list-panes -a -F` pull of `#{pane_id} #{history_size} #{history_bytes}`
+is the free per-save dirty indicator. A pane whose indicator matches what the *previous*
+capture recorded reuses that scrollback unchanged; every other pane (including one never
+seen before) gets a fresh `capture-pane -p -e -S -`. The small visible screen
+(`capture-pane -p -e`, no `-S`) is *always* re-pulled regardless, since an alt-screen TUI
+can redraw without ever touching scrollback. `capture-pane` targets a bare `%N` pane id
+directly — no `session:window.pane` needed. The correlator across saves is tmux's own
+pane id (`phoenix_core::PaneId`, living on `PaneContent`, not `Pane` — window-relative
+`PaneIndex` shifts if a sibling pane is added or removed, but a pane id doesn't).
+`phoenix-capture` has no persistence dependency of its own, so it never loads "the
+previous capture" itself — the caller (ultimately whatever loaded the last `Snapshot`)
+hands in a `HashMap<pane_id, PreviousPaneContent>`. Program output isn't guaranteed valid
+UTF-8 the way structural fields are, so captured lines are lossily decoded (U+FFFD for
+bad sequences) rather than failing the pane.
+
 ---
 
 ## 6. Restore — plan, then apply

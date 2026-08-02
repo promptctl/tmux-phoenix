@@ -13,7 +13,7 @@ mod time;
 mod version;
 
 pub use content::PaneContent;
-pub use ids::{Layout, PaneIndex, SessionName, WindowIndex, WindowName};
+pub use ids::{Layout, PaneId, PaneIndex, SessionName, WindowIndex, WindowName};
 pub use nonempty::NonEmpty;
 pub use path::Utf8PathBuf;
 pub use program::CapturedProgram;

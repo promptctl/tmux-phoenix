@@ -23,7 +23,8 @@ fn live_capture_round_trips_a_single_session_window_pane() {
     let harness = IsolatedTmux::new("capture-simple");
     let mut client = connect(&harness);
 
-    let snapshot = phoenix_capture::capture(&mut client).expect("capture failed");
+    let snapshot = phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
+        .expect("capture failed");
 
     assert_eq!(snapshot.sessions.len(), 1);
     let session = snapshot.sessions.first();
@@ -67,7 +68,8 @@ fn live_capture_tracks_the_real_active_window_and_pane() {
     let real_window_index: u32 = real_window_index.parse().unwrap();
     let real_pane_index: u32 = real_pane_index.parse().unwrap();
 
-    let snapshot = phoenix_capture::capture(&mut client).expect("capture failed");
+    let snapshot = phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
+        .expect("capture failed");
     let session = snapshot.sessions.first();
     assert_eq!(session.windows().len(), 3);
     assert_eq!(session.active().0, real_window_index);
@@ -91,7 +93,8 @@ fn live_capture_recovers_the_foreground_programs_argv() {
     // itself mid-fork.
     let mut argv = Vec::new();
     for _ in 0..30 {
-        let snapshot = phoenix_capture::capture(&mut client).expect("capture failed");
+        let snapshot = phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
+            .expect("capture failed");
         let pane = snapshot.sessions.first().active_window().active_pane();
         if pane.program.command == "sleep" {
             argv = pane.program.argv.clone();
@@ -119,7 +122,8 @@ fn live_capture_structure_matches_the_raw_list_panes_pane_count() {
         .unwrap();
     let raw_pane_count = raw.lines.len();
 
-    let snapshot = phoenix_capture::capture(&mut client).expect("capture failed");
+    let snapshot = phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
+        .expect("capture failed");
     let captured_pane_count: usize = snapshot
         .sessions
         .iter()

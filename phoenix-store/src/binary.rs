@@ -33,6 +33,10 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    pub fn write_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
     pub fn write_bytes(&mut self, v: &[u8]) {
         self.write_u32(v.len() as u32);
         self.buf.extend_from_slice(v);
@@ -104,6 +108,11 @@ impl<'a> Reader<'a> {
     pub fn read_i64(&mut self) -> Result<i64, StoreError> {
         let bytes: [u8; 8] = self.take(8)?.try_into().expect("take(8) returns 8 bytes");
         Ok(i64::from_le_bytes(bytes))
+    }
+
+    pub fn read_u64(&mut self) -> Result<u64, StoreError> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().expect("take(8) returns 8 bytes");
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn read_bytes(&mut self) -> Result<&'a [u8], StoreError> {

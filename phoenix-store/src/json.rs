@@ -139,10 +139,18 @@ fn pane_value(pane: &phoenix_core::Pane) -> Value {
             Value::Array(pane.program.argv.iter().cloned().map(Value::Str).collect()),
         ),
         (
-            "content_lines",
+            "content",
             match &pane.content {
                 None => Value::Number(-1), // no content captured for this pane
-                Some(content) => Value::Number(content.lines.len() as i64),
+                Some(content) => Value::Object(vec![
+                    ("history_size", Value::Number(content.history_size as i64)),
+                    ("history_bytes", Value::Number(content.history_bytes as i64)),
+                    (
+                        "scrollback_lines",
+                        Value::Number(content.scrollback.len() as i64),
+                    ),
+                    ("visible_lines", Value::Number(content.visible.len() as i64)),
+                ]),
             },
         ),
     ])
