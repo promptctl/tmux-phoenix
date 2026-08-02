@@ -22,11 +22,24 @@
 //!   transport reintroduces the exact off-by-one this module exists to
 //!   prevent — `connect()` is the safe default.
 //!
-//! No typed notification dispatch yet: a `ServerMessage` observed while
-//! waiting for a reply that isn't part of that reply (a notification) is
-//! buffered verbatim in [`Client::drain_notifications`] rather than
-//! dropped — nothing is silently lost — but there is no subscriber/event
-//! API yet; that shape is ticket `.5`'s job.
+//! Notifications dispatch as typed [`ServerMessage`] events to a registered
+//! subscriber. Pane output (`%output`/`%extended-output`) never goes
+//! through that path — it is high-volume and mixing it into the
+//! notification stream is how you get head-of-line blocking — it routes
+//! through a separate byte sink instead ([`Client::on_pane_output`]). If no
+//! sink is registered for either path, messages are buffered rather than
+//! dropped ([`Client::drain_notifications`], [`Client::drain_pane_output`]):
+//! nothing is silently lost just because a caller hasn't wired up a
+//! subscriber yet.
+//!
+//! A registered sink only fires while some blocking call
+//! (`execute`/`connect`/`reconnect`) is actively reading — this client has
+//! no background thread of its own, so "dispatch" here means "synchronously
+//! invoked the moment a message is parsed during one of those calls," not
+//! "delivered independently of any call in progress." A caller that wants
+//! to react to notifications while otherwise idle needs to poll (e.g. call
+//! `execute` on some interval, or a later layer that owns a dedicated
+//! read thread) — that policy belongs above this crate, not in it.
 
 mod connection_state;
 mod error;
@@ -34,7 +47,7 @@ mod error;
 pub use connection_state::{CloseReason, ConnectionState};
 pub use error::TmuxError;
 
-use crate::protocol::{Codec, Guard, ServerMessage};
+use crate::protocol::{Codec, Guard, PaneId, ServerMessage};
 use crate::transport::Transport;
 use std::collections::VecDeque;
 
@@ -46,15 +59,21 @@ pub struct CommandOutput {
     pub lines: Vec<Vec<u8>>,
 }
 
+type NotificationSink = Box<dyn FnMut(ServerMessage)>;
+type PaneOutputSink = Box<dyn FnMut(PaneId, Vec<u8>)>;
+
 /// Correlates commands to replies over a [`Transport`] + [`Codec`] pair.
 pub struct Client<T: Transport> {
     transport: T,
     codec: Codec,
-    /// `ServerMessage`s observed while waiting for a reply that were not
-    /// part of that reply (notifications) — buffered, not dropped. See
-    /// module docs: no typed dispatch yet, this is the interim non-lossy
-    /// holding area.
+    /// Non-pane-output `ServerMessage`s with no registered
+    /// [`Client::on_notification`] sink — buffered, not dropped.
     notifications: VecDeque<ServerMessage>,
+    /// `%output`/`%extended-output` bytes with no registered
+    /// [`Client::on_pane_output`] sink — buffered, not dropped.
+    pane_output: VecDeque<(PaneId, Vec<u8>)>,
+    notification_sink: Option<NotificationSink>,
+    pane_output_sink: Option<PaneOutputSink>,
     state: ConnectionState,
 }
 
@@ -68,6 +87,9 @@ impl<T: Transport> Client<T> {
             transport,
             codec: Codec::new(),
             notifications: VecDeque::new(),
+            pane_output: VecDeque::new(),
+            notification_sink: None,
+            pane_output_sink: None,
             state: ConnectionState::Ready,
         }
     }
@@ -82,6 +104,9 @@ impl<T: Transport> Client<T> {
             transport,
             codec: Codec::new(),
             notifications: VecDeque::new(),
+            pane_output: VecDeque::new(),
+            notification_sink: None,
+            pane_output_sink: None,
             state: ConnectionState::Connecting,
         };
         client.consume_greeting()?;
@@ -137,12 +162,11 @@ impl<T: Transport> Client<T> {
             // both the greeting's terminator *and* trailing bytes after it
             // (a notification tmux wrote right behind it). Returning the
             // instant the terminator is seen would drop the rest of that
-            // batch, so draining continues — routing anything past the
-            // terminator to `notifications` — until the whole batch is
-            // consumed.
+            // batch, so draining continues — dispatching anything past the
+            // terminator — until the whole batch is consumed.
             for msg in self.codec.feed(&buf[..n]) {
                 if settled {
-                    self.notifications.push_back(msg);
+                    self.dispatch(msg);
                     continue;
                 }
                 match msg {
@@ -157,12 +181,33 @@ impl<T: Transport> Client<T> {
                         self.state = ConnectionState::Ready;
                         settled = true;
                     }
-                    other => self.notifications.push_back(other),
+                    other => self.dispatch(other),
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Route a parsed message to its sink (`[LAW:single-enforcer]` — the
+    /// one place that decides notification vs. pane-output vs. buffered
+    /// fallback). Only ever called with messages that are neither guard
+    /// framing nor command output — those are handled by their own callers
+    /// before reaching here.
+    fn dispatch(&mut self, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Output { pane, data }
+            | ServerMessage::ExtendedOutput { pane, data, .. } => {
+                match &mut self.pane_output_sink {
+                    Some(sink) => sink(pane, data),
+                    None => self.pane_output.push_back((pane, data)),
+                }
+            }
+            other => match &mut self.notification_sink {
+                Some(sink) => sink(other),
+                None => self.notifications.push_back(other),
+            },
+        }
     }
 
     /// The single command-dispatch path (`[LAW:single-enforcer]`). Sends
@@ -216,12 +261,11 @@ impl<T: Transport> Client<T> {
             // block). codec.feed() hands back every message in that chunk
             // as one Vec — stopping at the first settling message here
             // would silently drop everything after it in the same batch, so
-            // once `outcome` is set the loop keeps draining, routing
-            // anything further to `notifications` instead of returning
-            // early.
+            // once `outcome` is set the loop keeps draining, dispatching
+            // anything further instead of returning early.
             for msg in self.codec.feed(&buf[..n]) {
                 if outcome.is_some() {
-                    self.notifications.push_back(msg);
+                    self.dispatch(msg);
                     continue;
                 }
                 match msg {
@@ -251,7 +295,7 @@ impl<T: Transport> Client<T> {
                             line,
                         }));
                     }
-                    other => self.notifications.push_back(other),
+                    other => self.dispatch(other),
                 }
             }
         }
@@ -259,10 +303,32 @@ impl<T: Transport> Client<T> {
         outcome.expect("loop only exits once outcome is Some")
     }
 
-    /// Drain every `ServerMessage` that arrived while an `execute()` call
-    /// was waiting for its own reply but wasn't part of that reply.
+    /// Register the sink every non-pane-output `ServerMessage` dispatches
+    /// to from now on, replacing any previously registered sink. Messages
+    /// already buffered before this call stay buffered — call
+    /// [`Client::drain_notifications`] first if you want them too.
+    pub fn on_notification(&mut self, sink: impl FnMut(ServerMessage) + 'static) {
+        self.notification_sink = Some(Box::new(sink));
+    }
+
+    /// Register the sink `%output`/`%extended-output` bytes dispatch to
+    /// from now on, replacing any previously registered sink. High-volume
+    /// and kept off the notification path entirely (module docs) so it
+    /// never head-of-line-blocks other notifications.
+    pub fn on_pane_output(&mut self, sink: impl FnMut(PaneId, Vec<u8>) + 'static) {
+        self.pane_output_sink = Some(Box::new(sink));
+    }
+
+    /// Drain every non-pane-output `ServerMessage` that arrived with no
+    /// [`Client::on_notification`] sink registered at the time.
     pub fn drain_notifications(&mut self) -> Vec<ServerMessage> {
         self.notifications.drain(..).collect()
+    }
+
+    /// Drain every `%output`/`%extended-output` chunk that arrived with no
+    /// [`Client::on_pane_output`] sink registered at the time.
+    pub fn drain_pane_output(&mut self) -> Vec<(PaneId, Vec<u8>)> {
+        self.pane_output.drain(..).collect()
     }
 
     /// The wire-level detach signal: a bare `\n` (SPEC §4.1). Deliberately
