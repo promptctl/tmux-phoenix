@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tmux-control", "phoenix-core"]
+members = ["tmux-control", "phoenix-core", "phoenix-capture"]
 
 [workspace.package]
 edition = "2021"

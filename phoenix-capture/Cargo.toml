@@ -1,0 +1,9 @@
+[package]
+name = "phoenix-capture"
+version = "0.1.0"
+edition.workspace = true
+description = "Interrogates a live tmux server into a phoenix-core Snapshot"
+
+[dependencies]
+phoenix-core = { path = "../phoenix-core" }
+tmux-control = { path = "../tmux-control" }
