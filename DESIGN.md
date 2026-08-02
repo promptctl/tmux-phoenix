@@ -119,6 +119,18 @@ enum ServerMessage {
 }
 ```
 
+The implementation adds two more variants beyond this SPEC §23 catalogue, both
+required for the guard-block state machine itself to stay total: `CommandOutput
+{ command_number: u32, line: Vec<u8> }` for a line of command-response text
+between `%begin` and `%end`/`%error` (SPEC §23 only catalogues `%`-prefixed
+protocol lines — a command's actual output, e.g. a `list-panes` row, has no
+wire type of its own and needs a home too), and `ProtocolError { command_number:
+u32, line: Vec<u8> }` for a `%end`/`%error` that arrives positionally as the
+open block's terminator but fails to parse — force-closing the block instead
+of leaving it open forever, which would otherwise silently misroute every
+subsequent line, notifications included, as output for a command that will
+never settle.
+
 Supporting pure pieces:
 
 - **Typed IDs.** `SessionId`, `WindowId`, `PaneId` are newtypes that parse the
