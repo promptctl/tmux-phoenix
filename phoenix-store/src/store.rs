@@ -151,6 +151,16 @@ impl Store {
         decode_file(&bytes)
     }
 
+    /// Loads a specific generation file directly by path — for `restore
+    /// --file <path>` (DESIGN.md §9), independent of this store's own
+    /// `latest`/generation bookkeeping. Not a method on a particular
+    /// generation since the path need not even be inside this store's `dir`
+    /// (e.g. a snapshot copied in from elsewhere).
+    pub fn load_file(path: &Path) -> Result<Snapshot, StoreError> {
+        let bytes = fs::read(path)?;
+        decode_file(&bytes)
+    }
+
     /// Every generation's id, newest first.
     fn generation_ids_desc(&self) -> io::Result<Vec<i64>> {
         let mut ids: Vec<i64> = match fs::read_dir(&self.dir) {
@@ -278,6 +288,17 @@ mod tests {
 
         store.save(&snapshot, 5).unwrap();
         let loaded = store.load_latest().unwrap();
+        assert_eq!(loaded, snapshot);
+    }
+
+    #[test]
+    fn load_file_reads_a_specific_generation_by_path_directly() {
+        let dir = TestDir::new("load-file");
+        let store = Store::new(&dir.0);
+        let snapshot = snapshot_at(1_700_000_000);
+
+        let outcome = store.save(&snapshot, 5).unwrap();
+        let loaded = Store::load_file(&outcome.path).unwrap();
         assert_eq!(loaded, snapshot);
     }
 

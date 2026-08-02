@@ -3,7 +3,10 @@
 //! diagnostic goes to stderr, prefixed with the subcommand so `phoenix save`
 //! and `phoenix list` output can be told apart in a combined log.
 
+use std::path::Path;
+
 use phoenix_core::Snapshot;
+use phoenix_restore::RestorePolicy;
 use phoenix_store::Store;
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
@@ -12,6 +15,17 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_DEGRADED: i32 = 3;
 pub const EXIT_FAIL: i32 = 1;
 
+/// `attach-session` (no `-t`, so it attaches to the server's
+/// most-recently-used session) needs *some* session to already exist on
+/// the target server. That's always true for `save` (it's reading a live
+/// session) and true for `restore` whenever it runs against an
+/// already-running server. Bootstrapping a restore onto a completely
+/// empty/nonexistent server — where `attach-session` has nothing to attach
+/// to at all — is out of scope here; verified live that it needs a
+/// different connection strategy (bare `tmux -C` will auto-create its own
+/// throwaway session just to have somewhere to attach, which would need
+/// cleaning up afterward). That's the daemon's boot-restore job (DESIGN.md
+/// §8), a later milestone, not this CLI command's.
 fn connect(socket: Option<String>) -> Result<Client<SpawnTransport>, String> {
     let transport = SpawnTransport::spawn(
         &["attach-session"],
@@ -117,6 +131,71 @@ pub fn run_list() -> i32 {
         }
         Err(e) => {
             eprintln!("phoenix list: {e}");
+            EXIT_FAIL
+        }
+    }
+}
+
+/// `file`: load that snapshot file directly (DESIGN.md §9's `restore
+/// --file`); otherwise load the store's `latest`.
+fn load_snapshot(file: Option<&str>) -> Result<Snapshot, String> {
+    match file {
+        Some(path) => {
+            Store::load_file(Path::new(path)).map_err(|e| format!("failed to load {path:?}: {e}"))
+        }
+        None => {
+            let store = open_store()?;
+            store
+                .load_latest()
+                .map_err(|e| format!("failed to load the latest snapshot: {e}"))
+        }
+    }
+}
+
+/// `--dry-run` prints exactly the tmux command lines that would run and
+/// executes nothing — DESIGN.md §6's safety property for a tool that can
+/// `send-keys` into live shells.
+pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) -> i32 {
+    let snapshot = match load_snapshot(file.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("phoenix restore: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    let restore_plan = phoenix_restore::plan(&snapshot, &RestorePolicy);
+
+    if dry_run {
+        for cmd in &restore_plan.commands {
+            println!("{}", cmd.to_command_string());
+        }
+        return EXIT_OK;
+    }
+
+    let mut client = match connect(socket) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("phoenix restore: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    let result = phoenix_restore::apply(&mut client, &restore_plan);
+    client.close();
+
+    match result {
+        Ok(outcome) => {
+            println!(
+                "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
+                snapshot.sessions.len(),
+                outcome.executed,
+                outcome.skipped_move_window
+            );
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("phoenix restore: {e}");
             EXIT_FAIL
         }
     }
