@@ -289,6 +289,21 @@ verdict, resolved by a pure function into `Restore`/`Skip`/`Ask`): interactively
 default and is logged, so a boot never blocks and never escalates. *(Full permission
 model deferred to a later milestone; the default-safe behavior ships first.)*
 
+**Implementation notes (found by running the plan against a real tmux server, not
+assumed):** `new-session` has no flag to request a specific window index — the
+window lands wherever the target server's `base-index` config puts it — so `plan`
+always follows a session's `new-session` with a `move-window` relocating it to the
+captured index (bare `-s <session>` as source resolves to the session's current,
+and right after creation only, window). That move can legitimately fail with tmux's
+"same index" error when the window already happened to land there; the executor
+must treat exactly that as success. Panes have no such fix-up available at all —
+`split-window` takes no index and there's no pane equivalent of `move-window` — so
+the plan never targets a pane by index: instead each window's originally-active
+pane is always the *last* one `split-window`'d (verified live that the most
+recently split pane stays active through a following `select-layout`), which means
+`select-pane` never actually appears in a plan despite being one of the tmux
+primitives this milestone's ticket named.
+
 ---
 
 ## 7. Persistence

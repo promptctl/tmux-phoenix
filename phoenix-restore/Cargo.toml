@@ -1,0 +1,9 @@
+[package]
+name = "phoenix-restore"
+version = "0.1.0"
+edition.workspace = true
+description = "Pure Snapshot -> RestorePlan planning for tmux-phoenix"
+
+[dependencies]
+phoenix-core = { path = "../phoenix-core" }
+tmux-control = { path = "../tmux-control" }
