@@ -2,10 +2,11 @@
 //! from a live tmux via a `MockTransport` that hands back pre-scripted
 //! byte chunks — exactly the testability DESIGN.md §3.2 calls out
 //! (`Transport` exists so codec and client are testable without a live
-//! tmux). Deliberately does NOT feed a startup-greeting block first: per
-//! `client/mod.rs`'s module docs, `execute()` assumes the stream is already
-//! positioned past it (ticket `.4`'s job) — these tests exercise that
-//! assumed-correct-position case directly, one layer at a time.
+//! tmux). Uses `Client::new` throughout, which starts `Ready` with no
+//! greeting handshake — the right choice here since these tests are about
+//! FIFO correlation, not the handshake itself. `Client::connect`'s greeting
+//! consumption and the `ConnectionState` gate it enforces are covered
+//! separately in `connection_state.rs`.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -334,7 +335,13 @@ fn close_delegates_to_transport_close() {
     let mut client = Client::new(transport);
     client.close();
     assert!(*state.closed.borrow());
-    // Further sends should now be refused by the mock's own closed check.
+    assert_eq!(
+        client.state(),
+        tmux_control::ConnectionState::Closed {
+            reason: tmux_control::CloseReason::Disposed
+        }
+    );
+    // The state gate refuses before ever touching the transport again.
     let err = client.execute("anything").unwrap_err();
-    assert!(matches!(err, TmuxError::Send(_)));
+    assert!(matches!(err, TmuxError::NotReady(_)));
 }

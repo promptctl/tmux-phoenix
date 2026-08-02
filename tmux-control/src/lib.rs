@@ -9,7 +9,7 @@ pub mod client;
 pub mod protocol;
 pub mod transport;
 
-pub use client::{Client, CommandOutput, TmuxError};
+pub use client::{Client, CloseReason, CommandOutput, ConnectionState, TmuxError};
 pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
     SessionId, WindowId,

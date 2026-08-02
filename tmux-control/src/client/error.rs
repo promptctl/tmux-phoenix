@@ -1,10 +1,16 @@
+use crate::client::ConnectionState;
 use crate::protocol::Guard;
 use std::fmt;
 use std::io;
 
-/// Everything `Client::execute` can fail with.
+/// Everything `Client::execute`/`connect`/`reconnect` can fail with.
 #[derive(Debug)]
 pub enum TmuxError {
+    /// `execute()` was called while `Client::state()` wasn't `Ready` — a
+    /// command sent during `Connecting`/`Reconnecting` would correlate
+    /// against the wrong guard block; `Closed` has no transport to send on
+    /// at all.
+    NotReady(ConnectionState),
     /// The transport refused or failed to send the command.
     Send(io::Error),
     /// A read from the transport failed (distinct from a clean close, which
@@ -26,6 +32,7 @@ pub enum TmuxError {
 impl fmt::Display for TmuxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TmuxError::NotReady(state) => write!(f, "client is not ready (state: {state:?})"),
             TmuxError::Send(err) => write!(f, "failed to send command: {err}"),
             TmuxError::Read(err) => write!(f, "failed to read from transport: {err}"),
             TmuxError::TransportClosed => {
