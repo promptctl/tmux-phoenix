@@ -262,10 +262,6 @@ and should stay even as the floor gets filled in:
 - **Content-addressed, deduplicated scrollback storage**, rather than a new flat copy of pane
   content on every save. This is already more storage-efficient than anything either old tool
   does.
-- **Real, generated service units for boot supervision**, not a terminal-window-launching
-  hack. `phoenix install` should keep writing an actual `launchd`/`systemd` unit and leaving
-  activation as an explicit, user-run step — never silently enabling a persistent background
-  process as a side effect of running a command.
 
 ---
 
