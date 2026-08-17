@@ -16,17 +16,13 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_DEGRADED: i32 = 3;
 pub const EXIT_FAIL: i32 = 1;
 
-/// `attach-session` (no `-t`, so it attaches to the server's
-/// most-recently-used session) needs *some* session to already exist on
-/// the target server. That's always true for `save` (it's reading a live
-/// session) and true for `restore` whenever it runs against an
-/// already-running server. Bootstrapping a restore onto a completely
-/// empty/nonexistent server — where `attach-session` has nothing to attach
-/// to at all — is out of scope here; verified live that it needs a
-/// different connection strategy (bare `tmux -C` will auto-create its own
-/// throwaway session just to have somewhere to attach, which would need
-/// cleaning up afterward). That's the daemon's boot-restore job (DESIGN.md
-/// §8), a later milestone, not this CLI command's.
+/// The `save` connector: bare `attach-session` (no `-t`, so it attaches to
+/// the server's most-recently-used session), which needs *some* session to
+/// already exist — always true for `save`, since it's reading a live server
+/// the user is looking at. `restore` deliberately does *not* use this: it can
+/// run against an empty or not-yet-running server, so it goes through
+/// `phoenix_restore::connect_and_apply`, which bootstraps a throwaway session
+/// when there's nothing to attach to (tmux-parity-ure.1).
 fn connect(socket: Option<String>) -> Result<Client<SpawnTransport>, String> {
     let transport = SpawnTransport::spawn(
         &["attach-session"],
@@ -277,19 +273,12 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
         };
     }
 
-    let mut client = match connect(socket) {
-        Ok(c) => c,
-        Err(msg) => {
-            eprintln!("phoenix restore: {msg}");
-            return EXIT_FAIL;
-        }
-    };
-
-    let result = phoenix_restore::apply(&mut client, &restore_plan);
-    client.close();
-
-    match result {
-        Ok(outcome) => {
+    // One connection strategy, shared with the daemon's boot restore
+    // (tmux-parity-ure.1): bootstraps a throwaway session when the target
+    // server is empty or not yet running, and leaves none behind.
+    match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan) {
+        Ok((mut client, outcome)) => {
+            client.close();
             println!(
                 "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
                 snapshot.sessions.len(),

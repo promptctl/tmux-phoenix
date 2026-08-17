@@ -28,12 +28,11 @@
 use std::process::Command;
 
 use phoenix_restore::{
-    apply, default_rules_path, load_rules_file, plan, resolve_non_interactive, ApplyError,
+    connect_and_apply, count_sessions, default_rules_path, load_rules_file, plan,
+    resolve_non_interactive, ConnectApplyError, BOOTSTRAP_SESSION,
 };
 use phoenix_store::{Store, StoreError};
 use tmux_control::{socket_args, Client, SpawnOptions, SpawnTransport, TmuxError};
-
-const BOOTSTRAP_SESSION: &str = "phoenix-boot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootDecision {
@@ -67,7 +66,9 @@ pub enum BootError {
     Io(std::io::Error),
     Tmux(TmuxError),
     Store(StoreError),
-    Restore(ApplyError),
+    /// The shared restore connection strategy (`connect_and_apply`) failed —
+    /// carries its own already-specific message (spawn/connect/apply/bootstrap).
+    ConnectApply(ConnectApplyError),
 }
 
 impl std::fmt::Display for BootError {
@@ -76,34 +77,23 @@ impl std::fmt::Display for BootError {
             BootError::Io(e) => write!(f, "{e}"),
             BootError::Tmux(e) => write!(f, "{e}"),
             BootError::Store(e) => write!(f, "{e}"),
-            BootError::Restore(e) => write!(f, "{e}"),
+            BootError::ConnectApply(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for BootError {}
 
+impl From<ConnectApplyError> for BootError {
+    fn from(e: ConnectApplyError) -> Self {
+        BootError::ConnectApply(e)
+    }
+}
+
 fn spawn_options(socket: Option<String>) -> SpawnOptions {
     SpawnOptions {
         socket,
         ..Default::default()
-    }
-}
-
-/// A plain (non-control-mode) `list-sessions` — doesn't attach, doesn't
-/// create anything. `Ok(0)` covers both "server doesn't exist yet" and "no
-/// sessions" identically, which is exactly the distinction this module
-/// doesn't need to make (either way, we're the one bootstrapping).
-fn count_existing_sessions(socket: Option<&str>) -> usize {
-    let mut cmd = Command::new("tmux");
-    cmd.args(socket_args(socket));
-    cmd.args(["list-sessions", "-F", "#{session_name}"]);
-    match cmd.output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .count(),
-        _ => 0,
     }
 }
 
@@ -124,7 +114,7 @@ pub fn connect_and_boot(
     store: &Store,
     mut on_log: impl FnMut(&str),
 ) -> Result<Client<SpawnTransport>, BootError> {
-    let existing = count_existing_sessions(socket.as_deref());
+    let existing = count_sessions(socket.as_deref());
     let latest = store.load_latest();
     let has_snapshot = !matches!(latest, Err(StoreError::NoLatest));
 
@@ -148,12 +138,6 @@ pub fn connect_and_boot(
         }
         BootDecision::RestoreLatest => {
             let snapshot = latest.map_err(BootError::Store)?;
-            run_tmux(
-                socket.as_deref(),
-                &["new-session", "-d", "-s", BOOTSTRAP_SESSION],
-            )
-            .map_err(BootError::Io)?;
-            let mut client = connect_to(socket.clone(), BOOTSTRAP_SESSION)?;
 
             // tmux-permissions-16s: a boot restore never prompts (there's
             // nobody to ask) — an already-learned rule is still honored,
@@ -185,29 +169,14 @@ pub fn connect_and_boot(
             });
 
             let restore_plan = plan(&snapshot, &policy);
-            apply(&mut client, &restore_plan).map_err(BootError::Restore)?;
-            let restored_sessions = snapshot.sessions.len();
-
-            // Reconnect onto a real restored session before tearing down
-            // the bootstrap one — see the module doc comment for why this
-            // order is load-bearing, not just tidy.
-            let target = snapshot.sessions.first().name().as_str().to_string();
-            let fresh_transport = SpawnTransport::spawn(
-                &["attach-session", "-t", &target],
-                &spawn_options(socket.clone()),
-            )
-            .map_err(BootError::Io)?;
-            client
-                .reconnect(fresh_transport, 0)
-                .map_err(BootError::Tmux)?;
-
-            let _ = run_tmux(
-                socket.as_deref(),
-                &["kill-session", "-t", BOOTSTRAP_SESSION],
-            );
+            // The bootstrap-connect-apply-reconnect-teardown dance lives in
+            // `phoenix-restore` now, shared verbatim with the CLI's `restore`
+            // (tmux-parity-ure.1) — one connection strategy, one place.
+            let (client, _outcome) = connect_and_apply(socket, &snapshot, &restore_plan)?;
 
             on_log(&format!(
-                "restored {restored_sessions} session(s) from the latest snapshot"
+                "restored {} session(s) from the latest snapshot",
+                snapshot.sessions.len()
             ));
             Ok(client)
         }
