@@ -5,17 +5,9 @@
 mod apply;
 mod command;
 mod connect;
-mod permission;
 mod plan;
-mod policy;
 
 pub use apply::{apply, ApplyError, ApplyErrorSource, ApplyOutcome};
 pub use command::{PlanStep, TmuxCommand};
 pub use connect::{connect_and_apply, count_sessions, ConnectApplyError, BOOTSTRAP_SESSION};
-pub use permission::{
-    default_choice_for, default_rules_path, load_rules_file, parse_prompt_choice,
-    resolve_interactive, resolve_non_interactive, save_rules_file, Matcher, PromptChoice,
-    Resolution, Rule, RuleSet, Verdict,
-};
 pub use plan::{plan, RestorePlan};
-pub use policy::{PaneLocation, RestorePolicy};

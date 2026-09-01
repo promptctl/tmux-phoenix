@@ -28,8 +28,7 @@
 use std::process::Command;
 
 use phoenix_restore::{
-    connect_and_apply, count_sessions, default_rules_path, load_rules_file, plan,
-    resolve_non_interactive, ConnectApplyError, BOOTSTRAP_SESSION,
+    connect_and_apply, count_sessions, plan, ConnectApplyError, BOOTSTRAP_SESSION,
 };
 use phoenix_store::{Store, StoreError};
 use tmux_control::{socket_args, Client, SpawnOptions, SpawnTransport, TmuxError};
@@ -139,36 +138,7 @@ pub fn connect_and_boot(
         BootDecision::RestoreLatest => {
             let snapshot = latest.map_err(BootError::Store)?;
 
-            // tmux-permissions-16s: a boot restore never prompts (there's
-            // nobody to ask) — an already-learned rule is still honored,
-            // but anything that would need a real `Ask` falls to the safe
-            // "cwd + shell only" default and is logged, never silently
-            // escalated. A rules-file load problem (missing HOME, a
-            // permissions error) is likewise non-fatal to the restore
-            // itself: it just means every relaunch decision falls to that
-            // same safe default, same as an empty ruleset would.
-            let ruleset = default_rules_path()
-                .and_then(|path| load_rules_file(&path))
-                .map(|(ruleset, warnings)| {
-                    for warning in warnings {
-                        on_log(&format!("relaunch rules file: {warning}"));
-                    }
-                    ruleset
-                })
-                .unwrap_or_else(|e| {
-                    on_log(&format!(
-                        "couldn't load relaunch rules ({e}); no program will be relaunched"
-                    ));
-                    Default::default()
-                });
-            let policy = resolve_non_interactive(&snapshot, &ruleset, |location, program| {
-                on_log(&format!(
-                    "{}:{}.{} ({}) needs consent to relaunch; skipping (boot restore never prompts)",
-                    location.session, location.window.0, location.pane.0, program.command
-                ));
-            });
-
-            let restore_plan = plan(&snapshot, &policy);
+            let restore_plan = plan(&snapshot);
             // The bootstrap-connect-apply-reconnect-teardown dance lives in
             // `phoenix-restore` now, shared verbatim with the CLI's `restore`
             // (tmux-parity-ure.1) — one connection strategy, one place.

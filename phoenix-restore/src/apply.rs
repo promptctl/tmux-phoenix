@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
-use crate::command::{PlanStep, TmuxCommand};
+use crate::command::{shell_quote, PlanStep, TmuxCommand};
 use crate::plan::RestorePlan;
 
 #[derive(Debug)]
@@ -133,14 +133,6 @@ fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource
             .to_command_line()
             .map_err(|e| ApplyErrorSource::Tmux(e.into())),
     }
-}
-
-/// POSIX-shell single-quoting. `send-keys` types this text into the pane,
-/// where a *shell* — not tmux — parses it, so tmux's own argument escaping
-/// (which `CommandLine` applies to the argument as a whole) is the wrong
-/// grammar for the text inside it.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn write_replay_temp_file(lines: &[String]) -> io::Result<PathBuf> {

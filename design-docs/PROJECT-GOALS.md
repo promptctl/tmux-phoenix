@@ -72,14 +72,14 @@ tmux-resurrect doesn't have (it has no preview mode at all). Captured scrollback
 into each pane immediately after it's created, so restored panes aren't just structurally
 correct but show their prior history.
 
-**Program relaunch.** Restore defaults to *shell + working directory only* — it never
-blindly re-executes whatever was running in a pane. Relaunching a pane's captured program is
-consent-gated: interactively, each candidate is a prompt (once / always for this exact
-command / always for this program / no); a granted decision is remembered
-(`${XDG_CONFIG_HOME}/tmux-phoenix/relaunch.rules`) so the same prompt doesn't repeat. This is
-a different mechanism from tmux-resurrect's static `@resurrect-processes` allowlist string —
-phoenix's version is interactive and self-training rather than something you hand-edit in
-`.tmux.conf` — but it does not yet cover resurrect's per-program *strategies* (see §3).
+**Program relaunch.** Restore replays each pane's captured foreground command line, so a
+pane that was running `vim foo.txt` comes back running it. Capture recovers that command line
+by walking from the pane's shell down to whichever child currently holds the foreground
+process group, which means it records the program actually running, not just the pane's
+shell. A pane with no captured foreground program restores as a fresh shell in its working
+directory. What phoenix does not yet have is resurrect's per-program *strategies* — knowing
+that `vim` is best restored through its session file rather than by re-running the binary
+(see §3).
 
 **Continuous daemon.** `phoenix daemon` holds one open connection and subscribes to
 structural change notifications; it saves once activity has been quiet for a debounce window
@@ -123,7 +123,7 @@ GitHub), not memory of what they do.
 | Autosave mechanism | Hijacks `status-right` redraws; silently stops if the status line is off or another plugin overwrites `status-right` | Event-driven off tmux's own change subscriptions; no status-line dependency |
 | Autosave failure mode | Fragile, undetectable when broken | Debounce + max-interval backstop, logged failures, connection auto-recovers |
 | Boot-time service integration | macOS: opens a real terminal window and runs `tmux` in it. Linux: starts only the bare tmux server, docs call this "incomplete," help wanted | Generates a real `launchd`/`systemd --user` unit that runs the daemon headless on both platforms |
-| Program relaunch consent | Static allowlist string in `.tmux.conf`, user must hand-edit `~`/`->`/`*` syntax | Interactive prompt at restore time, remembered per-program or per-exact-command |
+| Restoring onto an empty or not-yet-running server | Boot integration starts a server first, then restores into it | `phoenix restore` and the daemon's boot restore share one connection strategy that bootstraps an empty server itself |
 | Multi-server disambiguation | Only the first-started server gets autosave/autorestore; later servers get neither | `--socket` explicitly targets any server by name or path; each daemon instance is scoped to the socket it's given |
 
 ### Real gaps — not yet at parity
@@ -146,23 +146,14 @@ implement. None are architecture blockers; they're scoped work.
 - **Per-program resume strategies.** tmux-resurrect ships a real strategy system beyond
   "relaunch the same command line" — `vim`/`nvim` restore via a `Session.vim` file (actual
   editor state, not just re-opening the binary), and a dedicated `mosh-client` strategy that
-  correctly re-extracts and replays the original Mosh connection arguments. tmux-phoenix's
-  consent-gated relaunch is a better *safety* model than resurrect's static config, but it
-  has no equivalent of "restore this program *well*," only "restore this program's command
-  line, or don't."
+  correctly re-extracts and replays the original Mosh connection arguments. tmux-phoenix
+  replays the captured command line and nothing more — it has no equivalent of "restore this
+  program *well*."
 - **One-shot `save` doesn't capture content.** `phoenix save` (the plain CLI command, not the
   daemon) always runs with content capture off — it has no clean way to hold "the previous
   save's content" for dirty-tracking the way the daemon does in memory across cycles. A user
   running bare `phoenix save` gets structure only, no scrollback, silently — the daemon is
   currently the only path that actually delivers on the "save my scrollback" promise.
-- **Restoring onto a from-scratch server.** `phoenix restore` (the CLI command) connects via
-  `attach-session`, which requires an existing session on the target — it cannot restore
-  directly onto a completely empty or not-yet-running tmux server. (`phoenix daemon`'s boot
-  restore handles exactly this case already, via a throwaway bootstrap session; the CLI
-  command doesn't share that logic.) This surfaced during manual verification as a
-  cryptic `transport closed before the command's reply arrived` error rather than a
-  clear message, let alone working. **This is explicitly in scope to close as real
-  functionality**, not to leave as a documented limitation — see §4.
 - **Status-line integration.** `#{continuum_status}` lets a user's tmux status bar show the
   current autosave interval or `off`. tmux-phoenix has no equivalent format-string output at
   all today — there's no way for a user's own tmux config to show "daemon running, last
@@ -192,16 +183,12 @@ explaining why something is out of scope.
 - Make restore idempotent: skip a session/window/pane that already exists on the target
   server instead of failing the whole restore, matching tmux-resurrect's behavior (including
   its single-bootstrap-pane overwrite case).
-- Unify `phoenix restore`'s connection strategy with the daemon's boot-restore path so it
-  works uniformly whether the target server is empty, freshly started, or already populated
-  — no more "restore doesn't work if nothing's running yet."
 - Wire content capture into the one-shot `phoenix save` path (needs a way to load the
   previous save's per-pane content outside the daemon's in-memory state, so dirty-tracking
   works for a single invocation too).
-- Add per-program resume strategies on top of the existing consent-gated relaunch model:
-  vim/neovim session-file restore, a Mosh-aware strategy, and an extensible way to add more
-  — consent-gating stays as the safety layer; strategies decide *how* to relaunch what's
-  already been approved, not whether to.
+- Add per-program resume strategies over plain command-line replay: vim/neovim
+  session-file restore and a Mosh-aware strategy, both built on the same argv-rewrite
+  mechanism the LLM session resume work introduces (§4.2) rather than a second one.
 - Ship a real tmux plugin wrapper (TPM-installable) with default keybindings for save/restore
   and a `#{phoenix_status}`-style format string for the status line, so tmux-phoenix doesn't
   require leaving tmux to use.
@@ -212,6 +199,15 @@ explaining why something is out of scope.
 Once the floor is solid, the differentiated goal: things tmux-resurrect and tmux-continuum,
 as shell-script-era tools, were never positioned to do.
 
+- **Resume LLM agent sessions, not just their command lines.** A pane running `claude` or
+  `codex` is holding a conversation whose state lives on disk. Replaying its command line
+  hands back the program but starts an empty conversation — the session the user had is
+  still on disk, just abandoned. Restore should recognize an agent CLI, record which session
+  that process has open, and rewrite the captured argv into that agent's own resume form
+  (`claude --resume <id>`, `codex resume <uuid>`) while keeping the flags the user actually
+  ran with. This generalizes into the per-program strategy mechanism §4.1 needs for vim and
+  mosh: capture records extra identity alongside the argv, and a per-provider strategy turns
+  the pair into the command to run.
 - **Named, tagged snapshots.** `phoenix save --tag before-migration` alongside the automatic
   generations, so a deliberate checkpoint is easy to find and never gets pruned by `--keep`.
 - **Selective/partial restore.** Restore one session or one window out of a snapshot instead
@@ -255,10 +251,6 @@ and should stay even as the floor gets filled in:
 - **Event-driven, subscription-based save timing**, not a status-line-redraw hack or a bare
   polling timer. This is strictly more robust than tmux-continuum's mechanism and has no
   equivalent failure mode.
-- **Consent-gated program relaunch as the default safety layer.** Even as per-program resume
-  strategies (§4.1) get added, restore should never silently re-execute an arbitrary captured
-  command line the way `':all:'` in tmux-resurrect's config can. Strategies extend *how* an
-  approved relaunch happens, not a way around asking.
 - **Content-addressed, deduplicated scrollback storage**, rather than a new flat copy of pane
   content on every save. This is already more storage-efficient than anything either old tool
   does.
@@ -269,9 +261,13 @@ and should stay even as the floor gets filled in:
 
 Things worth a real decision before or during the relevant roadmap work, not yet resolved:
 
-- How should per-program resume strategies (§4.1) and the consent-gated ruleset compose in
-  the config/rules file format — is a strategy a property of a rule, or a separate
-  registration a rule can reference?
+- How should a pane's live agent session be identified (§4.2)? Two mechanisms are already
+  ruled out by measurement: the running `claude` process does not carry its session id in its
+  environment, and it holds no persistent open file descriptor on its transcript. What's left
+  is correlation — the pane's working directory maps to the agent's project directory, and
+  the transcript being written picks out the session — which needs its reliability
+  established, particularly for two sessions running in one directory at once. A wrong
+  identification is worse than none: it resumes someone else's conversation.
 - Should cross-machine snapshot sync (§4.2) be a built-in transfer mechanism, or should
   tmux-phoenix only guarantee that its storage format is safe to sync externally (e.g. via a
   user's own `rsync`/Syncthing/cloud-drive setup) and stop there?

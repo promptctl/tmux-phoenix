@@ -4,7 +4,6 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use phoenix_core::{
@@ -15,14 +14,6 @@ use phoenix_store::Store;
 use tmux_control::CommandLine;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// `connect_and_boot`'s `RestoreLatest` path reads `XDG_CONFIG_HOME`
-/// (`phoenix_restore::default_rules_path`) from the process's ambient
-/// environment — every test in this binary that reaches that path (whether
-/// or not it itself overrides the var) must hold this lock, since env vars
-/// are process-global and `cargo test` runs this file's tests concurrently
-/// on threads within one process.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique_name(name: &str) -> String {
     let nanos = SystemTime::now()
@@ -120,7 +111,6 @@ fn single_pane_snapshot(session_name: &str) -> Snapshot {
 
 #[test]
 fn boots_with_no_sessions_and_no_snapshot_leaves_a_bare_bootstrap_session() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let server = EmptyServer::new("nothing-to-restore");
     let data_dir = TestDataDir::new("nothing-to-restore");
     let store = Store::new(&data_dir.0);
@@ -140,7 +130,6 @@ fn boots_with_no_sessions_and_no_snapshot_leaves_a_bare_bootstrap_session() {
 
 #[test]
 fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_session() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let server = EmptyServer::new("restore");
     let data_dir = TestDataDir::new("restore");
     let store = Store::new(&data_dir.0);
@@ -184,7 +173,6 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
 
 #[test]
 fn boots_with_an_existing_session_never_touches_it() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let server = EmptyServer::new("stay-live");
     let existing_session = unique_name("pre-existing");
     let status = std::process::Command::new("tmux")
@@ -254,18 +242,15 @@ fn snapshot_with_program(session_name: &str, program: CapturedProgram) -> Snapsh
     }
 }
 
-/// tmux-permissions-16s: boot restore never prompts, but it still *honors*
-/// a rule the user already granted in an earlier interactive session — this
-/// proves that end to end, including that the program actually runs on the
-/// restored server, not just that a `RestorePolicy` gets built correctly
+/// An unattended boot restore brings each pane's captured program back —
+/// proving that end to end, including that the program actually runs on the
+/// restored server, not just that the plan contains the right command
 /// (that's `phoenix-restore`'s own unit/live tests).
 #[test]
-fn a_pane_whose_program_already_has_a_restore_rule_gets_relaunched_on_boot() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let server = EmptyServer::new("relaunch-granted");
-    let data_dir = TestDataDir::new("relaunch-granted");
+fn a_panes_captured_program_is_relaunched_on_boot() {
+    let server = EmptyServer::new("relaunch");
+    let data_dir = TestDataDir::new("relaunch");
     let store = Store::new(&data_dir.0);
-    let config_dir = std::env::temp_dir().join(unique_name("phx-boot-config"));
 
     let session_name = unique_name("relaunch-session");
     let program = CapturedProgram::new(
@@ -279,25 +264,8 @@ fn a_pane_whose_program_already_has_a_restore_rule_gets_relaunched_on_boot() {
         .save(&snapshot_with_program(&session_name, program), 5)
         .expect("failed to seed a snapshot to restore");
 
-    let ruleset = phoenix_restore::RuleSet {
-        rules: vec![phoenix_restore::Rule {
-            matcher: phoenix_restore::Matcher::Basename("echo".to_string()),
-            verdict: phoenix_restore::Verdict::Restore,
-        }],
-    };
-    phoenix_restore::save_rules_file(&config_dir.join("tmux-phoenix/relaunch.rules"), &ruleset)
-        .expect("failed to seed the relaunch rules file");
-
-    // SAFETY: serialized against every other test in this binary that
-    // reaches `connect_and_boot`'s `RestoreLatest` path via `ENV_LOCK`.
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", &config_dir);
-    }
-    let result = phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, |_| {});
-    unsafe {
-        std::env::remove_var("XDG_CONFIG_HOME");
-    }
-    let mut client = result.expect("connect_and_boot failed");
+    let mut client = phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, |_| {})
+        .expect("connect_and_boot failed");
 
     // Never assume the target-side pane index matches the snapshot's
     // captured one (`phoenix-restore` never targets panes by index at all —
@@ -328,9 +296,8 @@ fn a_pane_whose_program_already_has_a_restore_rule_gets_relaunched_on_boot() {
     }
     assert!(
         found_marker,
-        "boot restore should have relaunched the already-granted program"
+        "boot restore should have relaunched the pane's captured program"
     );
 
     client.close();
-    let _ = std::fs::remove_dir_all(&config_dir);
 }

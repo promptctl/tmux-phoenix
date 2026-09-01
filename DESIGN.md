@@ -294,17 +294,16 @@ bad sequences) rather than failing the pane.
 
 ## 6. Restore — plan, then apply
 
-`plan(&Snapshot, &RestorePolicy) -> RestorePlan` is pure; `tmux-control` executes the
+`plan(&Snapshot) -> RestorePlan` is pure; `tmux-control` executes the
 resulting ordered `Vec<TmuxCommand>`. Because the plan is data, `phoenix restore
 --dry-run` prints exactly what would run before it runs — a real safety property for a
 tool that can `send-keys` into live shells.
 
-Program relaunch defaults to **cwd + shell only**; it never blind-replays captured
-argv. Which programs may relaunch is a learned, consent-gated ruleset (a matcher +
-verdict, resolved by a pure function into `Restore`/`Skip`/`Ask`): interactively an
-`Ask` prompts the user; non-interactively (boot restore) an `Ask` falls to the safe
-default and is logged, so a boot never blocks and never escalates. *(Full permission
-model deferred to a later milestone; the default-safe behavior ships first.)*
+A restored pane comes back **at its captured cwd, running the program it was
+running** — the captured argv is replayed into the pane, unconditionally, on every
+restore path (interactive `phoenix restore` and the daemon's unattended boot restore
+alike). Nothing is asked and nothing is configured: getting your programs back is
+the whole point of restoring.
 
 **Implementation notes (found by running the plan against a real tmux server, not
 assumed):** `new-session` has no flag to request a specific window index — the
@@ -330,61 +329,22 @@ index — see above). This is the one `TmuxCommand` variant that isn't a literal
 command line: it needs a temp file that only exists at apply time, so `plan` (pure)
 can't render it verbatim the way every other variant can, and `apply` special-cases
 it. No separate policy toggle — a pane with captured content always gets replayed;
-one with `content: None` is simply left as a fresh idle shell, unchanged from the
-"cwd + shell only" default.
+one with `content: None` simply has no history to replay.
 
-**Consent-gated program relaunch (tmux-permissions-16s):** the ruleset
-(`phoenix-restore::permission`) is a `Vec<Rule>` of `Matcher` (`Exact` — a pane's
-argv rejoined with single spaces, an opaque comparison key that's never re-split
-back into arguments — or `Basename`, tmux's own `pane_current_command`) + `Verdict`
-(`Restore`/`Skip`), resolved to `Restore`/`Skip`/`Ask` by a pure function
-(`RuleSet::resolve`); an `Exact` rule always wins over a `Basename` one. A pane
-with empty `argv` (best-effort `ps` recovery failed for it) always resolves to
-`Skip`, before any rule is even consulted — there's no known command to relaunch,
-let alone ask about. Deciding happens entirely *before* `plan` runs (`plan` stays
-pure): `resolve_interactive`/`resolve_non_interactive` walk the snapshot and build
-a `RestorePolicy { relaunch: HashMap<PaneLocation, Vec<String>> }`, keyed by the
-snapshot's own captured `(session, window index, pane index)` rather than
-`PaneId` — the stable identity available at decision time regardless of whether
-content capture ran, since `plan` never targets a pane by index on the *target*
-server either way (see `panes_active_last` above). `TmuxCommand::RelaunchProgram`
-renders directly (unlike `ReplayContent`, it needs no temp file — the argv is
-shell-quoted element-by-element and joined, so an argument containing spaces
-round-trips as one shell word) and is interleaved right after `ReplayContent` for
-the same pane, so captured history is visible before the program that produced it
-is restarted on top (same ordering tmux-resurrect used).
-
-Interactively (`phoenix restore`, not `--dry-run`): an `Ask` prints the pane's
-location and command line to stderr and reads one line from stdin — `once` /
-`always-exact` / `always-like` / `no` (letters or full words, case-insensitive), a
-blank line picks the default. A recognized interpreter's basename (`python`,
-`bash`, `node`, …) defaults to `always-exact`, not `always-like` — granting "always
-relaunch any `python` invocation" is a much wider consent than one script's
-argument, so reaching that grant requires deliberately typing it rather than just
-hitting Enter; anything else defaults to `always-like`. `once` resolves that pane
-only; `always-*` additionally appends a new `Restore` rule and the whole ruleset is
-re-saved after the restore's decisions are made. EOF on stdin (piped/redirected,
-not a real terminal) falls back to `no` rather than blocking forever — the same
-"never prompt-blocks" property boot restore has, extended to the interactive path
-too. `--dry-run` never prompts either, for the same reason: an `Ask` there is
-reported to stderr and resolved as `Skip`, so it stays safe to run
-non-interactively.
-
-Non-interactively (boot restore, `phoenix-daemon`'s `connect_and_boot`): an
-already-learned rule is still honored (verified live — `tmux-daemon-b0h.3`'s test
-suite gained a case proving a granted program actually relaunches on boot), but an
-`Ask` never prompts (there's nobody to ask) — it falls straight to `Skip` and is
-reported through the daemon's existing `on_log` line, never silently escalated to
-`Restore`. Loading the rules file is best-effort everywhere it's used: a
-missing/unreadable file (or one with some malformed lines) is never fatal to a
-restore — it just means every undecided pane falls to `Ask`'s safe default, same as
-an empty ruleset would; malformed lines are reported but don't drop the rest of the
-file's valid rules. Rules persist as one human-editable file
-(`${XDG_CONFIG_HOME}/tmux-phoenix/relaunch.rules`, config rather than
-`phoenix-store`'s data directory since this one is meant to be hand-edited): one
-line per rule, `<restore|skip> <exact|basename> <value>`, `value` unsplit after the
-second space so an `Exact` value's internal spacing round-trips exactly; written
-with the same temp+rename atomicity `phoenix-store` uses for its own files.
+**Program relaunch:** a pane's captured `argv` (`phoenix-capture`'s best-effort `ps`
+recovery, DESIGN.md §5) becomes a `TmuxCommand::RelaunchProgram`, emitted right after
+that pane's `ReplayContent` so captured history is visible before the program that
+produced it is restarted on top (same ordering tmux-resurrect used). It renders
+directly (unlike `ReplayContent`, it needs no temp file — the argv is shell-quoted
+element-by-element and joined, so an argument containing spaces round-trips as one
+shell word). Two pane shapes have no foreground program to resume and so come back as
+a plain shell at their cwd: one whose `argv` is empty (`ps` recovery failed for it —
+there is no command line to run), and one that was simply idle at its prompt, which
+tmux reports as the pane's own shell being its foreground process. The second is
+recognized by `pane_current_command` being an interactive shell basename (`zsh`,
+`bash`, `fish`, …) invoked with no non-flag argument — restore already creates every
+pane as a fresh shell, so re-running that would only nest a second shell inside the
+first, whereas `bash deploy.sh` is a real program and does come back.
 
 ---
 
@@ -537,4 +497,3 @@ anywhere.
    session, rebuild it, assert `list-panes` geometry matches the snapshot.
 3. **Content capture + replay.**
 4. **Daemon: subscription-driven debounced save + boot restore + service install.**
-5. **Learned permission model for program relaunch.**

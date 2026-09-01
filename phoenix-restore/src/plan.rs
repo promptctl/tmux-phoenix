@@ -1,21 +1,20 @@
-//! `plan(&Snapshot, &RestorePolicy) -> RestorePlan` (DESIGN.md §6): pure,
-//! no I/O, unit-testable with no tmux running. `tmux-restore-qll.2` executes
-//! the resulting ordered [`TmuxCommand`]s.
+//! `plan(&Snapshot) -> RestorePlan` (DESIGN.md §6): pure, no I/O,
+//! unit-testable with no tmux running. `tmux-restore-qll.2` executes the
+//! resulting ordered [`TmuxCommand`]s.
 
-use phoenix_core::{Pane, Session, Snapshot, Window, WindowIndex};
+use phoenix_core::{CapturedProgram, Pane, Session, Snapshot, Window, WindowIndex};
 
 use crate::command::{PlanStep, TmuxCommand};
-use crate::policy::{PaneLocation, RestorePolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlan {
     pub commands: Vec<PlanStep>,
 }
 
-pub fn plan(snapshot: &Snapshot, policy: &RestorePolicy) -> RestorePlan {
+pub fn plan(snapshot: &Snapshot) -> RestorePlan {
     let mut commands = Vec::new();
     for session in snapshot.sessions.iter() {
-        plan_session(session, policy, &mut commands);
+        plan_session(session, &mut commands);
     }
     RestorePlan { commands }
 }
@@ -40,7 +39,7 @@ fn panes_active_last(window: &Window) -> Vec<&Pane> {
     ordered
 }
 
-fn plan_session(session: &Session, policy: &RestorePolicy, commands: &mut Vec<PlanStep>) {
+fn plan_session(session: &Session, commands: &mut Vec<PlanStep>) {
     let mut windows = session.windows().iter();
     let first_window = windows
         .next()
@@ -71,10 +70,9 @@ fn plan_session(session: &Session, policy: &RestorePolicy, commands: &mut Vec<Pl
         session,
         first_window.index(),
         first_window_panes[0],
-        policy,
         commands,
     );
-    plan_remaining_panes(session, first_window, &first_window_panes, policy, commands);
+    plan_remaining_panes(session, first_window, &first_window_panes, commands);
 
     for window in windows {
         let window_panes = panes_active_last(window);
@@ -84,8 +82,8 @@ fn plan_session(session: &Session, policy: &RestorePolicy, commands: &mut Vec<Pl
             name: window.name().clone(),
             cwd: window_panes[0].cwd.clone(),
         }));
-        plan_pane_extras(session, window.index(), window_panes[0], policy, commands);
-        plan_remaining_panes(session, window, &window_panes, policy, commands);
+        plan_pane_extras(session, window.index(), window_panes[0], commands);
+        plan_remaining_panes(session, window, &window_panes, commands);
     }
 
     commands.push(PlanStep::Command(TmuxCommand::SelectWindow {
@@ -101,7 +99,6 @@ fn plan_remaining_panes(
     session: &Session,
     window: &Window,
     ordered_panes: &[&Pane],
-    policy: &RestorePolicy,
     commands: &mut Vec<PlanStep>,
 ) {
     for pane in &ordered_panes[1..] {
@@ -113,7 +110,7 @@ fn plan_remaining_panes(
         // Still the current pane of `window` right after this split — see
         // `PlanStep::ReplayContent`'s doc comment for why this can't be
         // deferred to later.
-        plan_pane_extras(session, window.index(), pane, policy, commands);
+        plan_pane_extras(session, window.index(), pane, commands);
     }
 
     if ordered_panes.len() > 1 {
@@ -127,27 +124,23 @@ fn plan_remaining_panes(
 
 /// Everything that targets `pane` as the window's *current* pane, right
 /// after it was created: captured scrollback first (so it's visible history
-/// by the time the program that produced it, if any, gets relaunched on top
-/// — same ordering tmux-resurrect used), then a program relaunch
-/// (tmux-permissions-16s) if `policy` resolved this exact pane to
-/// `Restore`.
+/// by the time the program that produced it gets relaunched on top — same
+/// ordering tmux-resurrect used), then that program.
 fn plan_pane_extras(
     session: &Session,
     window: WindowIndex,
     pane: &Pane,
-    policy: &RestorePolicy,
-    commands: &mut Vec<TmuxCommand>,
+    commands: &mut Vec<PlanStep>,
 ) {
     maybe_replay_content(session, window, pane, commands);
-    maybe_relaunch_program(session, window, pane, policy, commands);
+    maybe_relaunch_program(session, window, pane, commands);
 }
 
 /// Emits `ReplayContent` for `pane` if (and only if) it has captured
 /// content — a pane with `content: None` (structure-only capture, or a
-/// degraded pane) is simply left as a fresh idle shell, unchanged from
-/// today's "cwd + shell only" default. No separate policy toggle: whether
-/// replay happens is entirely driven by whether the snapshot itself has
-/// content to replay.
+/// degraded pane) simply has no history to replay: whether replay happens
+/// is entirely driven by whether the snapshot itself has content to
+/// replay.
 fn maybe_replay_content(
     session: &Session,
     window: WindowIndex,
@@ -163,30 +156,46 @@ fn maybe_replay_content(
     }
 }
 
-/// Emits `RelaunchProgram` for `pane` only if `policy.relaunch` names this
-/// exact `(session, window, pane index)` — the consent-gated ruleset
-/// (tmux-permissions-16s) already decided *which* panes qualify before
-/// `plan` ever ran (see `crate::permission::resolve_interactive`/
-/// `resolve_non_interactive`); `plan` itself makes no relaunch decisions,
-/// it only renders ones already made.
+/// Basenames (tmux's own `pane_current_command`) of interactive shells —
+/// see [`foreground_argv`].
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "elvish", "nu", "xonsh",
+];
+
+/// The command line to relaunch in `program`'s pane, or `None` when the
+/// pane had no foreground program of its own to resume. Two shapes mean
+/// "none":
+///
+/// - Empty `argv`: best-effort `ps` recovery failed for this pane
+///   (`CapturedProgram`'s doc comment) — there is no command line to run.
+/// - A bare interactive shell: tmux reports the pane's own shell as its
+///   foreground whenever the pane is idle at a prompt, and restore already
+///   creates each pane as a fresh shell at the captured cwd, so running it
+///   again would only nest a second shell inside the first. Only a shell
+///   invoked with no non-flag argument counts as idle — `bash deploy.sh`
+///   is a script the user was running, not an idle prompt.
+fn foreground_argv(program: &CapturedProgram) -> Option<&[String]> {
+    let (_, args) = program.argv.split_first()?;
+    let idle_shell =
+        SHELLS.contains(&program.command.as_str()) && args.iter().all(|arg| arg.starts_with('-'));
+    (!idle_shell).then_some(program.argv.as_slice())
+}
+
+/// Emits `RelaunchProgram` for whatever `pane` had in its foreground when
+/// the snapshot was taken (see [`foreground_argv`]), so a restored pane
+/// comes back running what it was running.
 fn maybe_relaunch_program(
     session: &Session,
     window: WindowIndex,
     pane: &Pane,
-    policy: &RestorePolicy,
-    commands: &mut Vec<TmuxCommand>,
+    commands: &mut Vec<PlanStep>,
 ) {
-    let location = PaneLocation {
-        session: session.name().clone(),
-        window,
-        pane: pane.index,
-    };
-    if let Some(argv) = policy.relaunch.get(&location) {
-        commands.push(TmuxCommand::RelaunchProgram {
+    if let Some(argv) = foreground_argv(&pane.program) {
+        commands.push(PlanStep::Command(TmuxCommand::RelaunchProgram {
             session: session.name().clone(),
             window,
-            argv: argv.clone(),
-        });
+            argv: argv.to_vec(),
+        }));
     }
 }
 
@@ -236,10 +245,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         assert_eq!(
             plan.commands,
@@ -271,10 +277,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         let splits: Vec<_> = plan
             .commands
@@ -304,10 +307,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
         assert!(!plan
             .commands
             .iter()
@@ -327,10 +327,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         // new-session must not have swallowed the active pane's cwd as the
         // implicit first pane.
@@ -364,10 +361,7 @@ mod tests {
             WindowIndex(5),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         assert!(plan
             .commands
@@ -386,11 +380,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_never_references_the_captured_program_or_argv() {
-        // DESIGN.md §6: relaunch defaults to cwd + shell only. A pane with a
-        // non-shell program/argv still only contributes its cwd to the plan.
+    fn a_pane_relaunches_its_captured_program_with_the_exact_captured_argv() {
         let mut p = pane(0, "/proj");
-        p.program = CapturedProgram::new("vim", vec!["vim".to_string(), "file.rs".to_string()]);
+        p.program = CapturedProgram::new("vim", vec!["vim".to_string(), "foo.txt".to_string()]);
         let win = window(0, "editor", NonEmpty::singleton(p), 0);
         let session = Session::new(
             SessionName::parse("main").unwrap(),
@@ -398,18 +390,89 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
-        for cmd in &plan.commands {
-            let rendered = cmd.describe().unwrap();
+        let relaunched: Vec<&Vec<String>> = plan
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                PlanStep::Command(TmuxCommand::RelaunchProgram { argv, .. }) => Some(argv),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            relaunched,
+            vec![&vec!["vim".to_string(), "foo.txt".to_string()]]
+        );
+    }
+
+    #[test]
+    fn a_pane_idle_at_its_shell_is_left_as_a_plain_shell() {
+        // tmux reports the pane's own shell as the foreground program of an
+        // idle pane; restore already creates that shell, so relaunching it
+        // would just nest a second one.
+        for (command, argv) in [
+            ("zsh", vec!["-zsh"]),
+            ("zsh", vec!["/bin/zsh", "-l"]),
+            ("bash", vec!["bash"]),
+            ("fish", vec!["fish"]),
+        ] {
+            let mut p = pane(0, "/a");
+            p.program = CapturedProgram::new(
+                command,
+                argv.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            );
+            let win = window(0, "shell", NonEmpty::singleton(p), 0);
+            let session = Session::new(
+                SessionName::parse("main").unwrap(),
+                NonEmpty::singleton(win),
+                WindowIndex(0),
+            )
+            .unwrap();
+            let plan = plan(&snapshot(NonEmpty::singleton(session)));
             assert!(
-                !rendered.contains("vim"),
-                "plan leaked a captured program into: {rendered}"
+                !plan
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { .. }))),
+                "{command} {argv:?} should not be relaunched"
             );
         }
+    }
+
+    #[test]
+    fn a_shell_running_a_script_is_a_real_program_and_is_relaunched() {
+        let mut p = pane(0, "/a");
+        p.program = CapturedProgram::new("bash", vec!["bash".to_string(), "deploy.sh".to_string()]);
+        let win = window(0, "shell", NonEmpty::singleton(p), 0);
+        let session = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::singleton(win),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
+        assert!(plan.commands.iter().any(
+            |c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { argv, .. }) if argv[1] == "deploy.sh")
+        ));
+    }
+
+    #[test]
+    fn a_pane_whose_argv_recovery_failed_is_left_as_a_plain_shell() {
+        let mut p = pane(0, "/a");
+        p.program = CapturedProgram::new("vim", vec![]);
+        let win = window(0, "editor", NonEmpty::singleton(p), 0);
+        let session = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::singleton(win),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
+        assert!(!plan
+            .commands
+            .iter()
+            .any(|c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { .. }))));
     }
 
     #[test]
@@ -421,10 +484,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
         assert!(!plan
             .commands
             .iter()
@@ -448,10 +508,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         // NewSession creates the one pane; ReplayContent must immediately
         // follow it (before anything else could shift "current" away).
@@ -500,10 +557,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::singleton(session)),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::singleton(session)));
 
         let replayed: Vec<&str> = plan
             .commands
@@ -555,10 +609,7 @@ mod tests {
             WindowIndex(0),
         )
         .unwrap();
-        let plan = plan(
-            &snapshot(NonEmpty::new(s0, vec![s1])),
-            &RestorePolicy::default(),
-        );
+        let plan = plan(&snapshot(NonEmpty::new(s0, vec![s1])));
 
         let new_sessions: Vec<_> = plan
             .commands

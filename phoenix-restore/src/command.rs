@@ -67,6 +67,19 @@ pub enum TmuxCommand {
         session: SessionName,
         window: WindowIndex,
     },
+    /// Relaunches a pane's captured program — the argv the pane had in its
+    /// foreground when the snapshot was taken, typed into the restored
+    /// pane's shell. Same current-pane targeting as `SplitWindow` and
+    /// `PlanStep::ReplayContent`, and the same reason: no addressable pane
+    /// index, so this must be issued immediately after the pane's creation,
+    /// right after any replay for it (captured scrollback is shown first,
+    /// then the program that produced it is actually restarted on top —
+    /// same ordering tmux-resurrect used).
+    RelaunchProgram {
+        session: SessionName,
+        window: WindowIndex,
+        argv: Vec<String>,
+    },
 }
 
 /// One step of a [`crate::RestorePlan`]. Two kinds, because they differ in
@@ -90,19 +103,6 @@ pub enum PlanStep {
         session: SessionName,
         window: WindowIndex,
         lines: Vec<String>,
-    },
-    /// Relaunches a pane's captured program (tmux-permissions-16s: only for
-    /// panes the consent-gated ruleset resolved to `Restore` — see
-    /// `crate::permission`). Same current-pane targeting as `SplitWindow`/
-    /// `ReplayContent` and the same reason: no addressable pane index, so
-    /// this must be issued immediately after the pane's creation, right
-    /// after any `ReplayContent` for it (captured scrollback is shown first,
-    /// then the program that produced it is actually restarted on top —
-    /// same ordering tmux-resurrect used).
-    RelaunchProgram {
-        session: SessionName,
-        window: WindowIndex,
-        argv: Vec<String>,
     },
 }
 
@@ -131,6 +131,15 @@ impl PlanStep {
             )),
         }
     }
+}
+
+/// POSIX-shell single-quoting. `send-keys` types its text into the pane,
+/// where a *shell* — not tmux — parses it, so tmux's own argument escaping
+/// (which `CommandLine` applies to the argument as a whole) is the wrong
+/// grammar for the text inside it (`[LAW:one-source-of-truth]`: the one
+/// shell-quoter, shared with [`crate::apply`]'s content replay).
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// A window's `session:index` target — one argument, not two tokens.

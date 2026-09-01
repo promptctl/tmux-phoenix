@@ -12,7 +12,7 @@ use phoenix_core::{
     CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneIndex, Session,
     SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
-use phoenix_restore::{apply, plan, RestorePolicy};
+use phoenix_restore::{apply, plan};
 use tmux_control::{Client, Transport};
 
 fn pane(index: u32, cwd: &str) -> Pane {
@@ -115,7 +115,7 @@ fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_live_server() {
         sessions: NonEmpty::singleton(session),
     };
 
-    let restore_plan = plan(&snapshot, &RestorePolicy::default());
+    let restore_plan = plan(&snapshot);
     let outcome = apply(&mut client, &restore_plan).expect("apply failed");
     assert_eq!(
         outcome.executed + outcome.skipped_move_window,

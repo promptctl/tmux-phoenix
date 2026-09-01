@@ -89,10 +89,12 @@ fn foreground_row(pane_pid: u32, table: &[ProcessRow]) -> Option<&ProcessRow> {
 }
 
 /// Splitting a `ps` command string on whitespace is a lossy approximation of
-/// real argv (it can't reconstruct a quoted argument containing a space) —
-/// accepted here because this whole path is explicitly best-effort recovery,
-/// not a guarantee (DESIGN.md §5, §6: relaunch never blind-replays captured
-/// argv anyway).
+/// real argv — `ps` prints the arguments space-joined, so a quoted argument
+/// that itself contained a space can't be told apart from two arguments.
+/// Accepted here because this whole path is explicitly best-effort recovery
+/// (DESIGN.md §5), not a guarantee: the kernel's argv is not reachable
+/// portably, and every other source of the same information has the same
+/// flattening.
 fn split_command(command: &str) -> Vec<String> {
     command.split_whitespace().map(str::to_string).collect()
 }
