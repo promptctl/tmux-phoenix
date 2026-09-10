@@ -64,13 +64,17 @@ fn build_argv(socket: Option<&str>, user_args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// Append a trailing `\n` only if `command` doesn't already end with one
-/// (idempotent line-termination, mirrored from the reference transport).
-fn terminate_line(command: &str) -> String {
-    if command.ends_with('\n') {
-        command.to_string()
+/// The wire line for one command. tmux reads one command per line, so a `\n`
+/// inside `command` would reach it as a second command; commands are framed
+/// only here, so this is where that is refused (`[LAW:single-enforcer]`).
+fn wire_line(command: &str) -> io::Result<String> {
+    if command.contains('\n') {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("command contains a newline, so tmux would read several commands: {command:?}"),
+        ))
     } else {
-        format!("{command}\n")
+        Ok(format!("{command}\n"))
     }
 }
 
@@ -122,7 +126,7 @@ fn closed_err() -> io::Error {
 impl Transport for SpawnTransport {
     fn send(&mut self, command: &str) -> io::Result<()> {
         match &mut self.state {
-            State::Open { stdin, .. } => stdin.write_all(terminate_line(command).as_bytes()),
+            State::Open { stdin, .. } => stdin.write_all(wire_line(command)?.as_bytes()),
             State::Closed => Err(closed_err()),
         }
     }

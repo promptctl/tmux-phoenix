@@ -21,9 +21,9 @@ use std::io;
 /// down. No protocol knowledge lives here — `send`/`read` move bytes, full
 /// stop.
 pub trait Transport {
-    /// Send one command to tmux. `command` is LF-terminated if it doesn't
-    /// already end in `\n` — callers pass a bare command string, not a wire
-    /// line.
+    /// Send one command to tmux. The transport appends the `\n` that ends the
+    /// wire line; a `command` containing `\n` fails with `InvalidInput`, since
+    /// tmux would read it as more than one command.
     ///
     /// Sending an empty command writes a bare `\n`, which is the wire-level
     /// detach signal (SPEC §4.1) — this is a real, valid use of `send`, not
