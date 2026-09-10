@@ -589,6 +589,22 @@ fn non_percent_line_outside_block_is_unknown() {
 }
 
 #[test]
+fn empty_line_outside_block_is_unknown() {
+    assert_eq!(feed("\n"), vec![ServerMessage::Unknown(String::new())]);
+}
+
+#[test]
+fn signed_numeric_fields_do_not_parse() {
+    // `str::parse` accepts a leading sign; tmux never emits one.
+    assert_eq!(
+        feed("%begin +1699900000 0 0\n"),
+        vec![ServerMessage::Unknown("%begin +1699900000 0 0".into())]
+    );
+    assert_eq!(SessionId::parse(b"$+5"), None);
+    assert_eq!(PaneId::parse(b"%-3"), None);
+}
+
+#[test]
 fn very_long_line_does_not_panic() {
     let long_data = "a".repeat(50_000);
     let messages = feed(&format!("%output %1 {long_data}\n"));
