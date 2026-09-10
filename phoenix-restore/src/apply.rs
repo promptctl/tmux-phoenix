@@ -55,7 +55,11 @@ pub fn apply<T: Transport>(
     };
 
     for (index, cmd) in plan.commands.iter().enumerate() {
-        match client.execute(&cmd.to_command_string()) {
+        let line = cmd.to_command_line().map_err(|err| ApplyError {
+            command_index: index,
+            source: err.into(),
+        })?;
+        match client.execute(&line) {
             Ok(_) => outcome.executed += 1,
             Err(err) if is_benign_move_window_failure(cmd, &err) => {
                 outcome.skipped_move_window += 1;
@@ -92,6 +96,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
     use std::rc::Rc;
+    use tmux_control::CommandLine;
 
     #[derive(Clone, Default)]
     struct MockState {
@@ -115,8 +120,8 @@ mod tests {
     }
 
     impl Transport for MockTransport {
-        fn send(&mut self, command: &str) -> io::Result<()> {
-            self.state.sent.borrow_mut().push(command.to_string());
+        fn send(&mut self, line: &CommandLine) -> io::Result<()> {
+            self.state.sent.borrow_mut().push(line.as_str().to_string());
             Ok(())
         }
 
@@ -151,10 +156,7 @@ mod tests {
         let outcome = apply(&mut client, &move_window_plan()).unwrap();
         assert_eq!(outcome.executed, 0);
         assert_eq!(outcome.skipped_move_window, 1);
-        assert_eq!(
-            *state.sent.borrow(),
-            vec!["move-window -s 'main' -t 'main:0'"]
-        );
+        assert_eq!(*state.sent.borrow(), vec!["move-window -s main -t main:0"]);
     }
 
     #[test]

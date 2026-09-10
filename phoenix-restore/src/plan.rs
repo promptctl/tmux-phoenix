@@ -302,7 +302,8 @@ mod tests {
         let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
 
         for cmd in &plan.commands {
-            let rendered = cmd.to_command_string();
+            let rendered = cmd.to_command_line().unwrap();
+            let rendered = rendered.as_str();
             assert!(
                 !rendered.contains("vim"),
                 "plan leaked a captured program into: {rendered}"

@@ -167,10 +167,23 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
     let restore_plan = phoenix_restore::plan(&snapshot, &RestorePolicy);
 
     if dry_run {
-        for cmd in &restore_plan.commands {
-            println!("{}", cmd.to_command_string());
-        }
-        return EXIT_OK;
+        // Render the whole plan before printing any of it: a plan holding an
+        // unencodable name is not a plan a human should half-see.
+        let lines: Result<Vec<_>, _> = restore_plan
+            .commands
+            .iter()
+            .map(|cmd| cmd.to_command_line())
+            .collect();
+        return match lines {
+            Ok(lines) => {
+                lines.iter().for_each(|line| println!("{}", line.as_str()));
+                EXIT_OK
+            }
+            Err(err) => {
+                eprintln!("phoenix restore: {err}");
+                EXIT_FAIL
+            }
+        };
     }
 
     let mut client = match connect(socket) {

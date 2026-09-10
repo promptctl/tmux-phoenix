@@ -1,82 +1,19 @@
-//! Live sanity check: this crate promises `--dry-run` prints the exact
-//! string that later gets run (DESIGN.md §6), so the strings themselves
-//! need to be real, valid tmux syntax — not just internally-consistent
-//! fixtures. This runs each rendered [`TmuxCommand`] against a real,
-//! freshly-started (never pre-created) tmux server via a plain shell, the
-//! same way a human pasting `--dry-run`'s output would, and checks the
-//! resulting geometry. Actually wiring this through `tmux-control::Client`
-//! is tmux-restore-qll.2's job — this only proves the command strings
-//! themselves are correct.
+//! Live: a planned multi-window, multi-pane tree executed by `apply()` over
+//! a real `tmux-control::Client` against a real, isolated tmux server, then
+//! checked for the captured geometry. `tests/apply.rs` covers the same
+//! mechanism on the simplest tree; this is the shape that exercises window
+//! placement at non-default indices and the "split the active pane last"
+//! reordering, so the assertions here are the geometry ones.
 
-use std::process::Command;
+mod support;
+use support::{line, IsolatedTmux};
 
 use phoenix_core::{
     CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneIndex, Session,
     SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
-use phoenix_restore::{plan, RestorePolicy};
-
-struct FreshTmuxServer {
-    socket: String,
-}
-
-impl FreshTmuxServer {
-    fn new(name: &str) -> Self {
-        let socket = format!(
-            "/tmp/tmux-phoenix-test-restore-{name}-{}",
-            std::process::id()
-        );
-        let _ = std::fs::remove_file(&socket);
-        Self { socket }
-    }
-
-    /// Runs `tmux -S <socket> <command>` through `sh -c`, the same way a
-    /// human pasting `--dry-run`'s printed line would — `tmux_escape`'s
-    /// quoting only means anything once a real shell parses it.
-    ///
-    /// `move-window` is allowed to fail: `TmuxCommand::MoveWindow`'s doc
-    /// comment documents that it can legitimately hit tmux's "same index"
-    /// error when the window already landed on the captured index (this
-    /// varies by the test machine's own `base-index` config) — swallowing
-    /// that here is standing in for the tolerance tmux-restore-qll.2's real
-    /// executor is documented to need.
-    fn run(&self, command: &str) {
-        let full = format!("tmux -S '{}' {command}", self.socket);
-        let status = Command::new("sh")
-            .args(["-c", &full])
-            .status()
-            .unwrap_or_else(|e| panic!("failed to spawn sh for {full:?}: {e}"));
-        if !status.success() && !command.starts_with("move-window") {
-            panic!("command failed: {full}");
-        }
-    }
-
-    fn output(&self, args: &[&str]) -> String {
-        let out = Command::new("tmux")
-            .args(["-S", &self.socket])
-            .args(args)
-            .output()
-            .expect("failed to run tmux");
-        assert!(
-            out.status.success(),
-            "tmux {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
-    }
-}
-
-impl Drop for FreshTmuxServer {
-    fn drop(&mut self) {
-        // Kill only the one session this test creates, never the whole
-        // server: a tmux server with zero sessions exits on its own by
-        // default.
-        let _ = Command::new("tmux")
-            .args(["-S", &self.socket, "kill-session", "-t", "restored"])
-            .status();
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
+use phoenix_restore::{apply, plan, RestorePolicy};
+use tmux_control::{Client, Transport};
 
 fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
@@ -87,9 +24,30 @@ fn pane(index: u32, cwd: &str) -> Pane {
     }
 }
 
+/// `name` with `args` run on `client`, as sorted lines — every assertion
+/// here is about the set of windows or panes, never their listing order.
+fn query<T: Transport>(client: &mut Client<T>, name: &'static str, args: [&str; 4]) -> Vec<String> {
+    let mut lines: Vec<String> = client
+        .execute(&line(name, args))
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+        .lines
+        .iter()
+        .map(|l| String::from_utf8(l.clone()).expect("tmux returned a non-UTF-8 line"))
+        .collect();
+    lines.sort();
+    lines
+}
+
+fn sorted(expected: [&str; 3]) -> Vec<String> {
+    let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    expected
+}
+
 #[test]
-fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_fresh_server() {
-    let server = FreshTmuxServer::new("apply");
+fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_live_server() {
+    let harness = IsolatedTmux::new("restore-plan-apply");
+    let mut client = harness.connect();
 
     // tmux's `-c <cwd>` errors if the directory doesn't actually exist, so
     // these need to be real, distinct directories — which also lets the
@@ -158,60 +116,62 @@ fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_fresh_server() {
     };
 
     let restore_plan = plan(&snapshot, &RestorePolicy);
-    for cmd in &restore_plan.commands {
-        server.run(&cmd.to_command_string());
-    }
-
-    let windows = server.output(&[
-        "list-windows",
-        "-t",
-        "restored",
-        "-F",
-        "#{window_index} #{window_name} #{window_active}",
-    ]);
-    let mut window_lines: Vec<&str> = windows.lines().collect();
-    window_lines.sort();
+    let outcome = apply(&mut client, &restore_plan).expect("apply failed");
     assert_eq!(
-        window_lines,
-        vec!["0 shell 0", "5 editor 1"],
+        outcome.executed + outcome.skipped_move_window,
+        restore_plan.commands.len()
+    );
+
+    let windows = query(
+        &mut client,
+        "list-windows",
+        [
+            "-t",
+            "restored",
+            "-F",
+            "#{window_index} #{window_name} #{window_active}",
+        ],
+    );
+    assert_eq!(
+        windows,
+        vec!["0 shell 0".to_string(), "5 editor 1".to_string()],
         "window indices, names, and the active flag should match the snapshot"
     );
 
-    let panes = server.output(&[
+    let panes = query(
+        &mut client,
         "list-panes",
-        "-t",
-        "restored:5",
-        "-F",
-        "#{pane_current_path} #{pane_active}",
-    ]);
-    let mut pane_lines: Vec<&str> = panes.lines().collect();
-    pane_lines.sort();
-    let mut expected_panes = vec![
-        format!("{} 1", cwd_active.display()),
-        format!("{} 0", cwd_b.display()),
-        format!("{} 0", cwd_c.display()),
-    ];
-    expected_panes.sort();
+        [
+            "-t",
+            "restored:5",
+            "-F",
+            "#{pane_current_path} #{pane_active}",
+        ],
+    );
     assert_eq!(
-        pane_lines, expected_panes,
+        panes,
+        sorted([
+            &format!("{} 1", cwd_active.display()),
+            &format!("{} 0", cwd_b.display()),
+            &format!("{} 0", cwd_c.display()),
+        ]),
         "window 5 should have 3 panes, each in its captured cwd, with the originally-active one active"
     );
 
-    let geometry = server.output(&[
+    let sizes = query(
+        &mut client,
         "list-panes",
-        "-t",
-        "restored:5",
-        "-F",
-        "#{pane_width}x#{pane_height}",
-    ]);
-    let mut sizes: Vec<&str> = geometry.lines().collect();
-    sizes.sort();
-    let mut expected = vec!["50x30", "49x15", "49x14"];
-    expected.sort();
+        ["-t", "restored:5", "-F", "#{pane_width}x#{pane_height}"],
+    );
     assert_eq!(
-        sizes, expected,
+        sizes,
+        sorted(["50x30", "49x15", "49x14"]),
         "select-layout should reproduce the captured geometry"
     );
 
+    client
+        .execute(&line("kill-session", ["-t", "restored"]))
+        .expect("cleanup kill-session failed");
+    client.close();
     let _ = std::fs::remove_dir_all(&base);
 }

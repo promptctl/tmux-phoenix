@@ -4,26 +4,13 @@
 //! themselves).
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux};
 
 use phoenix_core::{
     CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneIndex, Session,
     SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
 use phoenix_restore::{apply, plan, RestorePolicy};
-use tmux_control::{Client, SpawnOptions, SpawnTransport};
-
-fn connect(harness: &IsolatedTmux) -> Client<SpawnTransport> {
-    let transport = SpawnTransport::spawn(
-        &["attach-session", "-t", &harness.session],
-        &SpawnOptions {
-            socket: Some(harness.socket.clone()),
-            ..Default::default()
-        },
-    )
-    .expect("failed to spawn tmux -C");
-    Client::connect(transport).expect("handshake failed against real tmux")
-}
 
 fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
@@ -37,7 +24,7 @@ fn pane(index: u32, cwd: &str) -> Pane {
 #[test]
 fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
     let harness = IsolatedTmux::new("restore-apply");
-    let mut client = connect(&harness);
+    let mut client = harness.connect();
 
     let base =
         std::env::temp_dir().join(format!("phoenix-restore-apply-live-{}", std::process::id()));
@@ -84,7 +71,10 @@ fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
     );
 
     let panes_out = client
-        .execute("list-panes -t restored-live:0 -F '#{pane_index}'")
+        .execute(&line(
+            "list-panes",
+            ["-t", "restored-live:0", "-F", "#{pane_index}"],
+        ))
         .expect("list-panes failed");
     assert_eq!(
         panes_out.lines.len(),
@@ -93,7 +83,7 @@ fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
     );
 
     client
-        .execute("kill-session -t restored-live")
+        .execute(&line("kill-session", ["-t", "restored-live"]))
         .expect("cleanup kill-session failed");
     client.close();
     let _ = std::fs::remove_dir_all(&base);
