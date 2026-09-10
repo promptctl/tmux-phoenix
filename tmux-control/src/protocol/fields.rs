@@ -51,27 +51,16 @@ pub fn to_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Parse a required numeric field. Strict: the *entire* slice must be a
-/// valid integer, unlike the reference's `parseInt`-based fields, which
-/// parse a leading numeric prefix and ignore trailing garbage (so e.g.
-/// `"12abc"` silently becomes `12` in the JS parser). That leniency isn't a
-/// SPEC requirement — real tmux only ever emits pure decimal fields — and
-/// silently accepting a corrupted numeric field as if it were valid runs
-/// against this project's no-silent-failure stance (DESIGN.md §1): a
-/// corrupted `%begin`/`%end` guard or subscription field should surface as
-/// `Unknown`/`ProtocolError`, not parse into a plausible-looking wrong value.
-pub fn parse_u32(bytes: &[u8]) -> Option<u32> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-/// See [`parse_u32`].
-pub fn parse_u64(bytes: &[u8]) -> Option<u64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-/// See [`parse_u32`].
-pub fn parse_i64(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+/// Parse a required numeric field: ASCII digits only. tmux emits nothing
+/// else, while the reference's `parseInt` tolerates trailing garbage and
+/// Rust's `parse` a sign, so a corrupted guard or subscription field surfaces
+/// as `Unknown`/`ProtocolError` instead of a plausible wrong value.
+pub fn parse_decimal<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+    bytes
+        .iter()
+        .all(u8::is_ascii_digit)
+        .then(|| std::str::from_utf8(bytes).ok()?.parse().ok())
+        .flatten()
 }
 
 /// Parse a `-`-or-value field (SPEC §7.9): `-` means "not applicable" and
@@ -89,5 +78,5 @@ pub fn parse_optional<T>(raw: &[u8], f: impl FnOnce(&[u8]) -> Option<T>) -> Opti
 /// `parse_optional` specialized to a bare (unprefixed) integer field, e.g.
 /// `%subscription-changed`'s `window-index`.
 pub fn parse_optional_u32(raw: &[u8]) -> Option<Option<u32>> {
-    parse_optional(raw, parse_u32)
+    parse_optional(raw, parse_decimal)
 }

@@ -27,8 +27,8 @@
 
 use super::decode::decode_octal;
 use super::fields::{
-    find_colon_sep, find_space, first_token, parse_i64, parse_optional, parse_optional_u32,
-    parse_u32, parse_u64, split_ws, to_text,
+    find_colon_sep, find_space, first_token, parse_decimal, parse_optional, parse_optional_u32,
+    split_ws, to_text,
 };
 use super::guard::Guard;
 use super::ids::{PaneId, SessionId, WindowId};
@@ -244,9 +244,9 @@ fn parse_guard(args: &[u8]) -> Option<Guard> {
         return None;
     }
     Some(Guard {
-        timestamp: parse_i64(parts[0])?,
-        command_number: parse_u32(parts[1])?,
-        flags: parse_u32(parts[2])?,
+        timestamp: parse_decimal(parts[0])?,
+        command_number: parse_decimal(parts[1])?,
+        flags: parse_decimal(parts[2])?,
     })
 }
 
@@ -266,7 +266,7 @@ fn parse_extended_output(args: &[u8]) -> Option<ServerMessage> {
         return None;
     }
     let pane = PaneId::parse(parts[0])?;
-    let age_ms = parse_u64(parts[1])?;
+    let age_ms = parse_decimal(parts[1])?;
     let data = decode_octal(value);
     Some(ServerMessage::ExtendedOutput { pane, age_ms, data })
 }
