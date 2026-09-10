@@ -4,15 +4,21 @@
 //!   `tmux` dependency) to verify send/read/close semantics without needing
 //!   tmux installed on the test machine.
 //! - Live-tmux tests actually spawn `tmux -C` against an isolated,
-//!   throw-away socket and drive it through a real guard-block exchange —
+//!   throw-away socket and drive it through real guard-block exchanges —
 //!   confirming this transport produces exactly the byte stream the codec
-//!   expects from a real server, not just an assumed shape.
+//!   expects from a real server, and that tmux reads every encoded argument
+//!   back byte for byte.
 //!
 //! Live tests use a unique socket path per test (never the user's default
 //! tmux socket) and always tear down via `kill-session` on their own socket.
 
 use std::io::ErrorKind;
-use tmux_control::{SpawnOptions, SpawnTransport, Transport};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use tmux_control::{CommandLine, SpawnOptions, SpawnTransport, Transport};
+
+const NO_ARGS: [&str; 0] = [];
 
 /// Spawn `sh -C -c cat` — an echo-back process with no `tmux` dependency,
 /// for testing send/read/close mechanics in isolation from the real
@@ -32,51 +38,102 @@ fn spawn_echo() -> SpawnTransport {
     .expect("failed to spawn sh -C -c cat")
 }
 
-/// Read up to exactly `want` bytes, never past them, so later bytes stay in
-/// the pipe; shorter only at EOF.
-fn read_available(transport: &mut SpawnTransport, want: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 256];
-    while out.len() < want {
-        let limit = (want - out.len()).min(buf.len());
-        let n = transport.read(&mut buf[..limit]).expect("read failed");
-        if n == 0 {
-            break;
+/// Test arguments never hold a NUL.
+fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
+    CommandLine::new(name, args).expect("test arguments hold no NUL")
+}
+
+/// Read on a thread, at most `budget(collected)` bytes at a time, until the
+/// budget is 0 or the pipe reaches EOF, so a stalled child fails the test at a
+/// deadline instead of hanging `cargo test`. After a timeout the thread keeps
+/// the transport; in a live test the `IsolatedTmux` drop runs `kill-session`,
+/// the attached client exits, and that EOF ends the thread, which drops and so
+/// reaps the transport.
+fn read_until(
+    transport: SpawnTransport,
+    budget: impl Fn(&[u8]) -> usize + Send + 'static,
+) -> (SpawnTransport, Vec<u8>) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut transport = transport;
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        let outcome = loop {
+            let limit = budget(&collected).min(buf.len());
+            if limit == 0 {
+                break Ok(());
+            }
+            match transport.read(&mut buf[..limit]) {
+                Ok(0) => break Ok(()),
+                Ok(n) => collected.extend_from_slice(&buf[..n]),
+                Err(e) => break Err(e),
+            }
+        };
+        // A send error means the deadline already failed the test.
+        let _ = tx.send(outcome.map(|()| (transport, collected)));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("read did not finish within 10s: {e}"))
+        .unwrap_or_else(|e| panic!("read failed: {e}"))
+}
+
+/// Up to exactly `want` bytes, never past them, so later bytes stay in the
+/// pipe; shorter only at EOF.
+fn read_available(transport: SpawnTransport, want: usize) -> (SpawnTransport, Vec<u8>) {
+    read_until(transport, move |collected| want - collected.len())
+}
+
+/// Whether `collected` holds a complete `%end` or `%error` line, either of
+/// which closes a guard block.
+fn closes_a_block(collected: &[u8]) -> bool {
+    collected.split_inclusive(|&b| b == b'\n').any(|line| {
+        line.ends_with(b"\n") && (line.starts_with(b"%end ") || line.starts_with(b"%error "))
+    })
+}
+
+/// Everything through the line that closes the next guard block.
+fn read_through_end(transport: SpawnTransport) -> (SpawnTransport, String) {
+    let (transport, bytes) = read_until(transport, |collected| {
+        if closes_a_block(collected) {
+            0
+        } else {
+            usize::MAX
         }
-        out.extend_from_slice(&buf[..n]);
-    }
-    out
+    });
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        closes_a_block(&bytes),
+        "tmux closed the connection before a %end or %error line: {text}"
+    );
+    (transport, text)
 }
 
 #[test]
-fn send_appends_lf_and_read_gets_it_back() {
+fn send_writes_the_line_and_read_gets_it_back() {
     let mut transport = spawn_echo();
-    transport.send("hello").unwrap();
-    let echoed = read_available(&mut transport, 6);
-    assert_eq!(echoed, b"hello\n");
+    transport.send(&line("display-message", ["hello"])).unwrap();
+    let expected = b"display-message hello\n";
+    let (mut transport, echoed) = read_available(transport, expected.len());
+    assert_eq!(echoed, expected);
     transport.close();
 }
 
 #[test]
-fn send_rejects_a_newline_and_writes_nothing() {
+fn a_newline_in_an_argument_is_written_escaped_on_one_line() {
     let mut transport = spawn_echo();
-    for command in ["first\n", "display-message a\ndisplay-message b"] {
-        let err = transport.send(command).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    }
-    // Only this send reaches the pipe, so nothing rejected above leaked.
-    transport.send("ok").unwrap();
-    assert_eq!(read_available(&mut transport, 3), b"ok\n");
+    transport.send(&line("display-message", ["a\nb"])).unwrap();
+    let expected = b"display-message a\\nb\n";
+    let (mut transport, echoed) = read_available(transport, expected.len());
+    assert_eq!(echoed, expected);
     transport.close();
 }
 
 #[test]
-fn empty_send_writes_a_bare_newline() {
+fn detach_writes_a_bare_newline() {
     // SPEC §4.1: an empty command line is the wire-level detach signal.
-    // `send("")` must produce exactly `\n`, not nothing.
     let mut transport = spawn_echo();
-    transport.send("").unwrap();
-    let echoed = read_available(&mut transport, 1);
+    transport.send(&CommandLine::detach()).unwrap();
+    let (mut transport, echoed) = read_available(transport, 1);
     assert_eq!(echoed, b"\n");
     transport.close();
 }
@@ -104,7 +161,7 @@ fn read_returns_eof_when_child_exits_on_its_own() {
 fn operations_after_close_return_broken_pipe_error() {
     let mut transport = spawn_echo();
     transport.close();
-    let err = transport.send("anything").unwrap_err();
+    let err = transport.send(&CommandLine::detach()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
 }
 
@@ -118,9 +175,10 @@ fn close_is_idempotent() {
 #[test]
 fn empty_buffer_read_leaves_the_transport_readable() {
     let mut transport = spawn_echo();
-    transport.send("hi").unwrap();
+    transport.send(&line("hi", NO_ARGS)).unwrap();
     assert_eq!(transport.read(&mut []).unwrap(), 0);
-    assert_eq!(read_available(&mut transport, 3), b"hi\n");
+    let (mut transport, echoed) = read_available(transport, 3);
+    assert_eq!(echoed, b"hi\n");
     transport.close();
 }
 
@@ -128,7 +186,7 @@ fn empty_buffer_read_leaves_the_transport_readable() {
 fn failed_send_leaves_buffered_output_readable() {
     // The child closes its stdin before printing, so once `ready` is read the
     // send must fail while `trailing` is still waiting in the stdout pipe.
-    let mut transport = SpawnTransport::spawn(
+    let transport = SpawnTransport::spawn(
         &["-c", "exec 0<&-; printf 'ready\\ntrailing\\n'"],
         &SpawnOptions {
             tmux_path: Some("sh".to_string()),
@@ -136,11 +194,14 @@ fn failed_send_leaves_buffered_output_readable() {
         },
     )
     .expect("failed to spawn sh");
-    assert_eq!(read_available(&mut transport, 6), b"ready\n");
-    let err = transport.send("anything").unwrap_err();
+    let (mut transport, ready) = read_available(transport, 6);
+    assert_eq!(ready, b"ready\n");
+    let err = transport.send(&line("anything", NO_ARGS)).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
-    assert_eq!(read_available(&mut transport, 9), b"trailing\n");
-    assert_eq!(read_available(&mut transport, 1), b"");
+    let (transport, trailing) = read_available(transport, 9);
+    assert_eq!(trailing, b"trailing\n");
+    let (_, eof) = read_available(transport, 1);
+    assert_eq!(eof, b"");
 }
 
 #[test]
@@ -190,50 +251,37 @@ impl Drop for IsolatedTmux {
     }
 }
 
-/// Read until a `%end ` arrives, on a thread, so a stalled tmux fails the
-/// test at a deadline instead of hanging `cargo test`. A timeout panic drops
-/// the `IsolatedTmux` harness, whose `kill-session` makes the attached client
-/// exit; that EOF ends the thread's read and it drops, and so reaps, the
-/// transport.
-fn read_through_end(transport: SpawnTransport) -> (SpawnTransport, String) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut transport = transport;
-        let mut collected = Vec::new();
-        let mut buf = [0u8; 4096];
-        let outcome = loop {
-            if collected.windows(5).any(|w| w == b"%end ") {
-                break Ok(String::from_utf8_lossy(&collected).into_owned());
-            }
-            match transport.read(&mut buf) {
-                Ok(0) => break Err("transport closed before a %end arrived".to_string()),
-                Ok(n) => collected.extend_from_slice(&buf[..n]),
-                Err(e) => break Err(format!("read failed: {e}")),
-            }
-        };
-        // A send error means the deadline already failed the test.
-        let _ = tx.send(outcome.map(|text| (transport, text)));
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap_or_else(|e| panic!("no complete %end block from tmux within 10s: {e}"))
-        .unwrap_or_else(|reason| panic!("{reason}"))
-}
-
-#[test]
-fn live_tmux_startup_greeting_is_an_empty_guard_block() {
-    let harness = IsolatedTmux::new("greeting");
-    let transport = SpawnTransport::spawn(
+/// A control client attached to the harness's session.
+fn attach(harness: &IsolatedTmux) -> SpawnTransport {
+    SpawnTransport::spawn(
         &["attach-session", "-t", &harness.session],
         &SpawnOptions {
             socket: Some(harness.socket.clone()),
             ..Default::default()
         },
     )
-    .expect("failed to spawn tmux -C");
+    .expect("failed to spawn tmux -C")
+}
+
+/// Send `line` and read its reply block, failing the test if tmux rejected it.
+fn run(mut transport: SpawnTransport, line: &CommandLine) -> (SpawnTransport, String) {
+    transport.send(line).expect("send failed");
+    let (transport, text) = read_through_end(transport);
+    assert!(
+        !text.lines().any(|l| l.starts_with("%error ")),
+        "tmux rejected `{}`: {text}",
+        line.as_str()
+    );
+    (transport, text)
+}
+
+#[test]
+fn live_tmux_startup_greeting_is_an_empty_guard_block() {
+    let harness = IsolatedTmux::new("greeting");
 
     // The unsolicited startup greeting (DESIGN.md §3.3) arrives as a complete
     // guard block before any command of ours is sent.
-    let (mut transport, text) = read_through_end(transport);
+    let (mut transport, text) = read_through_end(attach(&harness));
     assert!(
         text.starts_with("%begin "),
         "expected greeting to start with %begin, got: {text}"
@@ -245,25 +293,88 @@ fn live_tmux_startup_greeting_is_an_empty_guard_block() {
 #[test]
 fn live_tmux_command_round_trip_produces_correlated_guard_block() {
     let harness = IsolatedTmux::new("roundtrip");
-    let transport = SpawnTransport::spawn(
-        &["attach-session", "-t", &harness.session],
-        &SpawnOptions {
-            socket: Some(harness.socket.clone()),
-            ..Default::default()
-        },
-    )
-    .expect("failed to spawn tmux -C");
 
     // Drain the startup greeting first.
-    let (mut transport, _) = read_through_end(transport);
+    let (transport, _) = read_through_end(attach(&harness));
 
-    transport.send("display-message -p PHOENIX-MARKER").unwrap();
-
-    let (mut transport, text) = read_through_end(transport);
+    let (mut transport, text) = run(
+        transport,
+        &line("display-message", ["-p", "PHOENIX-MARKER"]),
+    );
     assert!(
         text.contains("PHOENIX-MARKER"),
         "expected our command's output in the reply block, got: {text}"
     );
 
+    transport.close();
+}
+
+/// Arguments tmux's lexer would split, expand, or unescape if the encoding were
+/// wrong.
+const HOSTILE: &[&str] = &[
+    " ",
+    "~",
+    "~/x",
+    "a~b",
+    "$",
+    "$HOME",
+    "${x}",
+    "$1",
+    "a$",
+    "$é",
+    "\"",
+    "'",
+    "\\",
+    "a b\\c",
+    "trailing\\",
+    "\n",
+    "one\ntwo\n",
+    "\r\n",
+    "tab\there",
+    "\x017\x1b[0m\x7f",
+    "#",
+    "#{session_name}",
+    ";",
+    "a;b",
+    "{",
+    "}",
+    "%",
+    "%if",
+    "-t",
+    "--",
+    "A=b",
+    "héllo wörld ✓",
+    "~$HOME \"it's\" \\ ; #{x} % {}\n\r\t\x017é\\",
+];
+
+#[test]
+fn live_tmux_reads_every_encoded_argument_back_byte_for_byte() {
+    let harness = IsolatedTmux::new("encoding");
+    let saved =
+        std::env::temp_dir().join(format!("tmux-phoenix-test-encoding-{}", std::process::id()));
+    let saved_path = saved.to_str().expect("temp path is UTF-8");
+
+    let (mut transport, _) = read_through_end(attach(&harness));
+    for &arg in HOSTILE {
+        (transport, _) = run(transport, &line("set-buffer", ["-b", "phx", "--", arg]));
+        (transport, _) = run(transport, &line("save-buffer", ["-b", "phx", saved_path]));
+        let read_back = std::fs::read(&saved).expect("save-buffer wrote no file");
+        assert_eq!(
+            read_back,
+            arg.as_bytes(),
+            "argument {arg:?} came back changed"
+        );
+    }
+
+    // set-buffer refuses empty data, so the empty argument round-trips through
+    // a user option instead.
+    (transport, _) = run(transport, &line("set-option", ["-g", "@phx", ""]));
+    let (mut transport, text) = run(transport, &line("display-message", ["-p", "[#{@phx}]"]));
+    assert!(
+        text.lines().any(|l| l == "[]"),
+        "expected the option to hold the empty string, got: {text}"
+    );
+
+    std::fs::remove_file(&saved).expect("failed to remove the saved buffer");
     transport.close();
 }
