@@ -8,7 +8,7 @@ that underwrites both. Every decision below is justified against one of those th
 it doesn't belong here.
 
 Protocol authority for everything in §3 is the C-source-cited spec in
-`promptctl/tmux-control-mode-js/SPEC.md` (tmux next-3.7, commit 5c30b145) and the tmux
+[`promptctl/tmux-control-mode-js/SPEC.md`](https://github.com/promptctl/tmux-control-mode-js/blob/master/SPEC.md) (tmux next-3.7, commit 5c30b145) and the tmux
 man page — never a captured transcript. That TypeScript library is also the reference
 architecture we port from.
 
@@ -33,16 +33,14 @@ operation) a stability win.
 
 ## 2. Crate layout and dependency direction
 
-Dependencies flow strictly downhill; no cycles, no upward calls
-(`[LAW:one-way-deps]`). Two foundation crates at the bottom, neither depending on
-phoenix:
+Dependencies flow strictly downhill: a crate depends only on crates in rows below it
+(`[LAW:one-way-deps]`). Two foundation crates at the bottom depend on nothing:
 
 ```
-phoenix-cli ─► phoenix-daemon ─┬─► phoenix-restore ─► phoenix-core
-                               ├─► phoenix-capture ──► phoenix-core
-                               ├─► phoenix-store ────► phoenix-core
-                               └─► tmux-control ─────► (std only)
-      phoenix-capture, phoenix-restore ─► tmux-control
+phoenix-cli
+phoenix-daemon
+phoenix-capture   phoenix-restore   phoenix-store
+tmux-control      phoenix-core
 ```
 
 - **`tmux-control`** — a complete, standalone Rust implementation of the tmux
@@ -54,9 +52,8 @@ phoenix-cli ─► phoenix-daemon ─┬─► phoenix-restore ─► phoenix-co
 - **`phoenix-store`** — atomic, versioned, generational persistence.
 - **`phoenix-restore`** — pure `Snapshot -> RestorePlan`; the plan is executed by
   `tmux-control`.
-- **`phoenix-daemon`** — owns the control-mode connection, the change subscriptions,
-  the debounce timer, and boot-restore.
-- **`phoenix-cli`** — argument parsing, exit codes.
+- **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
+- **`phoenix-cli`** — maps command lines onto the crates below.
 
 Each crate's purpose is one conjunction-free sentence (`[LAW:decomposition]`). If
 `phoenix-store` ever imports `tmux-control`, or `tmux-control` ever learns what a
@@ -172,7 +169,7 @@ read from the OS.
 - **Two teardowns, deliberately not merged** (IMPL §2.4): `detach()` writes a bare
   `\n` (tmux reads the empty line as client-exit, SPEC §4.1) and is the one wire write
   that is correctly *not* a command, because it carries no guard block to correlate;
-  `close()` drops the transport locally and sends nothing.
+  `close()` sends nothing: it drops the transport and reaps the child locally.
 - **Notifications** dispatch as typed events to subscribers. **Pane output does not**
   — it routes through a separate byte/line sink path, because `%output` is
   high-volume and mixing it into the event stream is how you get head-of-line
