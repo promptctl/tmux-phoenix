@@ -5,15 +5,17 @@
 //! the layers above (`[LAW:locality-or-seam]`).
 //!
 //! Deliberately protocol-agnostic: `Transport` knows nothing about guard
-//! blocks or `ServerMessage` — it moves bytes. Wiring transport output into
-//! [`crate::Codec::feed`] is the client layer's job (a later ticket), which
-//! keeps dependencies flowing one way (`[LAW:one-way-deps]`): transport does
-//! not depend on the codec.
+//! blocks or `ServerMessage` — it writes already-encoded [`CommandLine`]s and
+//! reads raw bytes. Wiring what it reads into [`crate::Codec::feed`] is the
+//! client layer's job (a later ticket), so dependencies still flow one way
+//! (`[LAW:one-way-deps]`): transport uses the protocol's command encoding, and
+//! the protocol layer knows nothing of transports.
 
 mod spawn;
 
 pub use spawn::{SpawnOptions, SpawnTransport};
 
+use crate::protocol::CommandLine;
 use std::io;
 
 /// Minimal contract for anything that can carry the tmux control-mode wire
@@ -21,14 +23,11 @@ use std::io;
 /// down. No protocol knowledge lives here — `send`/`read` move bytes, full
 /// stop.
 pub trait Transport {
-    /// Send one command to tmux. The transport appends the `\n` that ends the
-    /// wire line; a `command` containing `\n` fails with `InvalidInput`, since
-    /// tmux would read it as more than one command.
-    ///
-    /// Sending an empty command writes a bare `\n`, which is the wire-level
-    /// detach signal (SPEC §4.1) — this is a real, valid use of `send`, not
-    /// a misuse to guard against.
-    fn send(&mut self, command: &str) -> io::Result<()>;
+    /// Write one command to tmux. A [`CommandLine`] is exactly one wire line,
+    /// newline included, so the transport writes its bytes as they are and has
+    /// nothing to frame, escape, or refuse; [`CommandLine::detach`] is the
+    /// wire-level detach signal (SPEC §4.1).
+    fn send(&mut self, line: &CommandLine) -> io::Result<()>;
 
     /// Block until at least one byte is available and copy as many as fit
     /// into `buf`, returning the count. As with `std::io::Read`, `Ok(0)` for a

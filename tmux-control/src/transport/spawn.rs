@@ -12,6 +12,7 @@
 //! doesn't — DESIGN.md §3.2 chose `-C` deliberately).
 
 use super::Transport;
+use crate::protocol::CommandLine;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -64,20 +65,6 @@ fn build_argv(socket: Option<&str>, user_args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// The wire line for one command. tmux reads one command per line, so a `\n`
-/// inside `command` would reach it as a second command; commands are framed
-/// only here, so this is where that is refused (`[LAW:single-enforcer]`).
-fn wire_line(command: &str) -> io::Result<String> {
-    if command.contains('\n') {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("command contains a newline, so tmux would read several commands: {command:?}"),
-        ))
-    } else {
-        Ok(format!("{command}\n"))
-    }
-}
-
 impl SpawnTransport {
     /// Spawn `tmux -C <socket-selector> <args>` and take ownership of its
     /// stdin/stdout pipes. stderr is inherited: control-mode traffic is all on
@@ -124,9 +111,9 @@ fn closed_err() -> io::Error {
 }
 
 impl Transport for SpawnTransport {
-    fn send(&mut self, command: &str) -> io::Result<()> {
+    fn send(&mut self, line: &CommandLine) -> io::Result<()> {
         match &mut self.state {
-            State::Open { stdin, .. } => stdin.write_all(wire_line(command)?.as_bytes()),
+            State::Open { stdin, .. } => stdin.write_all(line.wire()),
             State::Closed => Err(closed_err()),
         }
     }

@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod transport;
 
 pub use protocol::{
-    decode_octal, Codec, Guard, Layout, PaneId, ServerMessage, SessionId, WindowId,
+    decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
+    SessionId, WindowId,
 };
 pub use transport::{SpawnOptions, SpawnTransport, Transport};
