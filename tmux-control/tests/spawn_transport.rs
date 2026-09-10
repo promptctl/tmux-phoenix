@@ -58,11 +58,15 @@ fn send_appends_lf_and_read_gets_it_back() {
 }
 
 #[test]
-fn send_does_not_double_terminate_a_line_that_already_ends_in_lf() {
+fn send_rejects_a_newline_and_writes_nothing() {
     let mut transport = spawn_echo();
-    transport.send("hello\n").unwrap();
-    let echoed = read_available(&mut transport, 6);
-    assert_eq!(echoed, b"hello\n");
+    for command in ["first\n", "display-message a\ndisplay-message b"] {
+        let err = transport.send(command).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+    // Only this send reaches the pipe, so nothing rejected above leaked.
+    transport.send("ok").unwrap();
+    assert_eq!(read_available(&mut transport, 3), b"ok\n");
     transport.close();
 }
 
