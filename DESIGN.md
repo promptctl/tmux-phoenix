@@ -217,8 +217,9 @@ struct Pane    { index: PaneIndex, cwd: Utf8PathBuf,
                  program: CapturedProgram, content: Option<PaneContent> }
 ```
 
-- `NonEmpty<T>` wherever tmux guarantees ≥1, so restore never branches on the
-  impossible-empty case (`[LAW:dataflow-not-control-flow]`).
+- `NonEmpty<T>` wherever a persisted snapshot needs ≥1, so restore never branches
+  on the impossible-empty case (`[LAW:dataflow-not-control-flow]`). tmux guarantees
+  it for windows and panes; for sessions, capture enforces it (§5).
 - A single `active: WindowIndex` that must resolve to a member — not a per-child
   `bool` that could encode two-active-or-none (`[LAW:one-source-of-truth]`,
   validated at parse time).
@@ -235,7 +236,11 @@ each pane's foreground argv (the format vars give only the command *name*), plus
 `capture-pane` per pane when content capture is on. A **pure** fold turns those text
 blobs into a `Snapshot` — testable against fixtures with no tmux (`[LAW:effects-at-boundaries]`).
 
-Structure capture is all-or-nothing (a torn tree is never persisted). Content capture
+Structure capture is all-or-nothing (a torn tree is never persisted). A server with
+zero sessions (possible under `exit-empty off`, or for an instant as the last session
+closes) has no tree: capture returns a typed failure, the daemon logs it like any
+failed save cycle, and nothing is saved, so an empty snapshot never becomes latest
+(`[LAW:parse-dont-validate]`). Content capture
 is best-effort per pane: an unresponsive pane degrades *that* pane's content to `None`
 with a recorded warning and marks the save `degraded` — never nukes the snapshot, never
 pretends (`[LAW:no-silent-failure]`).
