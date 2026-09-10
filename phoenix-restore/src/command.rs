@@ -67,6 +67,17 @@ pub enum TmuxCommand {
         session: SessionName,
         window: WindowIndex,
     },
+}
+
+/// One step of a [`crate::RestorePlan`]. Two kinds, because they differ in
+/// what it takes to render them: a [`PlanStep::Command`] is a tmux command
+/// the pure planner can write out in full, while [`PlanStep::ReplayContent`]
+/// needs a temp file that only exists at apply time. Splitting them keeps
+/// [`TmuxCommand::to_command_line`] total — there is no variant it has to
+/// render as something that isn't a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanStep {
+    Command(TmuxCommand),
     /// Replays a pane's captured content (tmux-content-dos.3: "the
     /// authoritative grid comes from capture-pane, not a re-emulated
     /// stream") so the pane looks as it did when captured. Like
@@ -75,19 +86,38 @@ pub enum TmuxCommand {
     /// [`crate::plan::panes_active_last`]'s doc comment — so it must be
     /// issued immediately after the pane it targets is created, before any
     /// later split shifts "current" away.
-    ///
-    /// **Not a literal tmux command**: unlike every other variant,
-    /// [`TmuxCommand::to_command_string`] can't render this one verbatim —
-    /// replaying arbitrary-length content needs a temp file that only
-    /// exists at apply time, which a pure `plan()` can't create. The
-    /// executor (tmux-restore-qll.2's `apply`) special-cases this variant;
-    /// `to_command_string` returns a human-readable summary for `--dry-run`
-    /// instead of runnable syntax.
     ReplayContent {
         session: SessionName,
         window: WindowIndex,
         lines: Vec<String>,
     },
+}
+
+impl From<TmuxCommand> for PlanStep {
+    fn from(cmd: TmuxCommand) -> Self {
+        PlanStep::Command(cmd)
+    }
+}
+
+impl PlanStep {
+    /// What `--dry-run` prints for this step: the exact command line for a
+    /// [`PlanStep::Command`], and for a replay — which has no command line
+    /// until apply time writes its temp file — a summary of what apply will
+    /// do.
+    pub fn describe(&self) -> Result<String, NulInArgument> {
+        match self {
+            PlanStep::Command(cmd) => Ok(cmd.to_command_line()?.as_str().to_owned()),
+            PlanStep::ReplayContent {
+                session,
+                window,
+                lines,
+            } => Ok(format!(
+                "# replay {} line(s) of captured content into {}'s active pane",
+                lines.len(),
+                window_target(session, *window)
+            )),
+        }
+    }
 }
 
 /// A window's `session:index` target — one argument, not two tokens.
@@ -159,15 +189,6 @@ impl TmuxCommand {
                 let target = window_target(session, *window);
                 CommandLine::new("select-window", ["-t", &target])
             }
-            TmuxCommand::ReplayContent {
-                session,
-                window,
-                lines,
-            } => format!(
-                "# replay {} line(s) of captured content into {}'s active pane",
-                lines.len(),
-                window_target(session, *window)
-            ),
         }
     }
 }

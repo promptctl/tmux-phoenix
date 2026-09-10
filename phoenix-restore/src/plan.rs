@@ -4,12 +4,12 @@
 
 use phoenix_core::{Pane, Session, Snapshot, Window, WindowIndex};
 
-use crate::command::TmuxCommand;
+use crate::command::{PlanStep, TmuxCommand};
 use crate::policy::RestorePolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlan {
-    pub commands: Vec<TmuxCommand>,
+    pub commands: Vec<PlanStep>,
 }
 
 /// `_policy` isn't read yet — see [`RestorePolicy`]'s doc comment for why.
@@ -41,7 +41,7 @@ fn panes_active_last(window: &Window) -> Vec<&Pane> {
     ordered
 }
 
-fn plan_session(session: &Session, commands: &mut Vec<TmuxCommand>) {
+fn plan_session(session: &Session, commands: &mut Vec<PlanStep>) {
     let mut windows = session.windows().iter();
     let first_window = windows
         .next()
@@ -51,20 +51,20 @@ fn plan_session(session: &Session, commands: &mut Vec<TmuxCommand>) {
     // first window is special: its creation and one of its panes' creation
     // are both folded into the one `new-session` call.
     let first_window_panes = panes_active_last(first_window);
-    commands.push(TmuxCommand::NewSession {
+    commands.push(PlanStep::Command(TmuxCommand::NewSession {
         session: session.name().clone(),
         first_window_name: first_window.name().clone(),
         cwd: first_window_panes[0].cwd.clone(),
-    });
+    }));
     // `new-session` has no way to request a specific window index (unlike
     // `new-window`, below) — the window lands wherever the target server's
     // `base-index` puts it, so this relocates it to the captured index
     // before anything else references it by that index. See
     // `TmuxCommand::MoveWindow`'s doc comment.
-    commands.push(TmuxCommand::MoveWindow {
+    commands.push(PlanStep::Command(TmuxCommand::MoveWindow {
         session: session.name().clone(),
         window: first_window.index(),
-    });
+    }));
     // The implicit first pane is current right now, immediately after
     // creation — the only moment `ReplayContent`'s "current pane" targeting
     // can reach it (see its doc comment).
@@ -78,20 +78,20 @@ fn plan_session(session: &Session, commands: &mut Vec<TmuxCommand>) {
 
     for window in windows {
         let window_panes = panes_active_last(window);
-        commands.push(TmuxCommand::NewWindow {
+        commands.push(PlanStep::Command(TmuxCommand::NewWindow {
             session: session.name().clone(),
             window: window.index(),
             name: window.name().clone(),
             cwd: window_panes[0].cwd.clone(),
-        });
+        }));
         maybe_replay_content(session, window.index(), window_panes[0], commands);
         plan_remaining_panes(session, window, &window_panes, commands);
     }
 
-    commands.push(TmuxCommand::SelectWindow {
+    commands.push(PlanStep::Command(TmuxCommand::SelectWindow {
         session: session.name().clone(),
         window: session.active(),
-    });
+    }));
 }
 
 /// `ordered_panes` (see [`panes_active_last`]): whichever command created
@@ -101,26 +101,26 @@ fn plan_remaining_panes(
     session: &Session,
     window: &Window,
     ordered_panes: &[&Pane],
-    commands: &mut Vec<TmuxCommand>,
+    commands: &mut Vec<PlanStep>,
 ) {
     for pane in &ordered_panes[1..] {
-        commands.push(TmuxCommand::SplitWindow {
+        commands.push(PlanStep::Command(TmuxCommand::SplitWindow {
             session: session.name().clone(),
             window: window.index(),
             cwd: pane.cwd.clone(),
-        });
+        }));
         // Still the current pane of `window` right after this split — see
-        // `TmuxCommand::ReplayContent`'s doc comment for why this can't be
+        // `PlanStep::ReplayContent`'s doc comment for why this can't be
         // deferred to later.
         maybe_replay_content(session, window.index(), pane, commands);
     }
 
     if ordered_panes.len() > 1 {
-        commands.push(TmuxCommand::SelectLayout {
+        commands.push(PlanStep::Command(TmuxCommand::SelectLayout {
             session: session.name().clone(),
             window: window.index(),
             layout: window.layout().clone(),
-        });
+        }));
     }
 }
 
@@ -134,10 +134,10 @@ fn maybe_replay_content(
     session: &Session,
     window: WindowIndex,
     pane: &Pane,
-    commands: &mut Vec<TmuxCommand>,
+    commands: &mut Vec<PlanStep>,
 ) {
     if let Some(content) = &pane.content {
-        commands.push(TmuxCommand::ReplayContent {
+        commands.push(PlanStep::ReplayContent {
             session: session.name().clone(),
             window,
             lines: content.scrollback.clone(),
@@ -196,19 +196,19 @@ mod tests {
         assert_eq!(
             plan.commands,
             vec![
-                TmuxCommand::NewSession {
+                PlanStep::Command(TmuxCommand::NewSession {
                     session: SessionName::parse("main").unwrap(),
                     first_window_name: WindowName::parse("shell").unwrap(),
                     cwd: "/home/user".into(),
-                },
-                TmuxCommand::MoveWindow {
+                }),
+                PlanStep::Command(TmuxCommand::MoveWindow {
                     session: SessionName::parse("main").unwrap(),
                     window: WindowIndex(0),
-                },
-                TmuxCommand::SelectWindow {
+                }),
+                PlanStep::Command(TmuxCommand::SelectWindow {
                     session: SessionName::parse("main").unwrap(),
                     window: WindowIndex(0),
-                },
+                }),
             ]
         );
     }
@@ -228,7 +228,7 @@ mod tests {
         let splits: Vec<_> = plan
             .commands
             .iter()
-            .filter(|c| matches!(c, TmuxCommand::SplitWindow { .. }))
+            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::SplitWindow { .. })))
             .collect();
         assert_eq!(
             splits.len(),
@@ -239,7 +239,7 @@ mod tests {
         let layouts: Vec<_> = plan
             .commands
             .iter()
-            .filter(|c| matches!(c, TmuxCommand::SelectLayout { .. }))
+            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. })))
             .collect();
         assert_eq!(layouts.len(), 1);
     }
@@ -257,7 +257,7 @@ mod tests {
         assert!(!plan
             .commands
             .iter()
-            .any(|c| matches!(c, TmuxCommand::SelectLayout { .. })));
+            .any(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. }))));
     }
 
     #[test]
@@ -279,14 +279,14 @@ mod tests {
         // implicit first pane.
         assert!(matches!(
             &plan.commands[0],
-            TmuxCommand::NewSession { cwd, .. } if cwd.as_str() != "/active"
+            PlanStep::Command(TmuxCommand::NewSession { cwd, .. }) if cwd.as_str() != "/active"
         ));
 
         let splits: Vec<_> = plan
             .commands
             .iter()
             .filter_map(|c| match c {
-                TmuxCommand::SplitWindow { cwd, .. } => Some(cwd.as_str()),
+                PlanStep::Command(TmuxCommand::SplitWindow { cwd, .. }) => Some(cwd.as_str()),
                 _ => None,
             })
             .collect();
@@ -309,16 +309,20 @@ mod tests {
         .unwrap();
         let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
 
-        assert!(plan.commands.contains(&TmuxCommand::NewWindow {
-            session: SessionName::parse("main").unwrap(),
-            window: WindowIndex(5),
-            name: WindowName::parse("editor").unwrap(),
-            cwd: "/b".into(),
-        }));
-        assert!(plan.commands.contains(&TmuxCommand::SelectWindow {
-            session: SessionName::parse("main").unwrap(),
-            window: WindowIndex(5),
-        }));
+        assert!(plan
+            .commands
+            .contains(&PlanStep::Command(TmuxCommand::NewWindow {
+                session: SessionName::parse("main").unwrap(),
+                window: WindowIndex(5),
+                name: WindowName::parse("editor").unwrap(),
+                cwd: "/b".into(),
+            })));
+        assert!(plan
+            .commands
+            .contains(&PlanStep::Command(TmuxCommand::SelectWindow {
+                session: SessionName::parse("main").unwrap(),
+                window: WindowIndex(5),
+            })));
     }
 
     #[test]
@@ -337,8 +341,7 @@ mod tests {
         let plan = plan(&snapshot(NonEmpty::singleton(session)), &RestorePolicy);
 
         for cmd in &plan.commands {
-            let rendered = cmd.to_command_line().unwrap();
-            let rendered = rendered.as_str();
+            let rendered = cmd.describe().unwrap();
             assert!(
                 !rendered.contains("vim"),
                 "plan leaked a captured program into: {rendered}"
@@ -359,7 +362,7 @@ mod tests {
         assert!(!plan
             .commands
             .iter()
-            .any(|c| matches!(c, TmuxCommand::ReplayContent { .. })));
+            .any(|c| matches!(c, PlanStep::ReplayContent { .. })));
     }
 
     #[test]
@@ -384,10 +387,16 @@ mod tests {
         // NewSession creates the one pane; ReplayContent must immediately
         // follow it (before anything else could shift "current" away).
         assert_eq!(plan.commands.len(), 4, "{:?}", plan.commands);
-        assert!(matches!(plan.commands[0], TmuxCommand::NewSession { .. }));
-        assert!(matches!(plan.commands[1], TmuxCommand::MoveWindow { .. }));
+        assert!(matches!(
+            plan.commands[0],
+            PlanStep::Command(TmuxCommand::NewSession { .. })
+        ));
+        assert!(matches!(
+            plan.commands[1],
+            PlanStep::Command(TmuxCommand::MoveWindow { .. })
+        ));
         match &plan.commands[2] {
-            TmuxCommand::ReplayContent { lines, .. } => {
+            PlanStep::ReplayContent { lines, .. } => {
                 assert_eq!(lines, &vec!["captured line".to_string()])
             }
             other => panic!("expected ReplayContent, got {other:?}"),
@@ -428,7 +437,7 @@ mod tests {
             .commands
             .iter()
             .filter_map(|c| match c {
-                TmuxCommand::ReplayContent { lines, .. } => Some(lines[0].as_str()),
+                PlanStep::ReplayContent { lines, .. } => Some(lines[0].as_str()),
                 _ => None,
             })
             .collect();
@@ -440,17 +449,19 @@ mod tests {
         let split_pos = plan
             .commands
             .iter()
-            .position(|c| matches!(c, TmuxCommand::SplitWindow { .. }))
+            .position(|c| matches!(c, PlanStep::Command(TmuxCommand::SplitWindow { .. })))
             .unwrap();
         let second_replay_pos = plan
             .commands
             .iter()
-            .position(|c| matches!(c, TmuxCommand::ReplayContent { lines, .. } if lines[0] == "from pane b"))
+            .position(
+                |c| matches!(c, PlanStep::ReplayContent { lines, .. } if lines[0] == "from pane b"),
+            )
             .unwrap();
         let layout_pos = plan
             .commands
             .iter()
-            .position(|c| matches!(c, TmuxCommand::SelectLayout { .. }))
+            .position(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. })))
             .unwrap();
         assert!(split_pos < second_replay_pos);
         assert!(second_replay_pos < layout_pos);
@@ -477,7 +488,7 @@ mod tests {
         let new_sessions: Vec<_> = plan
             .commands
             .iter()
-            .filter(|c| matches!(c, TmuxCommand::NewSession { .. }))
+            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::NewSession { .. })))
             .collect();
         assert_eq!(new_sessions.len(), 2);
     }

@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use phoenix_core::{PaneContent, PaneId};
-use tmux_control::{Client, TmuxError, Transport};
+use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
 const INDICATOR_DELIMITER: char = '\u{1f}';
 
@@ -82,10 +82,16 @@ fn capture_pane_lines<T: Transport>(
     pane_id: u32,
     full_scrollback: bool,
 ) -> Result<Vec<String>, TmuxError> {
-    let scrollback_flag = if full_scrollback { " -S -" } else { "" };
-    let output = client.execute(&format!(
-        "capture-pane -p -e{scrollback_flag} -t %{pane_id}"
-    ))?;
+    // `-S -` starts the capture at the oldest scrollback line; without it
+    // tmux captures the visible screen only.
+    let scrollback: &[&str] = if full_scrollback { &["-S", "-"] } else { &[] };
+    let target = format!("%{pane_id}");
+    let args: Vec<&str> = ["-p", "-e"]
+        .into_iter()
+        .chain(scrollback.iter().copied())
+        .chain(["-t", target.as_str()])
+        .collect();
+    let output = client.execute(&CommandLine::new("capture-pane", args)?)?;
     Ok(decode_lines(&output.lines))
 }
 
@@ -98,10 +104,10 @@ pub fn capture_content<T: Transport>(
     client: &mut Client<T>,
     previous: &HashMap<u32, PreviousPaneContent>,
 ) -> Result<HashMap<u32, PaneContent>, TmuxError> {
-    let indicator_cmd = format!(
-        "list-panes -a -F {}",
-        tmux_control::commands::tmux_escape(&indicator_format_string())
-    );
+    let indicator_cmd = CommandLine::new(
+        "list-panes",
+        ["-a", "-F", indicator_format_string().as_str()],
+    )?;
     let indicator_output = client.execute(&indicator_cmd)?;
     let indicators: Vec<Indicator> = indicator_output
         .lines

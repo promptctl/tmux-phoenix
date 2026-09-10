@@ -1,6 +1,6 @@
 //! Executes a [`RestorePlan`] over an existing `tmux-control` connection
 //! (DESIGN.md §6, §9). The only place in this crate that touches a live
-//! connection — or the local filesystem, for [`TmuxCommand::ReplayContent`]
+//! connection — or the local filesystem, for [`PlanStep::ReplayContent`]
 //! — everything upstream ([`crate::plan`]) is pure.
 
 use std::fs;
@@ -8,9 +8,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tmux_control::{Client, TmuxError, Transport};
+use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
-use crate::command::TmuxCommand;
+use crate::command::{PlanStep, TmuxCommand};
 use crate::plan::RestorePlan;
 
 #[derive(Debug)]
@@ -37,7 +37,7 @@ pub struct ApplyError {
 #[derive(Debug)]
 pub enum ApplyErrorSource {
     Tmux(TmuxError),
-    /// [`TmuxCommand::ReplayContent`] couldn't write its temp file — a
+    /// [`PlanStep::ReplayContent`] couldn't write its temp file — a
     /// local filesystem failure, not a tmux protocol one.
     TempFile(io::Error),
 }
@@ -73,15 +73,15 @@ pub fn apply<T: Transport>(
         skipped_move_window: 0,
     };
 
-    for (index, cmd) in plan.commands.iter().enumerate() {
-        let line = resolve_command_line(cmd).map_err(|source| ApplyError {
+    for (index, step) in plan.commands.iter().enumerate() {
+        let line = resolve_command_line(step).map_err(|source| ApplyError {
             command_index: index,
             source,
         })?;
 
         match client.execute(&line) {
             Ok(_) => outcome.executed += 1,
-            Err(err) if is_benign_move_window_failure(cmd, &err) => {
+            Err(err) if is_benign_move_window_failure(step, &err) => {
                 outcome.skipped_move_window += 1;
             }
             Err(source) => {
@@ -96,8 +96,8 @@ pub fn apply<T: Transport>(
     Ok(outcome)
 }
 
-fn is_benign_move_window_failure(cmd: &TmuxCommand, err: &TmuxError) -> bool {
-    if !matches!(cmd, TmuxCommand::MoveWindow { .. }) {
+fn is_benign_move_window_failure(step: &PlanStep, err: &TmuxError) -> bool {
+    if !matches!(step, PlanStep::Command(TmuxCommand::MoveWindow { .. })) {
         return false;
     }
     let TmuxError::Command { lines, .. } = err else {
@@ -110,34 +110,37 @@ fn is_benign_move_window_failure(cmd: &TmuxCommand, err: &TmuxError) -> bool {
 
 static REPLAY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Every command except `ReplayContent` renders directly via
-/// `to_command_string` — see [`TmuxCommand::ReplayContent`]'s doc comment
-/// for why that one needs special handling here instead: it writes its
-/// content to a temp file (not deleted afterward — the shell reads it
-/// asynchronously after `send-keys` returns, so there's no safe point to
-/// clean it up from here; left for the OS's own temp-dir hygiene) and sends
-/// a `cat` of that file into the target pane.
-fn resolve_command_string(cmd: &TmuxCommand) -> io::Result<String> {
-    match cmd {
-        TmuxCommand::ReplayContent {
+/// The command line a step actually sends. A [`PlanStep::Command`] already
+/// is one; [`PlanStep::ReplayContent`] becomes one only here, because it
+/// writes its content to a temp file first (not deleted afterward — the
+/// shell reads it asynchronously after `send-keys` returns, so there's no
+/// safe point to clean it up from here; left for the OS's own temp-dir
+/// hygiene) and sends a `cat` of that file into the target pane.
+fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource> {
+    match step {
+        PlanStep::ReplayContent {
             session,
             window,
             lines,
         } => {
-            let path = write_replay_temp_file(lines)?;
-            let shell_command = format!(
-                "cat {}",
-                tmux_control::commands::tmux_escape(&path.to_string_lossy())
-            );
+            let path = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
             let target = format!("{}:{}", session.as_str(), window.0);
-            Ok(format!(
-                "send-keys -t {} {} Enter",
-                tmux_control::commands::tmux_escape(&target),
-                tmux_control::commands::tmux_escape(&shell_command)
-            ))
+            let shell_command = format!("cat {}", shell_quote(&path.to_string_lossy()));
+            CommandLine::new("send-keys", ["-t", &target, &shell_command, "Enter"])
+                .map_err(|e| ApplyErrorSource::Tmux(e.into()))
         }
-        other => Ok(other.to_command_string()),
+        PlanStep::Command(cmd) => cmd
+            .to_command_line()
+            .map_err(|e| ApplyErrorSource::Tmux(e.into())),
     }
+}
+
+/// POSIX-shell single-quoting. `send-keys` types this text into the pane,
+/// where a *shell* — not tmux — parses it, so tmux's own argument escaping
+/// (which `CommandLine` applies to the argument as a whole) is the wrong
+/// grammar for the text inside it.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn write_replay_temp_file(lines: &[String]) -> io::Result<PathBuf> {
@@ -202,10 +205,10 @@ mod tests {
 
     fn move_window_plan() -> RestorePlan {
         RestorePlan {
-            commands: vec![TmuxCommand::MoveWindow {
+            commands: vec![PlanStep::Command(TmuxCommand::MoveWindow {
                 session: SessionName::parse("main").unwrap(),
                 window: WindowIndex(0),
-            }],
+            })],
         }
     }
 
@@ -246,10 +249,10 @@ mod tests {
     #[test]
     fn a_non_move_window_failure_is_never_treated_as_benign() {
         let plan = RestorePlan {
-            commands: vec![TmuxCommand::SelectWindow {
+            commands: vec![PlanStep::Command(TmuxCommand::SelectWindow {
                 session: SessionName::parse("main").unwrap(),
                 window: WindowIndex(0),
-            }],
+            })],
         };
         let (transport, _state) =
             MockTransport::new(vec!["%begin 1 1 1\nsame index: 0\n%error 1 1 1\n"]);
@@ -263,14 +266,14 @@ mod tests {
     fn stops_at_the_first_real_failure_and_reports_its_index() {
         let plan = RestorePlan {
             commands: vec![
-                TmuxCommand::MoveWindow {
+                PlanStep::Command(TmuxCommand::MoveWindow {
                     session: SessionName::parse("main").unwrap(),
                     window: WindowIndex(0),
-                },
-                TmuxCommand::SelectWindow {
+                }),
+                PlanStep::Command(TmuxCommand::SelectWindow {
                     session: SessionName::parse("main").unwrap(),
                     window: WindowIndex(0),
-                },
+                }),
             ],
         };
         let (transport, _state) = MockTransport::new(vec![
@@ -286,7 +289,7 @@ mod tests {
     #[test]
     fn replay_content_sends_a_send_keys_cat_command() {
         let plan = RestorePlan {
-            commands: vec![TmuxCommand::ReplayContent {
+            commands: vec![PlanStep::ReplayContent {
                 session: SessionName::parse("main").unwrap(),
                 window: WindowIndex(2),
                 lines: vec!["hello".to_string(), "world".to_string()],
@@ -299,8 +302,10 @@ mod tests {
 
         let sent = state.sent.borrow();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].starts_with("send-keys -t 'main:2' "));
-        assert!(sent[0].contains("cat"));
+        assert!(sent[0].starts_with("send-keys -t main:2 "));
+        // The keystrokes are one argument to tmux, and shell-quoted within
+        // it, because a shell — not tmux — parses what gets typed.
+        assert!(sent[0].contains("\"cat '"));
         assert!(sent[0].ends_with(" Enter"));
     }
 

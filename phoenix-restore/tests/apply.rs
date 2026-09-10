@@ -92,7 +92,7 @@ fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
 #[test]
 fn apply_replays_each_panes_captured_content_distinctly() {
     let harness = IsolatedTmux::new("restore-apply-content");
-    let mut client = connect(&harness);
+    let mut client = harness.connect();
 
     let base = std::env::temp_dir().join(format!(
         "phoenix-restore-apply-content-live-{}",
@@ -148,7 +148,10 @@ fn apply_replays_each_panes_captured_content_distinctly() {
     let mut found_b = false;
     for _ in 0..30 {
         let panes_out = client
-            .execute("list-panes -t restored-content:0 -F '#{pane_index}'")
+            .execute(&line(
+                "list-panes",
+                ["-t", "restored-content:0", "-F", "#{pane_index}"],
+            ))
             .unwrap();
         let indices: Vec<String> = panes_out
             .lines
@@ -159,7 +162,10 @@ fn apply_replays_each_panes_captured_content_distinctly() {
         let mut all_text = String::new();
         for idx in &indices {
             let out = client
-                .execute(&format!("capture-pane -p -t 'restored-content:0.{idx}'"))
+                .execute(&line(
+                    "capture-pane",
+                    ["-p", "-t", &format!("restored-content:0.{idx}")],
+                ))
                 .unwrap();
             for line in &out.lines {
                 all_text.push_str(&String::from_utf8_lossy(line));
@@ -177,7 +183,7 @@ fn apply_replays_each_panes_captured_content_distinctly() {
     assert!(found_b, "pane b's replayed content should appear somewhere");
 
     client
-        .execute("kill-session -t restored-content")
+        .execute(&line("kill-session", ["-t", "restored-content"]))
         .expect("cleanup kill-session failed");
     client.close();
     let _ = std::fs::remove_dir_all(&base);

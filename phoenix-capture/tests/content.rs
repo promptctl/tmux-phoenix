@@ -4,7 +4,7 @@
 //! and a changed pane's scrollback is actually *re-pulled*.
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux};
 
 use std::collections::HashMap;
 
@@ -77,7 +77,7 @@ fn unchanged_pane_reuses_previous_scrollback_and_changed_pane_re_captures() {
     // indicator has moved, so this pane must be treated as dirty and
     // re-captured for real, discarding the injected marker.
     client
-        .execute("send-keys 'echo distinctive-new-output' Enter")
+        .execute(&line("send-keys", ["echo distinctive-new-output", "Enter"]))
         .unwrap();
     let mut third_content = None;
     for _ in 0..30 {

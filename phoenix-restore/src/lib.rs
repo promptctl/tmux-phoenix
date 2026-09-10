@@ -7,7 +7,7 @@ mod command;
 mod plan;
 mod policy;
 
-pub use apply::{apply, ApplyError, ApplyOutcome};
-pub use command::TmuxCommand;
+pub use apply::{apply, ApplyError, ApplyErrorSource, ApplyOutcome};
+pub use command::{PlanStep, TmuxCommand};
 pub use plan::{plan, RestorePlan};
 pub use policy::RestorePolicy;

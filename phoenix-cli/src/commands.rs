@@ -172,14 +172,14 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
     if dry_run {
         // Render the whole plan before printing any of it: a plan holding an
         // unencodable name is not a plan a human should half-see.
-        let lines: Result<Vec<_>, _> = restore_plan
+        let lines: Result<Vec<String>, _> = restore_plan
             .commands
             .iter()
-            .map(|cmd| cmd.to_command_line())
+            .map(|step| step.describe())
             .collect();
         return match lines {
             Ok(lines) => {
-                lines.iter().for_each(|line| println!("{}", line.as_str()));
+                lines.iter().for_each(|line| println!("{line}"));
                 EXIT_OK
             }
             Err(err) => {

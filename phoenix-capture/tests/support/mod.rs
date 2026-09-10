@@ -8,7 +8,10 @@
 
 use tmux_control::CommandLine;
 
-/// For a command that takes no arguments.
+/// For a command that takes no arguments. `allow(dead_code)` because only
+/// some of this crate's test binaries take the no-argument path, and each
+/// compiles its own copy of this module — see the module doc.
+#[allow(dead_code)]
 pub const NO_ARGS: [&str; 0] = [];
 
 /// A command line for tests, whose arguments never hold a NUL.
