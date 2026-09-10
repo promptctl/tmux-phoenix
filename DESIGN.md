@@ -10,7 +10,8 @@ it doesn't belong here.
 Protocol authority for everything in §3 is the C-source-cited spec in
 [`promptctl/tmux-control-mode-js/SPEC.md`](https://github.com/promptctl/tmux-control-mode-js/blob/master/SPEC.md) (tmux next-3.7, commit 5c30b145) and the tmux
 man page — never a captured transcript. That TypeScript library is also the reference
-architecture we port from.
+architecture we port from; `IMPL §` citations point to its
+[`IMPL.md`](https://github.com/promptctl/tmux-control-mode-js/blob/master/IMPL.md).
 
 ---
 
@@ -185,7 +186,7 @@ mean "state changed" — session/window set, active window/pane, layout. The dae
 holds one idle connection that costs almost nothing until tmux pushes a
 `%subscription-changed`. Capturing a snapshot is a few `execute` round-trips
 (`list-panes -a`, per-pane `capture-pane` only when content capture is on) over the
-already-open connection — no process spawns. This is the whole efficiency thesis in one
+already-open connection — no tmux process spawns (argv recovery adds one `ps` pass, §5). This is the whole efficiency thesis in one
 paragraph: **subscribe to structure, stream nothing, capture on demand.**
 
 ### 3.5 Stability properties this layer guarantees
@@ -221,6 +222,8 @@ struct Pane    { index: PaneIndex, cwd: Utf8PathBuf,
 - A single `active: WindowIndex` that must resolve to a member — not a per-child
   `bool` that could encode two-active-or-none (`[LAW:one-source-of-truth]`,
   validated at parse time).
+- Every type here is phoenix-core's own (`Layout` included, not `tmux-control`'s), so
+  the crate depends on nothing; capture's fold parses tmux's strings into them.
 
 ---
 
@@ -257,7 +260,9 @@ model deferred to a later milestone; the default-safe behavior ships first.)*
 
 ## 7. Persistence
 
-`phoenix-store` owns the save dir (`${XDG_DATA_HOME}/tmux-phoenix/`), single writer.
+`phoenix-store` owns the save dir (`${XDG_DATA_HOME}/tmux-phoenix/`) and is its single
+writer, enforced by an exclusive lock on the dir held from temp write through prune
+(`[LAW:single-enforcer]`).
 Serialize to a temp file, `fsync`, `rename(2)` onto the final name, then atomically
 repoint `latest` — which therefore only ever names a fully-written snapshot; a crash
 mid-save leaves the last good one untouched (`[LAW:one-source-of-truth]`). Keep the
