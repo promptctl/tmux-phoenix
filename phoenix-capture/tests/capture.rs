@@ -149,7 +149,7 @@ fn live_capture_of_a_server_with_no_sessions_is_an_error() {
         .execute(&line("kill-session", ["-t", harness.session.as_str()]))
         .unwrap();
 
-    assert!(phoenix_capture::capture(&mut client).is_err());
+    assert!(phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off).is_err());
 
     client.close();
 }

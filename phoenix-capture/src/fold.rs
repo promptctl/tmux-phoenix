@@ -215,7 +215,10 @@ mod tests {
 
     #[test]
     fn folding_no_rows_is_a_no_sessions_error() {
-        assert_eq!(fold(vec![], &no_argv).err(), Some(FoldError::NoSessions));
+        assert_eq!(
+            fold(vec![], &no_argv, &no_content).err(),
+            Some(FoldError::NoSessions)
+        );
     }
 
     #[test]
