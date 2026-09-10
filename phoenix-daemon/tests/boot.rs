@@ -270,18 +270,27 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
     // Never assume the target-side pane index matches the snapshot's
     // captured one (`phoenix-restore` never targets panes by index at all —
     // see its `panes_active_last` doc comment); enumerate live indices.
+    let window_target = format!("{session_name}:0");
     let mut found_marker = false;
     for _ in 0..30 {
         let panes_out = client
-            .execute(&format!(
-                "list-panes -t {session_name}:0 -F '#{{pane_index}}'"
-            ))
+            .execute(
+                &CommandLine::new(
+                    "list-panes",
+                    ["-t", window_target.as_str(), "-F", "#{pane_index}"],
+                )
+                .expect("no NUL in a test target"),
+            )
             .unwrap();
         let mut all_text = String::new();
         for line in &panes_out.lines {
             let idx = String::from_utf8_lossy(line);
+            let pane_target = format!("{session_name}:0.{idx}");
             let out = client
-                .execute(&format!("capture-pane -p -t '{session_name}:0.{idx}'"))
+                .execute(
+                    &CommandLine::new("capture-pane", ["-p", "-t", pane_target.as_str()])
+                        .expect("no NUL in a test target"),
+                )
                 .unwrap();
             for line in &out.lines {
                 all_text.push_str(&String::from_utf8_lossy(line));

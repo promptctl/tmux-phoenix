@@ -10,7 +10,7 @@ use phoenix_core::{
     CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneContent, PaneId,
     PaneIndex, Session, SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
-use phoenix_restore::{apply, plan};
+use phoenix_restore::{apply, plan, PlanStep, TmuxCommand};
 
 fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
@@ -192,7 +192,7 @@ fn apply_replays_each_panes_captured_content_distinctly() {
 #[test]
 fn apply_relaunches_each_pane_captured_program() {
     let harness = IsolatedTmux::new("restore-apply-relaunch");
-    let mut client = connect(&harness);
+    let mut client = harness.connect();
 
     let base = std::env::temp_dir().join(format!(
         "phoenix-restore-apply-relaunch-live-{}",
@@ -240,7 +240,7 @@ fn apply_relaunches_each_pane_captured_program() {
         restore_plan
             .commands
             .iter()
-            .filter(|c| matches!(c, phoenix_restore::TmuxCommand::RelaunchProgram { .. }))
+            .filter(|c| { matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { .. })) })
             .count(),
         1,
         "only the pane with a captured foreground program relaunches"
@@ -255,13 +255,24 @@ fn apply_relaunches_each_pane_captured_program() {
     let mut found_marker = false;
     for _ in 0..30 {
         let panes_out = client
-            .execute("list-panes -t restored-relaunch:0 -F '#{pane_index}'")
+            .execute(&line(
+                "list-panes",
+                ["-t", "restored-relaunch:0", "-F", "#{pane_index}"],
+            ))
             .unwrap();
+        let indices: Vec<String> = panes_out
+            .lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect();
+
         let mut all_text = String::new();
-        for line in &panes_out.lines {
-            let idx = String::from_utf8_lossy(line);
+        for idx in &indices {
             let out = client
-                .execute(&format!("capture-pane -p -t 'restored-relaunch:0.{idx}'"))
+                .execute(&line(
+                    "capture-pane",
+                    ["-p", "-t", &format!("restored-relaunch:0.{idx}")],
+                ))
                 .unwrap();
             for line in &out.lines {
                 all_text.push_str(&String::from_utf8_lossy(line));
@@ -280,7 +291,7 @@ fn apply_relaunches_each_pane_captured_program() {
     );
 
     client
-        .execute("kill-session -t restored-relaunch")
+        .execute(&line("kill-session", ["-t", "restored-relaunch"]))
         .expect("cleanup kill-session failed");
     client.close();
     let _ = std::fs::remove_dir_all(&base);
