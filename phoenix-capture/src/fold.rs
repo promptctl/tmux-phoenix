@@ -16,6 +16,7 @@ use crate::row::PaneRow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldError {
+    NoSessions,
     EmptySessionName,
     EmptyWindowName { session: String, window_index: u32 },
     EmptyLayout { session: String, window_index: u32 },
@@ -27,6 +28,7 @@ pub enum FoldError {
 impl std::fmt::Display for FoldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FoldError::NoSessions => write!(f, "the server has no sessions to capture"),
             FoldError::EmptySessionName => write!(f, "a list-panes row had an empty session name"),
             FoldError::EmptyWindowName {
                 session,
@@ -83,10 +85,8 @@ pub fn fold(
         .into_iter()
         .map(|(_, rows)| fold_session(rows, argv_of))
         .collect::<Result<Vec<_>, _>>()?;
-    // `rows` is non-empty whenever `fold` is called from a real capture (at
-    // least one session always exists on a running server); `group_by` can't
-    // turn a non-empty input into zero groups, so `sessions` is non-empty too.
-    Ok(NonEmpty::from_vec(sessions).expect("group_by never drops non-empty input to zero groups"))
+    // [LAW:parse-dont-validate] the one conversion that stamps NonEmpty also rejects the empty server
+    NonEmpty::from_vec(sessions).ok_or(FoldError::NoSessions)
 }
 
 fn fold_session(
@@ -201,6 +201,11 @@ mod tests {
         let session = sessions.first();
         assert_eq!(session.name().as_str(), "main");
         assert_eq!(session.active_window().active_pane().index.0, 0);
+    }
+
+    #[test]
+    fn folding_no_rows_is_a_no_sessions_error() {
+        assert_eq!(fold(vec![], &no_argv).err(), Some(FoldError::NoSessions));
     }
 
     #[test]

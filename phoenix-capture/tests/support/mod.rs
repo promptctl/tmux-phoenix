@@ -25,6 +25,11 @@ impl IsolatedTmux {
 
 impl Drop for IsolatedTmux {
     fn drop(&mut self) {
+        // exit-empty back on first, so a test that turned it off and removed
+        // every session still lets its server exit instead of lingering.
+        let _ = std::process::Command::new("tmux")
+            .args(["-S", &self.socket, "set-option", "-g", "exit-empty", "on"])
+            .status();
         let _ = std::process::Command::new("tmux")
             .args(["-S", &self.socket, "kill-session", "-t", &self.session])
             .status();

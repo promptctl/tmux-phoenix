@@ -118,3 +118,19 @@ fn live_capture_structure_matches_the_raw_list_panes_pane_count() {
 
     client.close();
 }
+
+#[test]
+fn live_capture_of_a_server_with_no_sessions_is_an_error() {
+    let harness = IsolatedTmux::new("capture-empty");
+    let mut client = connect(&harness);
+
+    // exit-empty off keeps the server alive after its last session is gone.
+    client.execute("set-option -g exit-empty off").unwrap();
+    client
+        .execute(&format!("kill-session -t {}", harness.session))
+        .unwrap();
+
+    assert!(phoenix_capture::capture(&mut client).is_err());
+
+    client.close();
+}
