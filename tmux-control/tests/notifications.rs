@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
-use tmux_control::{Client, PaneId, ServerMessage};
+use tmux_control::{Client, CommandLine, PaneId, ServerMessage};
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -27,7 +27,7 @@ impl MockTransport {
 }
 
 impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &str) -> io::Result<()> {
+    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
         if *self.state.closed.borrow() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         }
@@ -61,7 +61,7 @@ fn pane_output_is_buffered_separately_from_other_notifications() {
         "%begin 1 1 1\nreply line\n%end 1 1 1\n",
     ]);
     let mut client = Client::new(transport);
-    let result = client.execute("noop").unwrap();
+    let result = client.execute(&line("noop", NO_ARGS)).unwrap();
     assert_eq!(result.lines, vec![b"reply line".to_vec()]);
 
     assert_eq!(client.drain_notifications(), vec![]);
@@ -78,7 +78,7 @@ fn extended_output_is_also_routed_as_pane_output() {
         "%begin 1 1 1\n%end 1 1 1\n",
     ]);
     let mut client = Client::new(transport);
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(
         client.drain_pane_output(),
@@ -93,7 +93,7 @@ fn non_output_notifications_still_go_through_drain_notifications() {
         "%begin 1 1 1\n%end 1 1 1\n",
     ]);
     let mut client = Client::new(transport);
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(
         client.drain_notifications(),
@@ -116,7 +116,7 @@ fn on_notification_sink_receives_messages_and_bypasses_the_buffer() {
     let mut client = Client::new(transport);
     client.on_notification(move |msg| received_in_sink.borrow_mut().push(msg));
 
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(*received.borrow(), vec![ServerMessage::SessionsChanged]);
     // The sink claimed it — nothing left in the fallback buffer.
@@ -132,7 +132,7 @@ fn on_pane_output_sink_receives_bytes_and_bypasses_the_buffer() {
     let mut client = Client::new(transport);
     client.on_pane_output(move |pane, data| received_in_sink.borrow_mut().push((pane, data)));
 
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(*received.borrow(), vec![(PaneId(5), b"hi\n".to_vec())]);
     assert_eq!(client.drain_pane_output(), vec![]);
@@ -149,7 +149,7 @@ fn registering_a_sink_does_not_retroactively_deliver_already_buffered_messages()
     let mut client = Client::new(transport);
 
     // First command: no sink registered yet, notification lands in the buffer.
-    client.execute("first").unwrap();
+    client.execute(&line("first", NO_ARGS)).unwrap();
     assert_eq!(
         client.drain_notifications(),
         vec![ServerMessage::SessionsChanged]
@@ -159,7 +159,7 @@ fn registering_a_sink_does_not_retroactively_deliver_already_buffered_messages()
     let received: Rc<RefCell<Vec<ServerMessage>>> = Rc::new(RefCell::new(Vec::new()));
     let received_in_sink = received.clone();
     client.on_notification(move |msg| received_in_sink.borrow_mut().push(msg));
-    client.execute("second").unwrap();
+    client.execute(&line("second", NO_ARGS)).unwrap();
 
     assert_eq!(
         *received.borrow(),
@@ -177,7 +177,7 @@ fn registering_a_sink_does_not_retroactively_deliver_already_buffered_messages()
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -200,14 +200,14 @@ fn live_tmux_pane_output_arrives_through_the_pane_output_path() {
     // No explicit -t: targets the attached session's active pane by
     // default, which is the only pane a freshly created session has.
     client
-        .execute("send-keys 'echo phoenix-output-marker' Enter")
+        .execute(&line("send-keys", ["echo phoenix-output-marker", "Enter"]))
         .unwrap();
 
     // Poll a few times: pane output arrives as its own notification, not
     // necessarily bundled with the send-keys command's own (empty) reply.
     let mut found = false;
     for _ in 0..20 {
-        let _ = client.execute("list-sessions"); // any command drives another read
+        let _ = client.execute(&line("list-sessions", NO_ARGS)); // any command drives another read
         if client
             .drain_pane_output()
             .iter()

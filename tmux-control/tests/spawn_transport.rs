@@ -18,8 +18,6 @@ use std::thread;
 use std::time::Duration;
 use tmux_control::{CommandLine, SpawnOptions, SpawnTransport, Transport};
 
-const NO_ARGS: [&str; 0] = [];
-
 /// Spawn `sh -C -c cat` — an echo-back process with no `tmux` dependency,
 /// for testing send/read/close mechanics in isolation from the real
 /// protocol. `SpawnTransport::spawn` always prepends `-C` (it is
@@ -36,11 +34,6 @@ fn spawn_echo() -> SpawnTransport {
         },
     )
     .expect("failed to spawn sh -C -c cat")
-}
-
-/// Test arguments never hold a NUL.
-fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
-    CommandLine::new(name, args).expect("test arguments hold no NUL")
 }
 
 /// Read on a thread, at most `budget(collected)` bytes at a time, until the
@@ -221,7 +214,7 @@ fn nonexistent_binary_returns_an_error_not_a_panic() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 
 /// A control client attached to the harness's session.
 fn attach(harness: &IsolatedTmux) -> SpawnTransport {

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
-use tmux_control::{Client, CloseReason, ConnectionState, TmuxError};
+use tmux_control::{Client, CloseReason, CommandLine, ConnectionState, TmuxError};
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -32,11 +32,14 @@ impl MockTransport {
 }
 
 impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &str) -> io::Result<()> {
+    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
         if *self.state.closed.borrow() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         }
-        self.state.sent.borrow_mut().push(command.to_string());
+        self.state
+            .sent
+            .borrow_mut()
+            .push(command.as_str().to_string());
         Ok(())
     }
 
@@ -134,7 +137,7 @@ fn execute_before_connect_finishes_would_correlate_the_greeting_wrongly() {
     let mut client = Client::new(transport);
     // Without a handshake, the "greeting" block is indistinguishable from
     // a real reply and gets consumed as this command's own (empty) output.
-    let result = client.execute("some-command").unwrap();
+    let result = client.execute(&line("some-command", NO_ARGS)).unwrap();
     assert_eq!(result.lines, Vec::<Vec<u8>>::new());
 }
 
@@ -144,7 +147,7 @@ fn execute_refuses_while_not_ready() {
     let mut client = Client::new(transport);
     // Force a non-Ready state the only way available post-construction.
     client.close();
-    let err = client.execute("anything").unwrap_err();
+    let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     match err {
         TmuxError::NotReady(state) => {
             assert_eq!(
@@ -162,7 +165,7 @@ fn execute_refuses_while_not_ready() {
 fn execute_transitions_to_closed_on_transport_closed_eof() {
     let (transport, _state) = MockTransport::new(vec![]); // no chunks: immediate EOF
     let mut client = Client::new(transport);
-    let err = client.execute("anything").unwrap_err();
+    let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed));
     assert_eq!(
         client.state(),
@@ -176,7 +179,7 @@ fn execute_transitions_to_closed_on_transport_closed_eof() {
 fn reconnect_swaps_transport_and_re_consumes_the_greeting() {
     let (first, _first_state) = MockTransport::new(vec![]); // dies with no greeting
     let mut client = Client::new(first); // starts Ready via new(), then dies below
-    let _ = client.execute("cmd-before-death");
+    let _ = client.execute(&line("cmd-before-death", NO_ARGS));
     assert_eq!(
         client.state(),
         ConnectionState::Closed {
@@ -211,7 +214,7 @@ fn reconnect_failure_reports_the_attempt_that_failed() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -232,7 +235,7 @@ fn live_tmux_connect_handshakes_and_then_executes() {
     assert_eq!(client.state(), ConnectionState::Ready);
 
     let result = client
-        .execute("display-message -p PHOENIX-CONNECT-MARKER")
+        .execute(&line("display-message", ["-p", "PHOENIX-CONNECT-MARKER"]))
         .unwrap();
     let joined = result.lines.concat();
     let text = String::from_utf8_lossy(&joined);

@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
-use tmux_control::{Client, ServerMessage, TmuxError};
+use tmux_control::{Client, CommandLine, ServerMessage, TmuxError};
 
 /// Shared with a `MockTransport` after it's moved into a `Client`, so tests
 /// can still assert on what was sent and control what's closed — `Client`
@@ -47,14 +47,17 @@ impl MockTransport {
 }
 
 impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &str) -> io::Result<()> {
+    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
         if *self.state.closed.borrow() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         }
         if self.fail_next_send {
             return Err(io::Error::other("send refused"));
         }
-        self.state.sent.borrow_mut().push(command.to_string());
+        self.state
+            .sent
+            .borrow_mut()
+            .push(command.as_str().to_string());
         Ok(())
     }
 
@@ -86,7 +89,7 @@ fn execute_sends_the_command_and_returns_output_on_end() {
         MockTransport::new(vec!["%begin 1000 1 1\n0: bash* (1 panes)\n%end 1000 1 1\n"]);
     let mut client = Client::new(transport);
 
-    let result = client.execute("list-windows").unwrap();
+    let result = client.execute(&line("list-windows", NO_ARGS)).unwrap();
 
     assert_eq!(result.guard.command_number, 1);
     assert_eq!(result.lines, vec![b"0: bash* (1 panes)".to_vec()]);
@@ -94,12 +97,14 @@ fn execute_sends_the_command_and_returns_output_on_end() {
 }
 
 #[test]
-fn execute_sends_exactly_the_command_string_unmodified() {
+fn execute_sends_exactly_the_command_line_unmodified() {
     // Line-termination is the transport's job (SpawnTransport tests cover
     // that); the client passes the command through as given, untouched.
     let (transport, state) = MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n"]);
     let mut client = Client::new(transport);
-    client.execute("display-message -p test").unwrap();
+    client
+        .execute(&line("display-message", ["-p", "test"]))
+        .unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec!["display-message -p test".to_string()]
@@ -113,7 +118,7 @@ fn execute_returns_command_error_on_tmux_error_reply() {
     ]);
     let mut client = Client::new(transport);
 
-    let err = client.execute("bad-command").unwrap_err();
+    let err = client.execute(&line("bad-command", NO_ARGS)).unwrap_err();
     match err {
         TmuxError::Command { guard, lines } => {
             assert_eq!(guard.command_number, 3);
@@ -135,7 +140,7 @@ fn execute_reads_across_multiple_transport_chunks() {
     ]);
     let mut client = Client::new(transport);
 
-    let result = client.execute("list-panes").unwrap();
+    let result = client.execute(&line("list-panes", NO_ARGS)).unwrap();
     assert_eq!(
         result.lines,
         vec![b"line one".to_vec(), b"line two".to_vec()]
@@ -154,7 +159,7 @@ fn execute_buffers_a_notification_that_arrives_before_the_reply_block_opens() {
     ]);
     let mut client = Client::new(transport);
 
-    let result = client.execute("list-windows").unwrap();
+    let result = client.execute(&line("list-windows", NO_ARGS)).unwrap();
     assert_eq!(result.lines, vec![b"0: bash* (1 panes)".to_vec()]);
 
     let notifications = client.drain_notifications();
@@ -174,7 +179,7 @@ fn execute_buffers_a_notification_trailing_in_the_same_read_chunk_as_the_reply()
         MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n%sessions-changed\n"]);
     let mut client = Client::new(transport);
 
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(
         client.drain_notifications(),
@@ -187,7 +192,7 @@ fn drain_notifications_empties_the_buffer() {
     let (transport, _state) =
         MockTransport::new(vec!["%sessions-changed\n%begin 1 1 1\n%end 1 1 1\n"]);
     let mut client = Client::new(transport);
-    client.execute("noop").unwrap();
+    client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(client.drain_notifications().len(), 1);
     assert_eq!(client.drain_notifications(), vec![]); // already drained
@@ -200,7 +205,7 @@ fn execute_surfaces_malformed_terminator_as_protocol_error() {
     ]);
     let mut client = Client::new(transport);
 
-    let err = client.execute("anything").unwrap_err();
+    let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     match err {
         TmuxError::Protocol {
             command_number,
@@ -218,7 +223,7 @@ fn execute_returns_transport_closed_on_eof_before_reply_completes() {
     let (transport, _state) = MockTransport::new(vec!["%begin 1 1 1\n"]); // no %end ever arrives
     let mut client = Client::new(transport);
 
-    let err = client.execute("hangs").unwrap_err();
+    let err = client.execute(&line("hangs", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed));
 }
 
@@ -228,7 +233,7 @@ fn execute_propagates_send_failure_without_reading() {
     transport.fail_next_send = true;
     let mut client = Client::new(transport);
 
-    let err = client.execute("anything").unwrap_err();
+    let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::Send(_)));
 }
 
@@ -240,8 +245,8 @@ fn sequential_execute_calls_correlate_independently() {
     ]);
     let mut client = Client::new(transport);
 
-    let first = client.execute("cmd-one").unwrap();
-    let second = client.execute("cmd-two").unwrap();
+    let first = client.execute(&line("cmd-one", NO_ARGS)).unwrap();
+    let second = client.execute(&line("cmd-two", NO_ARGS)).unwrap();
 
     assert_eq!(first.lines, vec![b"first".to_vec()]);
     assert_eq!(first.guard.command_number, 1);
@@ -270,7 +275,7 @@ fn detach_sends_a_bare_newline_bypassing_execute() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -309,7 +314,7 @@ fn live_tmux_execute_round_trips_against_a_real_server() {
     // greeting. execute() from here on should correlate cleanly.
     let mut client = Client::new(transport);
     let result = client
-        .execute("display-message -p PHOENIX-CLIENT-MARKER")
+        .execute(&line("display-message", ["-p", "PHOENIX-CLIENT-MARKER"]))
         .unwrap();
     let joined = result.lines.concat();
     let text = String::from_utf8_lossy(&joined);
@@ -318,7 +323,7 @@ fn live_tmux_execute_round_trips_against_a_real_server() {
         "unexpected output: {text}"
     );
 
-    let second = client.execute("list-sessions").unwrap();
+    let second = client.execute(&line("list-sessions", NO_ARGS)).unwrap();
     let joined = second.lines.concat();
     let listed = String::from_utf8_lossy(&joined);
     assert!(
@@ -342,6 +347,6 @@ fn close_delegates_to_transport_close() {
         }
     );
     // The state gate refuses before ever touching the transport again.
-    let err = client.execute("anything").unwrap_err();
+    let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::NotReady(_)));
 }

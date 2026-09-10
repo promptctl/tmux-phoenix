@@ -201,8 +201,8 @@ fn subscription_and_buffers_transcript_parses_into_the_exact_recorded_skeleton()
             },
             // The unquoted `refresh-client -B mysub:%*:#{pane_dead}` — a
             // genuine, unforced demonstration of exactly the bug
-            // commands::tmux_escape() exists to prevent (tmux's parser
-            // splits unquoted arguments on ':').
+            // `CommandLine` exists to prevent: `#{pane_dead}` reached tmux
+            // unquoted, so `#` opened a comment and ate the rest of the line.
             ServerMessage::GuardBegin(guard(1785677309, 561, 1)),
             ServerMessage::GuardError(guard(1785677309, 561, 1)),
             ServerMessage::GuardBegin(guard(1785677310, 562, 1)),
@@ -258,7 +258,7 @@ fn subscription_and_buffers_transcript_parses_into_the_exact_recorded_skeleton()
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 use tmux_control::commands::{query_tmux_version, set_no_output, subscribe, unsubscribe};
 use tmux_control::{Client, ConnectionState, SpawnOptions, SpawnTransport};
 
@@ -287,12 +287,14 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
 
     // Subscriptions: subscribe, force a change, observe it, unsubscribe.
     subscribe(&mut client, "roundtrip-sub", "", "#{session_windows}").expect("subscribe failed");
-    client.execute("new-window").expect("new-window failed");
+    client
+        .execute(&line("new-window", NO_ARGS))
+        .expect("new-window failed");
 
     let mut saw_subscription_changed = false;
     let mut saw_window_add = false;
     for _ in 0..30 {
-        let _ = client.execute("list-sessions");
+        let _ = client.execute(&line("list-sessions", NO_ARGS));
         for msg in client.drain_notifications() {
             match msg {
                 tmux_control::ServerMessage::SubscriptionChanged { ref name, .. }
@@ -322,14 +324,16 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
 
     // A command that fails for real, correlated correctly even after
     // everything above.
-    let err = client.execute("this-is-not-a-real-command").unwrap_err();
+    let err = client
+        .execute(&line("this-is-not-a-real-command", NO_ARGS))
+        .unwrap_err();
     assert!(matches!(err, tmux_control::TmuxError::Command { .. }));
 
     // The client must still be Ready after a command failure — a %error
     // reply settles the block same as %end; it doesn't kill the connection.
     assert_eq!(client.state(), ConnectionState::Ready);
     client
-        .execute("list-windows")
+        .execute(&line("list-windows", NO_ARGS))
         .expect("client should still be usable after a command error");
 
     // no-output was set, but pane_output must remain empty regardless —

@@ -9,7 +9,7 @@ use tmux_control::commands::{
     clear_flags, query_tmux_version, require_version, set_flags, set_no_output, set_pane_action,
     subscribe, unsubscribe, PaneAction,
 };
-use tmux_control::{Client, PaneId, TmuxError, TmuxVersion};
+use tmux_control::{Client, CommandLine, PaneId, TmuxError, TmuxVersion};
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -33,8 +33,11 @@ impl MockTransport {
 }
 
 impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &str) -> io::Result<()> {
-        self.state.sent.borrow_mut().push(command.to_string());
+    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
+        self.state
+            .sent
+            .borrow_mut()
+            .push(command.as_str().to_string());
         Ok(())
     }
 
@@ -58,24 +61,24 @@ impl tmux_control::Transport for MockTransport {
 const OK_REPLY: &str = "%begin 1 1 1\n%end 1 1 1\n";
 
 #[test]
-fn subscribe_builds_the_escaped_refresh_client_dash_b_command() {
+fn subscribe_sends_name_what_and_format_as_one_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
     subscribe(&mut client, "sub1", "%*", "#{pane_dead}").unwrap();
     assert_eq!(
         *state.sent.borrow(),
-        vec!["refresh-client -B 'sub1':'%*':'#{pane_dead}'".to_string()]
+        vec![r##"refresh-client -B "sub1:%*:#{pane_dead}""##.to_string()]
     );
 }
 
 #[test]
-fn subscribe_escapes_single_quotes_in_arguments() {
+fn subscribe_encodes_an_apostrophe_in_an_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
     subscribe(&mut client, "it's-a-sub", "", "#{session_name}").unwrap();
     assert_eq!(
         *state.sent.borrow(),
-        vec!["refresh-client -B 'it'\\''s-a-sub':'':'#{session_name}'".to_string()]
+        vec![r##"refresh-client -B "it's-a-sub::#{session_name}""##.to_string()]
     );
 }
 
@@ -86,18 +89,18 @@ fn unsubscribe_builds_the_name_only_form() {
     unsubscribe(&mut client, "sub1").unwrap();
     assert_eq!(
         *state.sent.borrow(),
-        vec!["refresh-client -B 'sub1'".to_string()]
+        vec!["refresh-client -B sub1".to_string()]
     );
 }
 
 #[test]
-fn set_pane_action_quotes_the_whole_pane_colon_action_token() {
+fn set_pane_action_sends_the_whole_pane_colon_action_token_as_one_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
     set_pane_action(&mut client, PaneId(5), PaneAction::Pause).unwrap();
     assert_eq!(
         *state.sent.borrow(),
-        vec!["refresh-client -A '%5:pause'".to_string()]
+        vec![r#"refresh-client -A "%5:pause""#.to_string()]
     );
 }
 
@@ -114,7 +117,7 @@ fn pane_action_variants_map_to_spec_13_strings() {
         set_pane_action(&mut client, PaneId(1), action).unwrap();
         assert_eq!(
             *state.sent.borrow(),
-            vec![format!("refresh-client -A '%1:{expected}'")]
+            vec![format!(r#"refresh-client -A "%1:{expected}""#)]
         );
     }
 }
@@ -205,7 +208,7 @@ fn require_version_rejects_older_with_a_named_error() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -251,11 +254,11 @@ fn live_tmux_subscribe_produces_a_subscription_changed_notification() {
     // then poll until %subscription-changed shows up. Deliberately not
     // renaming the session itself: IsolatedTmux's Drop cleans up by the
     // session's original name, and a rename would break that.
-    client.execute("new-window").unwrap();
+    client.execute(&line("new-window", NO_ARGS)).unwrap();
 
     let mut found = false;
     for _ in 0..30 {
-        let _ = client.execute("list-sessions");
+        let _ = client.execute(&line("list-sessions", NO_ARGS));
         if client.drain_notifications().iter().any(|m| {
             matches!(
                 m,

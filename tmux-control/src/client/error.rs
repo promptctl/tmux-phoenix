@@ -1,5 +1,5 @@
 use crate::client::ConnectionState;
-use crate::protocol::Guard;
+use crate::protocol::{Guard, NulInArgument};
 use crate::version::TmuxVersion;
 use std::fmt;
 use std::io;
@@ -13,6 +13,9 @@ pub enum TmuxError {
     /// against the wrong guard block; `Closed` has no transport to send on
     /// at all.
     NotReady(ConnectionState),
+    /// An argument held a NUL, so no command line exists to send: tmux
+    /// arguments are C strings.
+    Encode(NulInArgument),
     /// The transport refused or failed to send the command.
     Send(io::Error),
     /// A read from the transport failed (distinct from a clean close, which
@@ -46,6 +49,7 @@ impl fmt::Display for TmuxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TmuxError::NotReady(state) => write!(f, "client is not ready (state: {state:?})"),
+            TmuxError::Encode(err) => write!(f, "cannot build the command line: {err}"),
             TmuxError::Send(err) => write!(f, "failed to send command: {err}"),
             TmuxError::Read(err) => write!(f, "failed to read from transport: {err}"),
             TmuxError::TransportClosed => {
@@ -91,6 +95,12 @@ impl fmt::Display for TmuxError {
                 )
             }
         }
+    }
+}
+
+impl From<NulInArgument> for TmuxError {
+    fn from(err: NulInArgument) -> Self {
+        TmuxError::Encode(err)
     }
 }
 

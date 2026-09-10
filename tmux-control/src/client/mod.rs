@@ -47,7 +47,7 @@ mod error;
 pub use connection_state::{CloseReason, ConnectionState};
 pub use error::TmuxError;
 
-use crate::protocol::{Codec, Guard, PaneId, ServerMessage};
+use crate::protocol::{Codec, CommandLine, Guard, PaneId, ServerMessage};
 use crate::transport::Transport;
 use std::collections::VecDeque;
 
@@ -223,7 +223,7 @@ impl<T: Transport> Client<T> {
     /// A `%error` reply is `Err(TmuxError::Command)`, not
     /// `Ok(CommandOutput { .. })` with a failure flag — SPEC §5.3's parse
     /// errors and other command failures are error conditions, not data.
-    pub fn execute(&mut self, command: &str) -> Result<CommandOutput, TmuxError> {
+    pub fn execute(&mut self, command: &CommandLine) -> Result<CommandOutput, TmuxError> {
         if self.state != ConnectionState::Ready {
             return Err(TmuxError::NotReady(self.state));
         }
@@ -337,7 +337,9 @@ impl<T: Transport> Client<T> {
     /// `ConnectionState`: a caller may reasonably try to detach from any
     /// state, best-effort.
     pub fn detach(&mut self) -> Result<(), TmuxError> {
-        self.transport.send("").map_err(TmuxError::Send)
+        self.transport
+            .send(&CommandLine::detach())
+            .map_err(TmuxError::Send)
     }
 
     /// Local-side teardown: drops the transport, sends nothing to tmux

@@ -1,16 +1,12 @@
 //! Free functions over [`Client::execute`] (DESIGN.md §3.3):
-//! `[LAW:single-enforcer]` — these are thin command-string builders, not an
+//! `[LAW:single-enforcer]` — these are thin [`CommandLine`] builders, not an
 //! alternate dispatch path. Scoped to what ticket `tmux-control-mode-1ju.6`
 //! asks for: subscriptions (SPEC §14), pane flow control (SPEC §13), client
 //! flags (SPEC §9), and version gating (IMPL.md §2.2). `list-panes`,
 //! `send-keys`, and friends are a later ticket's job.
 
-mod escape;
-
-pub use escape::tmux_escape;
-
 use crate::client::{Client, CommandOutput, TmuxError};
-use crate::protocol::PaneId;
+use crate::protocol::{CommandLine, PaneId};
 use crate::transport::Transport;
 use crate::version::{parse_tmux_version, TmuxVersion};
 
@@ -50,13 +46,12 @@ pub fn subscribe<T: Transport>(
     what: &str,
     format: &str,
 ) -> Result<CommandOutput, TmuxError> {
-    let cmd = format!(
-        "refresh-client -B {}:{}:{}",
-        tmux_escape(name),
-        tmux_escape(what),
-        tmux_escape(format)
-    );
-    client.execute(&cmd)
+    // tmux takes `name:what:format` as one argument and splits it itself.
+    let target = format!("{name}:{what}:{format}");
+    client.execute(&CommandLine::new(
+        "refresh-client",
+        ["-B", target.as_str()],
+    )?)
 }
 
 /// `refresh-client -B <name>` (SPEC §14, name-only form): remove a
@@ -65,7 +60,7 @@ pub fn unsubscribe<T: Transport>(
     client: &mut Client<T>,
     name: &str,
 ) -> Result<CommandOutput, TmuxError> {
-    client.execute(&format!("refresh-client -B {}", tmux_escape(name)))
+    client.execute(&CommandLine::new("refresh-client", ["-B", name])?)
 }
 
 /// `refresh-client -A <pane>:<action>` (SPEC §13).
@@ -74,10 +69,12 @@ pub fn set_pane_action<T: Transport>(
     pane: PaneId,
     action: PaneAction,
 ) -> Result<CommandOutput, TmuxError> {
-    // tmux's command parser splits unquoted arguments on ':' — the whole
-    // pane:action token must be quoted as one (mirrors the reference).
+    // `pane:action` is one argument, which tmux splits itself.
     let target = format!("%{}:{}", pane.0, action.as_str());
-    client.execute(&format!("refresh-client -A {}", tmux_escape(&target)))
+    client.execute(&CommandLine::new(
+        "refresh-client",
+        ["-A", target.as_str()],
+    )?)
 }
 
 /// `refresh-client -f <flags>` (SPEC §9), comma-joined.
@@ -85,7 +82,10 @@ pub fn set_flags<T: Transport>(
     client: &mut Client<T>,
     flags: &[&str],
 ) -> Result<CommandOutput, TmuxError> {
-    client.execute(&format!("refresh-client -f {}", flags.join(",")))
+    client.execute(&CommandLine::new(
+        "refresh-client",
+        ["-f", flags.join(",").as_str()],
+    )?)
 }
 
 /// `refresh-client -f !<flags>` (SPEC §9): `!`-prefixing a flag clears it.
@@ -94,7 +94,10 @@ pub fn clear_flags<T: Transport>(
     flags: &[&str],
 ) -> Result<CommandOutput, TmuxError> {
     let negated: Vec<String> = flags.iter().map(|f| format!("!{f}")).collect();
-    client.execute(&format!("refresh-client -f {}", negated.join(",")))
+    client.execute(&CommandLine::new(
+        "refresh-client",
+        ["-f", negated.join(",").as_str()],
+    )?)
 }
 
 /// Convenience wrapper for `set_flags(client, &[NO_OUTPUT_FLAG])` — DESIGN.md
@@ -108,7 +111,7 @@ pub fn set_no_output<T: Transport>(client: &mut Client<T>) -> Result<CommandOutp
 /// [`Transport`], since the probe travels the protocol channel to the real
 /// server rather than spawning a local `tmux -V` (IMPL.md §2.2).
 pub fn query_tmux_version<T: Transport>(client: &mut Client<T>) -> Result<TmuxVersion, TmuxError> {
-    let response = client.execute("display-message -p \"#{version}\"")?;
+    let response = client.execute(&CommandLine::new("display-message", ["-p", "#{version}"])?)?;
     response
         .lines
         .iter()
