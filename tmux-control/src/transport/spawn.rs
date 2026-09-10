@@ -34,11 +34,18 @@ pub struct SpawnOptions {
 /// process. Owns the child and its stdin/stdout pipes; this is the only
 /// place in the crate a process is spawned or an OS byte is read.
 pub struct SpawnTransport {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-    closed: bool,
-    close_reason: Option<String>,
+    state: State,
+}
+
+/// `close()` moves the child out of `Open` and reaps it, so it is reaped
+/// exactly once and a closed transport holds no pipes.
+enum State {
+    Open {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+    },
+    Closed,
 }
 
 /// `-C` plus the socket selector plus the caller's own tmux command/args, in
@@ -69,8 +76,9 @@ fn terminate_line(command: &str) -> String {
 
 impl SpawnTransport {
     /// Spawn `tmux -C <socket-selector> <args>` and take ownership of its
-    /// stdin/stdout pipes. stderr is discarded: control clients get their
-    /// errors through `%error` guard blocks on stdout, not stderr.
+    /// stdin/stdout pipes. stderr is inherited: control-mode traffic is all on
+    /// stdout, and a startup failure (no server, a bad socket) is printed by
+    /// tmux before any control connection exists.
     pub fn spawn(args: &[&str], options: &SpawnOptions) -> io::Result<Self> {
         let tmux_path = options.tmux_path.as_deref().unwrap_or("tmux");
         let argv = build_argv(options.socket.as_deref(), args);
@@ -80,7 +88,7 @@ impl SpawnTransport {
             .args(&argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         for (key, value) in &options.env {
             command.env(key, value);
         }
@@ -98,86 +106,46 @@ impl SpawnTransport {
             .expect("child.stdout missing despite Stdio::piped()");
 
         Ok(Self {
-            child,
-            stdin,
-            stdout,
-            closed: false,
-            close_reason: None,
+            state: State::Open {
+                child,
+                stdin,
+                stdout,
+            },
         })
     }
+}
 
-    fn closed_err(&self) -> io::Error {
-        let msg = match &self.close_reason {
-            Some(reason) => format!("transport closed: {reason}"),
-            None => "transport closed".to_string(),
-        };
-        io::Error::new(io::ErrorKind::BrokenPipe, msg)
-    }
+fn closed_err() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "transport closed")
 }
 
 impl Transport for SpawnTransport {
     fn send(&mut self, command: &str) -> io::Result<()> {
-        if self.closed {
-            return Err(self.closed_err());
-        }
-        let line = terminate_line(command);
-        match self.stdin.write_all(line.as_bytes()) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                self.closed = true;
-                self.close_reason.get_or_insert_with(|| err.to_string());
-                Err(err)
-            }
+        match &mut self.state {
+            State::Open { stdin, .. } => stdin.write_all(terminate_line(command).as_bytes()),
+            State::Closed => Err(closed_err()),
         }
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.closed {
-            return Err(self.closed_err());
-        }
-        match self.stdout.read(buf) {
-            Ok(0) => {
-                self.closed = true;
-                self.close_reason.get_or_insert("eof".to_string());
-                Ok(0)
-            }
-            Ok(n) => Ok(n),
-            Err(err) => {
-                self.closed = true;
-                self.close_reason.get_or_insert_with(|| err.to_string());
-                Err(err)
-            }
+        match &mut self.state {
+            State::Open { stdout, .. } => stdout.read(buf),
+            State::Closed => Err(closed_err()),
         }
     }
 
     fn close(&mut self) {
-        if self.closed {
-            return;
+        if let State::Open { mut child, .. } = std::mem::replace(&mut self.state, State::Closed) {
+            // `kill()` fails harmlessly on a child that already exited; `wait()`
+            // reaps it either way, which `std::process::Child` never does on drop.
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        self.closed = true;
-        self.close_reason.get_or_insert("closed".to_string());
-        reap(&mut self.child);
     }
-}
-
-/// Best-effort kill-then-wait, tolerant of a child that has already exited
-/// (`kill()` on a dead process errors harmlessly; ignored either way).
-///
-/// Separate from the `closed` flag on purpose: `read()` observing a natural
-/// EOF sets `closed = true` without calling `wait()` (EOF only tells us the
-/// pipe closed, not that we've reaped the process) — if `close()` then
-/// short-circuited on `closed` alone, that path would never reap the child.
-/// `Drop` also calls this unconditionally, so a `SpawnTransport` dropped
-/// without an explicit `close()` — after a natural EOF, or with no
-/// teardown call at all — never leaks a zombie. `std::process::Child`,
-/// unlike Node's `child_process`, does not reap on drop by itself.
-fn reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 impl Drop for SpawnTransport {
     fn drop(&mut self) {
-        reap(&mut self.child);
+        self.close();
     }
 }

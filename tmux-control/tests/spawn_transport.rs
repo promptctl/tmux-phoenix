@@ -9,8 +9,7 @@
 //!   expects from a real server, not just an assumed shape.
 //!
 //! Live tests use a unique socket path per test (never the user's default
-//! tmux socket) and always tear down via `kill-session`, never
-//! `kill-server`.
+//! tmux socket) and always tear down via `kill-session` on their own socket.
 
 use std::io::ErrorKind;
 use tmux_control::{SpawnOptions, SpawnTransport, Transport};
@@ -126,9 +125,7 @@ fn nonexistent_binary_returns_an_error_not_a_panic() {
 // ---------------------------------------------------------------------------
 
 /// Isolated throw-away socket path + a guard that tears the session down via
-/// `kill-session` on drop (never `kill-server` — that's repo-policy
-/// forbidden and would be wrong here regardless, since it's blunter than
-/// this test needs).
+/// `kill-session` on drop.
 struct IsolatedTmux {
     socket: String,
     session: String,
@@ -158,10 +155,29 @@ impl Drop for IsolatedTmux {
     }
 }
 
+/// Read until a `%end ` arrives, on a thread, so a stalled tmux fails the
+/// test at a deadline instead of hanging `cargo test`.
+fn read_through_end(transport: SpawnTransport) -> (SpawnTransport, String) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut transport = transport;
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !collected.windows(5).any(|w| w == b"%end ") {
+            let n = transport.read(&mut buf).expect("read failed");
+            assert!(n > 0, "transport closed before a %end arrived");
+            collected.extend_from_slice(&buf[..n]);
+        }
+        let _ = tx.send((transport, String::from_utf8_lossy(&collected).into_owned()));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("no complete %end block from tmux: {e}"))
+}
+
 #[test]
 fn live_tmux_startup_greeting_is_an_empty_guard_block() {
     let harness = IsolatedTmux::new("greeting");
-    let mut transport = SpawnTransport::spawn(
+    let transport = SpawnTransport::spawn(
         &["attach-session", "-t", &harness.session],
         &SpawnOptions {
             socket: Some(harness.socket.clone()),
@@ -170,28 +186,12 @@ fn live_tmux_startup_greeting_is_an_empty_guard_block() {
     )
     .expect("failed to spawn tmux -C");
 
-    // Read until we see a complete %begin...%end block (the unsolicited
-    // startup greeting SPEC/DESIGN.md §3.3 describes) — proves this
-    // transport delivers a real, correctly-framed guard block before any
-    // command of ours was sent.
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = transport.read(&mut buf).expect("read failed");
-        assert!(n > 0, "transport closed before the greeting arrived");
-        collected.extend_from_slice(&buf[..n]);
-        if collected.windows(5).any(|w| w == b"%end ") {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&collected);
+    // The unsolicited startup greeting (DESIGN.md §3.3) arrives as a complete
+    // guard block before any command of ours is sent.
+    let (mut transport, text) = read_through_end(transport);
     assert!(
         text.starts_with("%begin "),
         "expected greeting to start with %begin, got: {text}"
-    );
-    assert!(
-        text.contains("%end "),
-        "expected greeting to close with %end, got: {text}"
     );
 
     transport.close();
@@ -200,7 +200,7 @@ fn live_tmux_startup_greeting_is_an_empty_guard_block() {
 #[test]
 fn live_tmux_command_round_trip_produces_correlated_guard_block() {
     let harness = IsolatedTmux::new("roundtrip");
-    let mut transport = SpawnTransport::spawn(
+    let transport = SpawnTransport::spawn(
         &["attach-session", "-t", &harness.session],
         &SpawnOptions {
             socket: Some(harness.socket.clone()),
@@ -210,30 +210,11 @@ fn live_tmux_command_round_trip_produces_correlated_guard_block() {
     .expect("failed to spawn tmux -C");
 
     // Drain the startup greeting first.
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = transport.read(&mut buf).expect("read failed");
-        assert!(n > 0);
-        collected.extend_from_slice(&buf[..n]);
-        if collected.windows(5).any(|w| w == b"%end ") {
-            break;
-        }
-    }
+    let (mut transport, _) = read_through_end(transport);
 
     transport.send("display-message -p PHOENIX-MARKER").unwrap();
 
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = transport.read(&mut buf).expect("read failed");
-        assert!(n > 0, "transport closed before our command's reply arrived");
-        collected.extend_from_slice(&buf[..n]);
-        if collected.windows(5).any(|w| w == b"%end ") {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&collected);
+    let (mut transport, text) = read_through_end(transport);
     assert!(
         text.contains("PHOENIX-MARKER"),
         "expected our command's output in the reply block, got: {text}"

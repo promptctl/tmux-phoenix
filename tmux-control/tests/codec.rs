@@ -580,9 +580,12 @@ fn malformed_known_type_outside_block_degrades_to_unknown() {
 }
 
 #[test]
-fn non_percent_line_outside_block_is_dropped() {
-    let messages = feed("this is not a notification\nneither is this\n");
-    assert_eq!(messages, vec![]);
+fn non_percent_line_outside_block_is_unknown() {
+    let messages = feed("this is not a notification\n");
+    assert_eq!(
+        messages,
+        vec![ServerMessage::Unknown("this is not a notification".into())]
+    );
 }
 
 #[test]
@@ -676,10 +679,13 @@ fn reset_inside_open_block_clears_active_command() {
         })]
     );
     codec.reset();
-    // No block is open anymore, so a plain line outside a block is dropped,
-    // not captured as output for command 42.
+    // No block is open anymore, so a plain line is `Unknown`, not output for
+    // command 42.
     let messages = codec.feed(b"this line is outside\n");
-    assert_eq!(messages, vec![]);
+    assert_eq!(
+        messages,
+        vec![ServerMessage::Unknown("this line is outside".into())]
+    );
 }
 
 // ---------------------------------------------------------------------------

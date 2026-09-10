@@ -110,7 +110,7 @@ enum ServerMessage {
     ClientSessionChanged { client: String, session: SessionId, name: String },
     ClientDetached { client: String },
     PasteBufferChanged { name: String }, PasteBufferDeleted { name: String },
-    SubscriptionChanged { name: String, session: SessionId, window: Option<WindowId>,
+    SubscriptionChanged { name: String, session: Option<SessionId>, window: Option<WindowId>,
                           window_index: Option<u32>, pane: Option<PaneId>, value: String },
     Message { text: String },
     ConfigError { text: String },
@@ -138,8 +138,7 @@ Supporting pure pieces:
   re-parses a raw id string (`[LAW:parse-dont-validate]`).
 - **`decode_octal`.** `%output`/`%extended-output` payloads are octal-escaped
   (`\NNN`, `\` → `\134`, SPEC §10). One decoder, tolerant of malformed/partial
-  escapes (pass a stray `\` through rather than panicking) — the reference documents
-  exactly this tolerance.
+  escapes: anything that isn't a valid `\000`–`\377` escape decodes to `?`.
 - **`Layout`** stays an opaque newtype around tmux's own layout string. tmux owns
   window geometry; we transport it verbatim and never re-derive it
   (`[LAW:one-source-of-truth]`).

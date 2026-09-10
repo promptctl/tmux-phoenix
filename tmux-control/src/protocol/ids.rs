@@ -23,7 +23,7 @@ fn parse_prefixed(bytes: &[u8], prefix: u8) -> Option<u32> {
     if bytes.first().copied()? != prefix {
         return None;
     }
-    std::str::from_utf8(&bytes[1..]).ok()?.parse().ok()
+    super::fields::parse_decimal(&bytes[1..])
 }
 
 impl SessionId {

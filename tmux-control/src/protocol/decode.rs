@@ -3,12 +3,7 @@
 //! Ported from the reference decoder (`promptctl/tmux-control-mode-js`
 //! `src/protocol/decode.ts`), which is the authoritative source for this
 //! library-side tolerance policy — SPEC §10 only documents the wire encoding
-//! rule (`\NNN`, `\` → `\134`), not decoder recovery behavior. The reference
-//! decoder's actual recovery differs slightly from DESIGN.md's prose gloss
-//! ("pass a stray `\` through"): a malformed escape decodes to `?`, not a
-//! literal backslash. This port follows the reference source, per this
-//! project's standing rule to spec against authoritative sources/impls
-//! rather than paraphrases.
+//! rule (`\NNN`, `\` → `\134`), not decoder recovery behavior.
 
 const SPACE: u8 = 0x20;
 const BACKSLASH: u8 = b'\\';
@@ -24,6 +19,7 @@ const QUESTION: u8 = b'?';
 ///   digits) decodes to one byte,
 /// - a malformed escape (`\` not followed by three octal digits) decodes to
 ///   `?`, and parsing resumes at the byte that failed to be a digit,
+/// - an escape above `\377` also decodes to `?`,
 /// - every other byte (`0x20..=0xFF`) passes through unchanged.
 ///
 /// Total and panic-free: every input byte sequence produces some output.
@@ -60,7 +56,10 @@ pub fn decode_octal(input: &[u8]) -> Vec<u8> {
                 }
                 value = value * 8 + digit as u16;
             }
-            c = if malformed { QUESTION } else { value as u8 };
+            c = match u8::try_from(value) {
+                Ok(byte) if !malformed => byte,
+                _ => QUESTION,
+            };
         }
 
         result.push(c);
@@ -106,6 +105,11 @@ mod tests {
     #[test]
     fn malformed_escape_becomes_question_mark_and_resumes_at_the_bad_byte() {
         assert_eq!(decode_octal(b"\\9x"), b"?9x");
+    }
+
+    #[test]
+    fn escape_above_377_becomes_question_mark() {
+        assert_eq!(decode_octal(b"\\400\\777"), b"??");
     }
 
     #[test]

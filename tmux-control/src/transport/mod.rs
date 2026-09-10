@@ -31,8 +31,8 @@ pub trait Transport {
     fn send(&mut self, command: &str) -> io::Result<()>;
 
     /// Block until at least one byte is available and copy as many as fit
-    /// into `buf`, returning the count. `Ok(0)` means clean EOF: the
-    /// transport has closed (the process exited, the pipe closed).
+    /// into `buf`, returning the count. As with `std::io::Read`, `Ok(0)` for a
+    /// non-empty `buf` means clean EOF: the process exited or the pipe closed.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
 
     /// Tear down the transport. Idempotent — calling it more than once, or

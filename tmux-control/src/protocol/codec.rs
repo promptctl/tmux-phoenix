@@ -3,10 +3,8 @@
 //! Exactly two states, because the protocol has exactly two:
 //!
 //! - **Outside a block:** a `%begin` line opens one; every other `%`-line is
-//!   a notification; anything else is dropped (SPEC §4: an empty line
-//!   detaches the *client's own* connection — it is never something a
-//!   server sends back, so a non-`%` line here is simply not a protocol
-//!   line).
+//!   a notification; anything else is not a protocol line and surfaces as
+//!   `Unknown`.
 //! - **Inside a block:** every line is command output until `%end`/`%error`
 //!   closes it — routed by *position*, not by content. A command's output
 //!   happening to start with `%` (e.g. `list-panes -F '#{pane_id}'` printing
@@ -99,11 +97,6 @@ impl Codec {
                 });
                 return;
             }
-        }
-
-        if !is_notification {
-            // A non-`%` line outside any block is not a protocol line.
-            return;
         }
 
         match parse_notification(type_str, args) {
