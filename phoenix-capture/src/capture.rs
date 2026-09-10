@@ -6,7 +6,7 @@
 use std::time::SystemTime;
 
 use phoenix_core::{FormatVersion, OffsetDateTime, Snapshot, TmuxVersion};
-use tmux_control::{Client, TmuxError, Transport};
+use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
 use crate::argv::recover_argv;
 use crate::fold::{fold, FoldError};
@@ -48,11 +48,10 @@ impl std::error::Error for CaptureError {}
 /// failure degrades every pane's `argv` to empty rather than failing the
 /// capture (DESIGN.md §5).
 pub fn capture<T: Transport>(client: &mut Client<T>) -> Result<Snapshot, CaptureError> {
+    let list_panes = CommandLine::new("list-panes", ["-a", "-F", format_string().as_str()])
+        .map_err(|err| CaptureError::ListPanes(err.into()))?;
     let output = client
-        .execute(&format!(
-            "list-panes -a -F {}",
-            tmux_control::commands::tmux_escape(&format_string())
-        ))
+        .execute(&list_panes)
         .map_err(CaptureError::ListPanes)?;
 
     let rows: Vec<PaneRow> = output

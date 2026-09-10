@@ -1,9 +1,20 @@
 //! Shared test-only harness for spawning an isolated, throw-away tmux
 //! server that live-integration tests can safely drive without touching the
-//! developer's real tmux sessions. Duplicated (not shared via a lib crate)
+//! developer's real tmux sessions, plus the command builder every test sends
+//! through. Duplicated (not shared via a lib crate)
 //! from `tmux-control/tests/support/mod.rs` — each integration test binary
 //! compiles its own copy either way, and Rust's per-binary dead-code lint
 //! flags an unused shared module's items if only some binaries use them.
+
+use tmux_control::CommandLine;
+
+/// For a command that takes no arguments.
+pub const NO_ARGS: [&str; 0] = [];
+
+/// A command line for tests, whose arguments never hold a NUL.
+pub fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
+    CommandLine::new(name, args).expect("test arguments hold no NUL")
+}
 
 pub struct IsolatedTmux {
     pub socket: String,

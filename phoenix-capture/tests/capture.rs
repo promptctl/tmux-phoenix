@@ -2,7 +2,7 @@
 //! server (never the developer's own sessions).
 
 mod support;
-use support::IsolatedTmux;
+use support::{line, IsolatedTmux, NO_ARGS};
 
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
@@ -45,13 +45,22 @@ fn live_capture_tracks_the_real_active_window_and_pane() {
     let harness = IsolatedTmux::new("capture-active");
     let mut client = connect(&harness);
 
-    client.execute("new-window -n second").unwrap();
-    client.execute("new-window -n third").unwrap();
-    client.execute("split-window -h -t third").unwrap();
+    client
+        .execute(&line("new-window", ["-n", "second"]))
+        .unwrap();
+    client
+        .execute(&line("new-window", ["-n", "third"]))
+        .unwrap();
+    client
+        .execute(&line("split-window", ["-h", "-t", "third"]))
+        .unwrap();
     // tmux focuses the newest window/pane on creation; "third" (index 2,
     // real tmux base-index may vary) and its right-hand split are active.
     let real_active = client
-        .execute("display-message -p \"#{window_index}:#{pane_index}\"")
+        .execute(&line(
+            "display-message",
+            ["-p", "#{window_index}:#{pane_index}"],
+        ))
         .unwrap();
     let real_active = String::from_utf8(real_active.lines[0].clone()).unwrap();
     let (real_window_index, real_pane_index) = real_active.split_once(':').unwrap();
@@ -74,7 +83,9 @@ fn live_capture_recovers_the_foreground_programs_argv() {
     let harness = IsolatedTmux::new("capture-argv");
     let mut client = connect(&harness);
 
-    client.execute("send-keys 'sleep 987654' Enter").unwrap();
+    client
+        .execute(&line("send-keys", ["sleep 987654", "Enter"]))
+        .unwrap();
     // Give the shell a moment to actually exec `sleep` before we snapshot —
     // otherwise the pane's foreground process could still be the shell
     // itself mid-fork.
@@ -90,7 +101,7 @@ fn live_capture_recovers_the_foreground_programs_argv() {
     }
     assert_eq!(argv, vec!["sleep".to_string(), "987654".to_string()]);
 
-    client.execute("send-keys C-c").ok();
+    client.execute(&line("send-keys", ["C-c"])).ok();
     client.close();
 }
 
@@ -99,11 +110,13 @@ fn live_capture_structure_matches_the_raw_list_panes_pane_count() {
     let harness = IsolatedTmux::new("capture-count");
     let mut client = connect(&harness);
 
-    client.execute("new-window").unwrap();
-    client.execute("split-window").unwrap();
-    client.execute("split-window -h").unwrap();
+    client.execute(&line("new-window", NO_ARGS)).unwrap();
+    client.execute(&line("split-window", NO_ARGS)).unwrap();
+    client.execute(&line("split-window", ["-h"])).unwrap();
 
-    let raw = client.execute("list-panes -a -F '#{pane_id}'").unwrap();
+    let raw = client
+        .execute(&line("list-panes", ["-a", "-F", "#{pane_id}"]))
+        .unwrap();
     let raw_pane_count = raw.lines.len();
 
     let snapshot = phoenix_capture::capture(&mut client).expect("capture failed");
@@ -125,9 +138,11 @@ fn live_capture_of_a_server_with_no_sessions_is_an_error() {
     let mut client = connect(&harness);
 
     // exit-empty off keeps the server alive after its last session is gone.
-    client.execute("set-option -g exit-empty off").unwrap();
     client
-        .execute(&format!("kill-session -t {}", harness.session))
+        .execute(&line("set-option", ["-g", "exit-empty", "off"]))
+        .unwrap();
+    client
+        .execute(&line("kill-session", ["-t", harness.session.as_str()]))
         .unwrap();
 
     assert!(phoenix_capture::capture(&mut client).is_err());
