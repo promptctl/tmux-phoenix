@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use phoenix_capture::{ContentCapture, PreviousPaneContent};
 use phoenix_core::Snapshot;
 use phoenix_store::{SaveOutcome, Store};
-use tmux_control::{Client, ServerMessage, TmuxError, Transport};
+use tmux_control::{Client, CommandLine, ServerMessage, TmuxError, Transport};
 
 use crate::boot::connect_and_boot;
 use crate::debounce::{DebouncePolicy, DebounceState};
@@ -132,6 +132,12 @@ pub fn run<T: Transport>(
     )
     .map_err(DaemonError::Tmux)?;
 
+    // Built once: the heartbeat never varies, so encoding it per cycle would
+    // re-ask a question already answered (`[LAW:dataflow-not-control-flow]` —
+    // a loop-invariant value, not a per-iteration decision).
+    let heartbeat =
+        CommandLine::new("display-message", ["-p", ""]).map_err(|e| DaemonError::Tmux(e.into()))?;
+
     let mut previous_content = store
         .load_latest()
         .map(|s| previous_content_from_snapshot(&s))
@@ -140,7 +146,7 @@ pub fn run<T: Transport>(
     let mut state = DebounceState::new(Instant::now());
 
     while should_continue() {
-        if let Err(e) = client.execute("display-message -p \"\"") {
+        if let Err(e) = client.execute(&heartbeat) {
             let fatal = is_connection_dead(&e);
             let err = DaemonError::Tmux(e);
             on_error(&err);
@@ -242,7 +248,7 @@ mod resilience_tests {
     struct DeadTransport;
 
     impl Transport for DeadTransport {
-        fn send(&mut self, _command: &str) -> io::Result<()> {
+        fn send(&mut self, _line: &CommandLine) -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "dead"))
         }
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {

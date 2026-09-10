@@ -11,6 +11,7 @@ use phoenix_core::{
     SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
 };
 use phoenix_store::Store;
+use tmux_control::CommandLine;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -157,7 +158,10 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
     // The client should have reconnected onto the restored session, not be
     // left dangling on the now-destroyed bootstrap one.
     let out = client
-        .execute("display-message -p \"#{session_name}\"")
+        .execute(
+            &CommandLine::new("display-message", ["-p", "#{session_name}"])
+                .expect("no NUL in a literal format"),
+        )
         .expect("client should still be usable after boot");
     assert_eq!(
         String::from_utf8_lossy(&out.lines[0]),
