@@ -16,7 +16,7 @@ use std::io::ErrorKind;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use tmux_control::{CommandLine, SpawnOptions, SpawnTransport, Transport};
+use tmux_control::{Codec, CommandLine, ServerMessage, SpawnOptions, SpawnTransport, Transport};
 
 const NO_ARGS: [&str; 0] = [];
 
@@ -83,11 +83,20 @@ fn read_available(transport: SpawnTransport, want: usize) -> (SpawnTransport, Ve
     read_until(transport, move |collected| want - collected.len())
 }
 
-/// Whether `collected` holds a complete `%end` or `%error` line, either of
-/// which closes a guard block.
+/// Whether `collected` holds a line that closes a guard block — asked of the
+/// real [`Codec`] rather than re-derived from the bytes here, so the tests
+/// stop reading on exactly the lines the client treats as terminators
+/// (`[LAW:one-source-of-truth]`). A byte-prefix scan would drift: a bare
+/// `%end` carrying no fields has no trailing space, yet still force-closes
+/// the block.
 fn closes_a_block(collected: &[u8]) -> bool {
-    collected.split_inclusive(|&b| b == b'\n').any(|line| {
-        line.ends_with(b"\n") && (line.starts_with(b"%end ") || line.starts_with(b"%error "))
+    Codec::new().feed(collected).iter().any(|message| {
+        matches!(
+            message,
+            ServerMessage::GuardEnd(_)
+                | ServerMessage::GuardError(_)
+                | ServerMessage::ProtocolError { .. }
+        )
     })
 }
 
@@ -347,18 +356,31 @@ const HOSTILE: &[&str] = &[
     "~$HOME \"it's\" \\ ; #{x} % {}\n\r\t\x017é\\",
 ];
 
+/// Removes its file on drop. The cleanup has to ride on `Drop` the way
+/// [`IsolatedTmux`]'s does: an assertion inside the hostile-argument loop
+/// panics past any cleanup line written at the end of the test, which would
+/// strand the buffer file in the temp dir for good.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[test]
 fn live_tmux_reads_every_encoded_argument_back_byte_for_byte() {
     let harness = IsolatedTmux::new("encoding");
-    let saved =
-        std::env::temp_dir().join(format!("tmux-phoenix-test-encoding-{}", std::process::id()));
-    let saved_path = saved.to_str().expect("temp path is UTF-8");
+    let saved = TempFile(
+        std::env::temp_dir().join(format!("tmux-phoenix-test-encoding-{}", std::process::id())),
+    );
+    let saved_path = saved.0.to_str().expect("temp path is UTF-8");
 
     let (mut transport, _) = read_through_end(attach(&harness));
     for &arg in HOSTILE {
         (transport, _) = run(transport, &line("set-buffer", ["-b", "phx", "--", arg]));
         (transport, _) = run(transport, &line("save-buffer", ["-b", "phx", saved_path]));
-        let read_back = std::fs::read(&saved).expect("save-buffer wrote no file");
+        let read_back = std::fs::read(&saved.0).expect("save-buffer wrote no file");
         assert_eq!(
             read_back,
             arg.as_bytes(),
@@ -375,6 +397,5 @@ fn live_tmux_reads_every_encoded_argument_back_byte_for_byte() {
         "expected the option to hold the empty string, got: {text}"
     );
 
-    std::fs::remove_file(&saved).expect("failed to remove the saved buffer");
     transport.close();
 }
