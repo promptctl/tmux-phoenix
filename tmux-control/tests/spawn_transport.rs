@@ -257,6 +257,9 @@ impl Drop for IsolatedTmux {
         let _ = std::process::Command::new("tmux")
             .args(["-S", &self.socket, "kill-session", "-t", &self.session])
             .status();
+        // Ending the session leaves the socket file itself behind, so every
+        // run of these tests used to deposit one more in /tmp permanently.
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
