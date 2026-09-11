@@ -257,21 +257,29 @@ and should stay even as the floor gets filled in:
 
 ---
 
-## 6. Open questions
+## 6. Resolved questions
 
-Things worth a real decision before or during the relevant roadmap work, not yet resolved:
+All three questions this section once held open are decided, each written into the ticket
+that owns it. Those tickets carry the reasoning and the acceptance criteria; what follows is
+only the record of the decision and where it lives.
 
-- How should a pane's live agent session be identified (§4.2)? Two mechanisms are already
-  ruled out by measurement: the running `claude` process does not carry its session id in its
-  environment, and it holds no persistent open file descriptor on its transcript. What's left
-  is correlation — the pane's working directory maps to the agent's project directory, and
-  the transcript being written picks out the session — which needs its reliability
-  established, particularly for two sessions running in one directory at once. A wrong
-  identification is worse than none: it resumes someone else's conversation.
-- Should cross-machine snapshot sync (§4.2) be a built-in transfer mechanism, or should
-  tmux-phoenix only guarantee that its storage format is safe to sync externally (e.g. via a
-  user's own `rsync`/Syncthing/cloud-drive setup) and stop there?
-- What's the right default for excluding sensitive content from capture (§4.2) — an opt-out
-  per pane/session, an opt-in-only model (matching resurrect's own default-off stance on
-  content capture), or a heuristic redaction pass? This has real security implications and
-  shouldn't be decided as a side effect of implementing something else.
+- **Identifying a pane's live agent session (§4.2)** — `tmux-llm-34m.1`, epic `tmux-llm-34m`.
+  Claude Code publishes a pid-keyed registry at `~/.claude/sessions/<pid>.json` carrying the
+  session id, the unslugged working directory and the pane's own tmux address, so identifying
+  a session is a direct lookup on the pid capture already collects, not a correlation. The
+  newest-transcript-by-mtime heuristic this section used to assume is rejected as actively
+  wrong: directories routinely hold two to four concurrent `claude` processes, a long-lived
+  process rolls onto new session ids over its life, and its start time can be hours older than
+  the transcript it is currently writing — so filtering candidates by start time discards the
+  right answer rather than narrowing to it.
+- **Cross-machine snapshot sync (§4.2)** — `tmux-toolbox-3ki.9`. Sync-safe storage format
+  only, with no built-in transfer. The natural boundary is the format, not the transport: a
+  transfer feature would put a network stack, authentication and conflict resolution inside a
+  tool whose job is snapshotting tmux, duplicating what the user's own `rsync`/Syncthing/cloud
+  drive already does well.
+- **Default for excluding sensitive scrollback (§4.2)** — `tmux-toolbox-3ki.7`. Capture stays
+  on by default, with per-pane and per-session opt-out configured through tmux options, so it
+  lives where the user already configures tmux. Opt-in-only was rejected because it guts the
+  capability phoenix is adopted for. Heuristic redaction was rejected as a *default* because a
+  redactor that catches common key formats and misses a pasted private key leaves the user
+  believing they are protected when they are not; it may later exist as an opt-in extra.
