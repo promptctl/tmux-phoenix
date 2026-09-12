@@ -114,11 +114,17 @@ impl<T: Transport> Client<T> {
     }
 
     /// Re-attach after a prior transport died: swaps in `transport`, resets
-    /// the codec, and re-consumes its greeting exactly as `connect()` does
-    /// for the first connection (DESIGN.md §3.3: "the client re-enters
-    /// Connecting and re-consumes the greeting on reconnect"). `attempt` is
-    /// the caller's own retry counter — this crate owns the reconnect
-    /// mechanics, not when or how often to retry.
+    /// the codec, and re-consumes its greeting as `connect()` does for the
+    /// first connection — but from `Reconnecting { attempt }`, which is the
+    /// greeting-consuming phase of a reconnect rather than a step before
+    /// one (DESIGN.md §3.3). Passing back through `Connecting` would
+    /// overwrite the attempt count to say less than `Reconnecting` already
+    /// does, and say it where nothing can read it: this call is
+    /// synchronous, and [`Client::execute`] gates on `Ready` alone, so both
+    /// states refuse correlation alike.
+    ///
+    /// `attempt` is the caller's own retry counter — this crate owns the
+    /// reconnect mechanics, not when or how often to retry.
     pub fn reconnect(&mut self, transport: T, attempt: u32) -> Result<(), TmuxError> {
         self.transport = transport;
         self.codec = Codec::new();

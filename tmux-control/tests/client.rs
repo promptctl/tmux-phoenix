@@ -216,6 +216,21 @@ fn a_failed_detach_reports_the_connection_closed() {
 }
 
 #[test]
+fn the_harness_refuses_only_the_next_send_not_every_later_one() {
+    let (mut transport, state) = MockTransport::empty();
+    transport.fail_next_send = true;
+    let mut client = Client::new(transport);
+
+    // `detach()` is not state-gated, so it reaches the transport twice and
+    // can show that the refusal was one-shot. A sticky flag would fail the
+    // second call too, which would let a test asserting "fails once, then
+    // succeeds" pass without ever exercising the recovery it names.
+    assert!(matches!(client.detach(), Err(TmuxError::Send(_))));
+    assert!(client.detach().is_ok());
+    assert_eq!(state.sent.borrow().len(), 1);
+}
+
+#[test]
 fn a_detach_after_close_keeps_the_disposed_reason() {
     let (transport, _state) = MockTransport::empty();
     let mut client = Client::new(transport);

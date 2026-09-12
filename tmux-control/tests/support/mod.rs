@@ -101,6 +101,11 @@ impl Transport for MockTransport {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         }
         if self.fail_next_send {
+            // One-shot, as the name says: a test that wants the refusal to
+            // repeat sets it again. Leaving it set would make every later
+            // send fail too, so a test asserting "this send fails and a
+            // subsequent one succeeds" would pass while testing neither.
+            self.fail_next_send = false;
             return Err(io::Error::other("send refused"));
         }
         self.state

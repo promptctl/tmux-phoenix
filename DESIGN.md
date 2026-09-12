@@ -214,8 +214,12 @@ paragraph: **subscribe to structure, stream nothing, capture on demand.**
   `Unknown` absorbing anything unrecognized. A malformed line can never crash the
   daemon.
 - Reconnection is a **typed state**, not a retry loop bolted on: `Reconnecting`
-  carries the attempt count; the client re-enters `Connecting` and re-consumes the
-  greeting on reconnect.
+  carries the attempt count and is itself the greeting-consuming phase of a
+  reconnect, so the client re-consumes the greeting from `Reconnecting` and settles
+  straight into `Ready`. It does not pass back through `Connecting`, which would
+  overwrite the attempt count with a phase no caller can observe — `reconnect()` is
+  synchronous, and `execute()` gates on `Ready` alone, so `Connecting` and
+  `Reconnecting` refuse correlation alike.
 - Backpressure can't wedge us: with `no-output` set we never enter the pause/`too far
   behind` machinery (SPEC §16) at all.
 
