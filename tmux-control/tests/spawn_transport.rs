@@ -45,10 +45,18 @@ fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> 
 
 /// Read on a thread, at most `budget(collected)` bytes at a time, until the
 /// budget is 0 or the pipe reaches EOF, so a stalled child fails the test at a
-/// deadline instead of hanging `cargo test`. After a timeout the thread keeps
-/// the transport; in a live test the `IsolatedTmux` drop runs `kill-session`,
-/// the attached client exits, and that EOF ends the thread, which drops and so
-/// reaps the transport.
+/// deadline instead of hanging `cargo test`.
+///
+/// After a timeout the thread keeps the transport, and only the live-tmux
+/// callers recover from that: `IsolatedTmux`'s drop runs `kill-session`, the
+/// attached client exits, and that EOF ends the thread, which drops and so
+/// reaps the transport. The process-mechanics callers have no equivalent —
+/// `spawn_echo`'s `sh -C -c cat` is torn down by nothing — so a timeout there
+/// leaves the thread blocked holding the only handle to its child, and that
+/// `sh` survives until the test binary exits. The leak is bounded to a run that
+/// is already failing, and closing it needs a kill handle that does not move
+/// into the thread, which is a question about the transport's public surface
+/// rather than this helper's: tmux-testing-h1t.
 fn read_until(
     transport: SpawnTransport,
     budget: impl Fn(&[u8]) -> usize + Send + 'static,
