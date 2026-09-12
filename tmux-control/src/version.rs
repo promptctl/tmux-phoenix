@@ -1,6 +1,6 @@
 //! Pure tmux version parsing and comparison (IMPL.md §2.2). No I/O — the
 //! effectful probe that turns a live connection into a known
-//! [`TmuxVersion`] lives in the commands layer, built on top of this one.
+//! [`TmuxVersion`] lives in [`crate::commands::query_tmux_version`].
 
 /// A `<major>.<minor>` tmux version pair.
 ///

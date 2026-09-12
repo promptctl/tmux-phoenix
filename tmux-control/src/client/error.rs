@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 
 /// Everything `Client::execute`/`connect`/`reconnect`, and the free
-/// functions in the commands layer, can fail with.
+/// functions in [`crate::commands`], can fail with.
 #[derive(Debug)]
 pub enum TmuxError {
     /// `execute()` was called while `Client::state()` wasn't `Ready` — a
@@ -40,8 +40,8 @@ pub enum TmuxError {
         required: TmuxVersion,
         have: TmuxVersion,
     },
-    /// The commands layer's version probe replied without a recognizable
-    /// `<major>.<minor>` version string in it.
+    /// [`crate::commands::query_tmux_version`]'s reply didn't contain a
+    /// recognizable `<major>.<minor>` version string.
     VersionProbeFailed { output: Vec<Vec<u8>> },
 }
 
