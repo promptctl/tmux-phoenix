@@ -18,8 +18,6 @@ use std::thread;
 use std::time::Duration;
 use tmux_control::{Codec, CommandLine, ServerMessage, SpawnOptions, SpawnTransport, Transport};
 
-const NO_ARGS: [&str; 0] = [];
-
 /// Spawn `sh -C -c cat` — an echo-back process with no `tmux` dependency,
 /// for testing send/read/close mechanics in isolation from the real
 /// protocol. `SpawnTransport::spawn` always prepends `-C` (it is
@@ -36,11 +34,6 @@ fn spawn_echo() -> SpawnTransport {
         },
     )
     .expect("failed to spawn sh -C -c cat")
-}
-
-/// Test arguments never hold a NUL.
-fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
-    CommandLine::new(name, args).expect("test arguments hold no NUL")
 }
 
 /// Read on a thread, at most `budget(collected)` bytes at a time, until the
@@ -237,39 +230,8 @@ fn nonexistent_binary_returns_an_error_not_a_panic() {
 // Live tmux integration
 // ---------------------------------------------------------------------------
 
-/// Isolated throw-away socket path + a guard that tears the session down via
-/// `kill-session` on drop.
-struct IsolatedTmux {
-    socket: String,
-    session: String,
-}
-
-impl IsolatedTmux {
-    fn new(name: &str) -> Self {
-        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
-        let session = format!("phoenix-test-{name}");
-        // Pre-create the session out-of-band (not through the transport
-        // under test) so `attach-session` below has something real to
-        // attach to, exactly like a daemon attaching to a live server.
-        let status = std::process::Command::new("tmux")
-            .args(["-S", &socket, "new-session", "-d", "-s", &session])
-            .status()
-            .expect("failed to run tmux new-session");
-        assert!(status.success(), "tmux new-session failed");
-        Self { socket, session }
-    }
-}
-
-impl Drop for IsolatedTmux {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
-            .args(["-S", &self.socket, "kill-session", "-t", &self.session])
-            .status();
-        // Ending the session leaves the socket file itself behind, so every
-        // run of these tests used to deposit one more in /tmp permanently.
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
+mod support;
+use support::{line, IsolatedTmux, NO_ARGS};
 
 /// A control client attached to the harness's session.
 fn attach(harness: &IsolatedTmux) -> SpawnTransport {
