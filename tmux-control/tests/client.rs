@@ -8,80 +8,7 @@
 //! consumption and the `ConnectionState` gate it enforces are covered
 //! separately in `connection_state.rs`.
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::io;
-use std::rc::Rc;
-use tmux_control::{Client, CommandLine, ServerMessage, TmuxError};
-
-/// Shared with a `MockTransport` after it's moved into a `Client`, so tests
-/// can still assert on what was sent and control what's closed — `Client`
-/// owns its transport outright and exposes no way to get it back.
-#[derive(Clone, Default)]
-struct MockState {
-    sent: Rc<RefCell<Vec<String>>>,
-    closed: Rc<RefCell<bool>>,
-}
-
-struct MockTransport {
-    /// Each `read()` call pops and returns one chunk. Exhausted means EOF.
-    chunks: VecDeque<Vec<u8>>,
-    state: MockState,
-    fail_next_send: bool,
-}
-
-impl MockTransport {
-    fn new(chunks: Vec<&str>) -> (Self, MockState) {
-        let state = MockState::default();
-        let transport = Self {
-            chunks: chunks.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
-            state: state.clone(),
-            fail_next_send: false,
-        };
-        (transport, state)
-    }
-
-    fn empty() -> (Self, MockState) {
-        Self::new(vec![])
-    }
-}
-
-impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
-        if *self.state.closed.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-        }
-        if self.fail_next_send {
-            return Err(io::Error::other("send refused"));
-        }
-        self.state
-            .sent
-            .borrow_mut()
-            .push(command.as_str().to_string());
-        Ok(())
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if *self.state.closed.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-        }
-        match self.chunks.pop_front() {
-            Some(chunk) => {
-                assert!(
-                    chunk.len() <= buf.len(),
-                    "test chunk larger than read buffer"
-                );
-                buf[..chunk.len()].copy_from_slice(&chunk);
-                Ok(chunk.len())
-            }
-            None => Ok(0), // simulated EOF once scripted chunks are exhausted
-        }
-    }
-
-    fn close(&mut self) {
-        *self.state.closed.borrow_mut() = true;
-    }
-}
+use tmux_control::{Client, CloseReason, ConnectionState, ServerMessage, TmuxError};
 
 #[test]
 fn execute_sends_the_command_and_returns_output_on_end() {
@@ -270,12 +197,30 @@ fn detach_sends_a_bare_newline_bypassing_execute() {
     assert_eq!(*state.sent.borrow(), vec!["".to_string()]);
 }
 
+#[test]
+fn a_failed_detach_reports_the_connection_closed() {
+    let (mut transport, _state) = MockTransport::empty();
+    transport.fail_next_send = true;
+    let mut client = Client::new(transport);
+
+    assert!(matches!(client.detach(), Err(TmuxError::Send(_))));
+    // The transport is known dead, so state() has to say so on its own:
+    // making the caller infer liveness from detach()'s return value is the
+    // timing folklore this client exists to remove.
+    assert_eq!(
+        client.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::TransportError
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live tmux integration
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, NO_ARGS};
+use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]

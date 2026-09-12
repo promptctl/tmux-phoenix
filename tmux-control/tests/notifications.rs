@@ -2,61 +2,12 @@
 //! notifications, and the `on_notification`/`on_pane_output` sink API.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::io;
 use std::rc::Rc;
-use tmux_control::{Client, CommandLine, PaneId, ServerMessage};
-
-#[derive(Clone, Default)]
-struct MockState {
-    closed: Rc<RefCell<bool>>,
-}
-
-struct MockTransport {
-    chunks: VecDeque<Vec<u8>>,
-    state: MockState,
-}
-
-impl MockTransport {
-    fn new(chunks: Vec<&str>) -> Self {
-        Self {
-            chunks: chunks.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
-            state: MockState::default(),
-        }
-    }
-}
-
-impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
-        if *self.state.closed.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-        }
-        let _ = command;
-        Ok(())
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.chunks.pop_front() {
-            Some(chunk) => {
-                assert!(
-                    chunk.len() <= buf.len(),
-                    "test chunk larger than read buffer"
-                );
-                buf[..chunk.len()].copy_from_slice(&chunk);
-                Ok(chunk.len())
-            }
-            None => Ok(0),
-        }
-    }
-
-    fn close(&mut self) {
-        *self.state.closed.borrow_mut() = true;
-    }
-}
+use tmux_control::{Client, PaneId, ServerMessage};
 
 #[test]
 fn pane_output_is_buffered_separately_from_other_notifications() {
-    let transport = MockTransport::new(vec![
+    let (transport, _state) = MockTransport::new(vec![
         "%output %3 hello\\012\n",
         "%begin 1 1 1\nreply line\n%end 1 1 1\n",
     ]);
@@ -73,7 +24,7 @@ fn pane_output_is_buffered_separately_from_other_notifications() {
 
 #[test]
 fn extended_output_is_also_routed_as_pane_output() {
-    let transport = MockTransport::new(vec![
+    let (transport, _state) = MockTransport::new(vec![
         "%extended-output %2 500 : chunk\\012\n",
         "%begin 1 1 1\n%end 1 1 1\n",
     ]);
@@ -88,7 +39,7 @@ fn extended_output_is_also_routed_as_pane_output() {
 
 #[test]
 fn non_output_notifications_still_go_through_drain_notifications() {
-    let transport = MockTransport::new(vec![
+    let (transport, _state) = MockTransport::new(vec![
         "%sessions-changed\n%window-add @1\n",
         "%begin 1 1 1\n%end 1 1 1\n",
     ]);
@@ -112,7 +63,7 @@ fn on_notification_sink_receives_messages_and_bypasses_the_buffer() {
     let received: Rc<RefCell<Vec<ServerMessage>>> = Rc::new(RefCell::new(Vec::new()));
     let received_in_sink = received.clone();
 
-    let transport = MockTransport::new(vec!["%sessions-changed\n", "%begin 1 1 1\n%end 1 1 1\n"]);
+    let (transport, _state) = MockTransport::new(vec!["%sessions-changed\n", "%begin 1 1 1\n%end 1 1 1\n"]);
     let mut client = Client::new(transport);
     client.on_notification(move |msg| received_in_sink.borrow_mut().push(msg));
 
@@ -128,7 +79,7 @@ fn on_pane_output_sink_receives_bytes_and_bypasses_the_buffer() {
     let received = Rc::new(RefCell::new(Vec::<(PaneId, Vec<u8>)>::new()));
     let received_in_sink = received.clone();
 
-    let transport = MockTransport::new(vec!["%output %5 hi\\012\n", "%begin 1 1 1\n%end 1 1 1\n"]);
+    let (transport, _state) = MockTransport::new(vec!["%output %5 hi\\012\n", "%begin 1 1 1\n%end 1 1 1\n"]);
     let mut client = Client::new(transport);
     client.on_pane_output(move |pane, data| received_in_sink.borrow_mut().push((pane, data)));
 
@@ -140,7 +91,7 @@ fn on_pane_output_sink_receives_bytes_and_bypasses_the_buffer() {
 
 #[test]
 fn registering_a_sink_does_not_retroactively_deliver_already_buffered_messages() {
-    let transport = MockTransport::new(vec![
+    let (transport, _state) = MockTransport::new(vec![
         "%sessions-changed\n",
         "%begin 1 1 1\n%end 1 1 1\n",
         "%window-add @1\n",
@@ -177,7 +128,7 @@ fn registering_a_sink_does_not_retroactively_deliver_already_buffered_messages()
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, NO_ARGS};
+use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]

@@ -3,67 +3,7 @@
 //! correlation itself using `Client::new` (no handshake); this file is
 //! entirely about the handshake and state machine ticket `.4` adds on top.
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::io;
-use std::rc::Rc;
-use tmux_control::{Client, CloseReason, CommandLine, ConnectionState, TmuxError};
-
-#[derive(Clone, Default)]
-struct MockState {
-    sent: Rc<RefCell<Vec<String>>>,
-    closed: Rc<RefCell<bool>>,
-}
-
-struct MockTransport {
-    chunks: VecDeque<Vec<u8>>,
-    state: MockState,
-}
-
-impl MockTransport {
-    fn new(chunks: Vec<&str>) -> (Self, MockState) {
-        let state = MockState::default();
-        let transport = Self {
-            chunks: chunks.into_iter().map(|c| c.as_bytes().to_vec()).collect(),
-            state: state.clone(),
-        };
-        (transport, state)
-    }
-}
-
-impl tmux_control::Transport for MockTransport {
-    fn send(&mut self, command: &CommandLine) -> io::Result<()> {
-        if *self.state.closed.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-        }
-        self.state
-            .sent
-            .borrow_mut()
-            .push(command.as_str().to_string());
-        Ok(())
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if *self.state.closed.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
-        }
-        match self.chunks.pop_front() {
-            Some(chunk) => {
-                assert!(
-                    chunk.len() <= buf.len(),
-                    "test chunk larger than read buffer"
-                );
-                buf[..chunk.len()].copy_from_slice(&chunk);
-                Ok(chunk.len())
-            }
-            None => Ok(0),
-        }
-    }
-
-    fn close(&mut self) {
-        *self.state.closed.borrow_mut() = true;
-    }
-}
+use tmux_control::{Client, CloseReason, ConnectionState, TmuxError};
 
 const GREETING: &str = "%begin 1699900000 0 0\n%end 1699900000 0 0\n";
 
@@ -214,7 +154,7 @@ fn reconnect_failure_reports_the_attempt_that_failed() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, NO_ARGS};
+use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]

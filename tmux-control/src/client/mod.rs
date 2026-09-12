@@ -80,9 +80,11 @@ pub struct Client<T: Transport> {
 const READ_CHUNK: usize = 8192;
 
 impl<T: Transport> Client<T> {
-    /// Build a client that starts `Ready` immediately, with no greeting
-    /// handshake. See the module docs for when this is (and isn't) safe.
-    pub fn new(transport: T) -> Self {
+    /// The one place a fresh `Client`'s fields are named
+    /// (`[LAW:one-source-of-truth]`), so a field added later cannot be
+    /// initialized in one entry point and forgotten in the other. The
+    /// starting state is all the two differ by.
+    fn with_state(transport: T, state: ConnectionState) -> Self {
         Self {
             transport,
             codec: Codec::new(),
@@ -90,8 +92,14 @@ impl<T: Transport> Client<T> {
             pane_output: VecDeque::new(),
             notification_sink: None,
             pane_output_sink: None,
-            state: ConnectionState::Ready,
+            state,
         }
+    }
+
+    /// Build a client that starts `Ready` immediately, with no greeting
+    /// handshake. See the module docs for when this is (and isn't) safe.
+    pub fn new(transport: T) -> Self {
+        Self::with_state(transport, ConnectionState::Ready)
     }
 
     /// Build a client against a freshly-attached transport: synchronously
@@ -100,15 +108,7 @@ impl<T: Transport> Client<T> {
     /// is returned instead of a half-initialized client). This is the
     /// entry point real usage against a live tmux should call.
     pub fn connect(transport: T) -> Result<Self, TmuxError> {
-        let mut client = Self {
-            transport,
-            codec: Codec::new(),
-            notifications: VecDeque::new(),
-            pane_output: VecDeque::new(),
-            notification_sink: None,
-            pane_output_sink: None,
-            state: ConnectionState::Connecting,
-        };
+        let mut client = Self::with_state(transport, ConnectionState::Connecting);
         client.consume_greeting()?;
         Ok(client)
     }
@@ -130,6 +130,44 @@ impl<T: Transport> Client<T> {
         self.state
     }
 
+    /// Every transport touch goes through these two
+    /// (`[LAW:single-enforcer]`), which is what makes "a dead transport
+    /// ends the connection" true of the client rather than true of
+    /// whichever call sites remembered to say so. A caller asking
+    /// [`Client::state`] after any failure gets the same answer no matter
+    /// which operation failed.
+    fn send_or_close(&mut self, command: &CommandLine) -> Result<(), TmuxError> {
+        match self.transport.send(command) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.state = ConnectionState::Closed {
+                    reason: CloseReason::TransportError,
+                };
+                Err(TmuxError::Send(err))
+            }
+        }
+    }
+
+    /// A clean EOF and a failed read are different endings — `Exit` versus
+    /// `TransportError` — so the distinction is carried, not collapsed.
+    fn read_or_close(&mut self, buf: &mut [u8]) -> Result<usize, TmuxError> {
+        match self.transport.read(buf) {
+            Ok(0) => {
+                self.state = ConnectionState::Closed {
+                    reason: CloseReason::Exit,
+                };
+                Err(TmuxError::TransportClosed)
+            }
+            Ok(n) => Ok(n),
+            Err(err) => {
+                self.state = ConnectionState::Closed {
+                    reason: CloseReason::TransportError,
+                };
+                Err(TmuxError::Read(err))
+            }
+        }
+    }
+
     /// Block, reading and feeding the codec, until the first guard block
     /// (the unsolicited greeting) settles — on `%end`, `%error`, *or* a
     /// malformed terminator alike: none of those are something a caller
@@ -142,21 +180,7 @@ impl<T: Transport> Client<T> {
         let mut settled = false;
 
         while !settled {
-            let n = match self.transport.read(&mut buf) {
-                Ok(n) => n,
-                Err(err) => {
-                    self.state = ConnectionState::Closed {
-                        reason: CloseReason::TransportError,
-                    };
-                    return Err(TmuxError::Read(err));
-                }
-            };
-            if n == 0 {
-                self.state = ConnectionState::Closed {
-                    reason: CloseReason::Exit,
-                };
-                return Err(TmuxError::TransportClosed);
-            }
+            let n = self.read_or_close(&mut buf)?;
             // Same reasoning as execute()'s identically-shaped loop: one
             // read() can return a chunk whose codec.feed() batch contains
             // both the greeting's terminator *and* trailing bytes after it
@@ -228,33 +252,14 @@ impl<T: Transport> Client<T> {
             return Err(TmuxError::NotReady(self.state));
         }
 
-        if let Err(err) = self.transport.send(command) {
-            self.state = ConnectionState::Closed {
-                reason: CloseReason::TransportError,
-            };
-            return Err(TmuxError::Send(err));
-        }
+        self.send_or_close(command)?;
 
         let mut lines: Vec<Vec<u8>> = Vec::new();
         let mut buf = [0u8; READ_CHUNK];
         let mut outcome = None;
 
         while outcome.is_none() {
-            let n = match self.transport.read(&mut buf) {
-                Ok(n) => n,
-                Err(err) => {
-                    self.state = ConnectionState::Closed {
-                        reason: CloseReason::TransportError,
-                    };
-                    return Err(TmuxError::Read(err));
-                }
-            };
-            if n == 0 {
-                self.state = ConnectionState::Closed {
-                    reason: CloseReason::Exit,
-                };
-                return Err(TmuxError::TransportClosed);
-            }
+            let n = self.read_or_close(&mut buf)?;
             // A single read() can return a chunk containing our reply's
             // GuardEnd/GuardError *and* trailing bytes after it (tmux wrote
             // them in one burst, e.g. a notification right behind the
@@ -337,9 +342,7 @@ impl<T: Transport> Client<T> {
     /// `ConnectionState`: a caller may reasonably try to detach from any
     /// state, best-effort.
     pub fn detach(&mut self) -> Result<(), TmuxError> {
-        self.transport
-            .send(&CommandLine::detach())
-            .map_err(TmuxError::Send)
+        self.send_or_close(&CommandLine::detach())
     }
 
     /// Local-side teardown: drops the transport, sends nothing to tmux

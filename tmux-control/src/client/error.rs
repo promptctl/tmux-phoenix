@@ -1,4 +1,4 @@
-use crate::client::ConnectionState;
+use super::connection_state::ConnectionState;
 use crate::protocol::{Guard, NulInArgument};
 use crate::version::TmuxVersion;
 use std::fmt;
