@@ -22,39 +22,20 @@ pub const MIN_TMUX_VERSION: TmuxVersion = TmuxVersion { major: 3, minor: 2 };
 /// is ignored — the match is on the digits only, mirroring the reference's
 /// regex-based parser. Returns `None` if no such pattern appears anywhere.
 pub fn parse_tmux_version(s: &str) -> Option<TmuxVersion> {
-    (0..s.len()).find_map(|start| try_parse_version_at(s, start))
+    // Tokens are maximal, so a rejected token is skipped whole. A scan that
+    // could resume *inside* a rejected digit run would reinterpret a major
+    // too large for `u32` as a shorter suffix of itself — reporting a
+    // truncated version where this promises `None`.
+    s.split(|c: char| !c.is_ascii_digit() && c != '.')
+        .find_map(parse_version_token)
 }
 
-fn try_parse_version_at(s: &str, start: usize) -> Option<TmuxVersion> {
-    let bytes = s.as_bytes();
-    if !s.is_char_boundary(start) {
-        return None;
-    }
-
-    let mut i = start;
-    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
-        return None;
-    }
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    let major: u32 = s[start..i].parse().ok()?;
-
-    if i >= bytes.len() || bytes[i] != b'.' {
-        return None;
-    }
-    i += 1;
-
-    let minor_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == minor_start {
-        return None;
-    }
-    let minor: u32 = s[minor_start..i].parse().ok()?;
-
-    Some(TmuxVersion { major, minor })
+fn parse_version_token(token: &str) -> Option<TmuxVersion> {
+    let mut parts = token.split('.');
+    Some(TmuxVersion {
+        major: parts.next()?.parse().ok()?,
+        minor: parts.next()?.parse().ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -102,6 +83,14 @@ mod tests {
         assert_eq!(parse_tmux_version(""), None);
         assert_eq!(parse_tmux_version("3"), None); // no minor component
         assert_eq!(parse_tmux_version("3."), None); // no minor digits
+    }
+
+    #[test]
+    fn rejects_components_too_large_for_u32_rather_than_truncating_them() {
+        // Skipping the digit run whole is what makes these `None`: a scan
+        // resuming inside the run would find "999999999" and call it 3.x.
+        assert_eq!(parse_tmux_version("99999999999.2"), None);
+        assert_eq!(parse_tmux_version("3.99999999999"), None);
     }
 
     #[test]
