@@ -110,7 +110,7 @@ enum ServerMessage {
     ClientSessionChanged { client: String, session: SessionId, name: String },
     ClientDetached { client: String },
     PasteBufferChanged { name: String }, PasteBufferDeleted { name: String },
-    SubscriptionChanged { name: String, session: SessionId, window: Option<WindowId>,
+    SubscriptionChanged { name: String, session: Option<SessionId>, window: Option<WindowId>,
                           window_index: Option<u32>, pane: Option<PaneId>, value: String },
     Message { text: String },
     ConfigError { text: String },
@@ -119,6 +119,18 @@ enum ServerMessage {
 }
 ```
 
+The implementation adds two more variants beyond this SPEC §23 catalogue, both
+required for the guard-block state machine itself to stay total: `CommandOutput
+{ command_number: u32, line: Vec<u8> }` for a line of command-response text
+between `%begin` and `%end`/`%error` (SPEC §23 only catalogues `%`-prefixed
+protocol lines — a command's actual output, e.g. a `list-panes` row, has no
+wire type of its own and needs a home too), and `ProtocolError { command_number:
+u32, line: Vec<u8> }` for a `%end`/`%error` that arrives positionally as the
+open block's terminator but fails to parse — force-closing the block instead
+of leaving it open forever, which would otherwise silently misroute every
+subsequent line, notifications included, as output for a command that will
+never settle.
+
 Supporting pure pieces:
 
 - **Typed IDs.** `SessionId`, `WindowId`, `PaneId` are newtypes that parse the
@@ -126,17 +138,24 @@ Supporting pure pieces:
   re-parses a raw id string (`[LAW:parse-dont-validate]`).
 - **`decode_octal`.** `%output`/`%extended-output` payloads are octal-escaped
   (`\NNN`, `\` → `\134`, SPEC §10). One decoder, tolerant of malformed/partial
-  escapes (pass a stray `\` through rather than panicking) — the reference documents
-  exactly this tolerance.
+  escapes: anything that isn't a valid `\000`–`\377` escape decodes to `?`.
 - **`Layout`** stays an opaque newtype around tmux's own layout string. tmux owns
   window geometry; we transport it verbatim and never re-derive it
   (`[LAW:one-source-of-truth]`).
+- **`CommandLine`.** The client-to-server half of the wire. tmux parses every line a
+  control client sends with its config-file lexer, so a command is built from its
+  argv by a port of tmux's own `args_escape`, and tmux reads each argument back as
+  exactly the original string. A newline inside an argument is written as the `\n`
+  escape, so a `CommandLine` is always one wire line and newlines in pane paths,
+  option values, and relaunch commands survive. NUL is the one argument no encoding
+  can carry (tmux arguments are C strings), so it fails construction.
 
 ### 3.2 `transport` — the effect edge
 
 Spawns `tmux -C` (single `-C`; `-CC` needs a tty and adds only DCS framing we don't
 want — IMPL §2.1), owns the child and its stdin/stdout pipes, reads bytes into the
-codec, writes command lines out. Defined behind a `Transport` trait so the codec and
+codec, writes `CommandLine`s out. `send` takes the encoded type, not a string, so
+the transport never frames or checks a command. Defined behind a `Transport` trait so the codec and
 client are testable without a live tmux, and so an alternate transport (PTY, or a
 remote socket) can be swapped in without touching the layers above
 (`[LAW:locality-or-seam]`). This is the *only* place a process is spawned or a byte is
