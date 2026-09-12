@@ -215,6 +215,25 @@ fn a_failed_detach_reports_the_connection_closed() {
     );
 }
 
+#[test]
+fn a_detach_after_close_keeps_the_disposed_reason() {
+    let (transport, _state) = MockTransport::empty();
+    let mut client = Client::new(transport);
+
+    client.close();
+    // detach() is documented as callable from any state, best-effort, and
+    // the closed transport refuses the send. The connection still ended
+    // because the caller disposed of it — reporting a transport failure
+    // here would be a state() a caller has to reconcile rather than read.
+    assert!(matches!(client.detach(), Err(TmuxError::Send(_))));
+    assert_eq!(
+        client.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::Disposed
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live tmux integration
 // ---------------------------------------------------------------------------

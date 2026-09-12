@@ -140,9 +140,7 @@ impl<T: Transport> Client<T> {
         match self.transport.send(command) {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.state = ConnectionState::Closed {
-                    reason: CloseReason::TransportError,
-                };
+                self.state = self.state.closed(CloseReason::TransportError);
                 Err(TmuxError::Send(err))
             }
         }
@@ -153,16 +151,12 @@ impl<T: Transport> Client<T> {
     fn read_or_close(&mut self, buf: &mut [u8]) -> Result<usize, TmuxError> {
         match self.transport.read(buf) {
             Ok(0) => {
-                self.state = ConnectionState::Closed {
-                    reason: CloseReason::Exit,
-                };
+                self.state = self.state.closed(CloseReason::Exit);
                 Err(TmuxError::TransportClosed)
             }
             Ok(n) => Ok(n),
             Err(err) => {
-                self.state = ConnectionState::Closed {
-                    reason: CloseReason::TransportError,
-                };
+                self.state = self.state.closed(CloseReason::TransportError);
                 Err(TmuxError::Read(err))
             }
         }
@@ -349,8 +343,6 @@ impl<T: Transport> Client<T> {
     /// (IMPL.md §2.4 — distinct from [`Client::detach`]).
     pub fn close(&mut self) {
         self.transport.close();
-        self.state = ConnectionState::Closed {
-            reason: CloseReason::Disposed,
-        };
+        self.state = self.state.closed(CloseReason::Disposed);
     }
 }
