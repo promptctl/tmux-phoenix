@@ -18,14 +18,10 @@ pub enum ConnectionState {
     /// own retry count — this crate does not own retry timing or backoff
     /// policy, only the mechanics of swapping in a fresh transport and
     /// re-consuming its greeting (`Client::reconnect`).
-    Reconnecting {
-        attempt: u32,
-    },
+    Reconnecting { attempt: u32 },
     /// The connection is over. Terminal, and `reason` records the ending
     /// that got here first.
-    Closed {
-        reason: CloseReason,
-    },
+    Closed { reason: CloseReason },
 }
 
 impl ConnectionState {
