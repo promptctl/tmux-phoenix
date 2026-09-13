@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
-use tmux_control::{CommandLine, Transport};
+use tmux_control::{Client, CommandLine, PaneId, ServerMessage, TmuxError, Transport};
 
 /// For a command that takes no arguments.
 pub const NO_ARGS: [&str; 0] = [];
@@ -55,6 +55,74 @@ impl Drop for IsolatedTmux {
         // run of these tests used to deposit one more in /tmp permanently.
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// One dispatched `%output`/`%extended-output` delivery: which pane, what
+/// bytes — the pane-output sink's two arguments, paired for collection.
+pub type PaneOutputChunk = (PaneId, Vec<u8>);
+
+/// What a `Client`'s two required sinks delivered, readable after the
+/// closures have been moved into the client — the same shared-handle shape
+/// as [`MockState`], for the same reason.
+///
+/// This is the caller-owned buffer that replaced the client's own: the crate
+/// dispatches and holds nothing, so a test that wants to assert over a window
+/// of the connection keeps the window here.
+#[derive(Clone, Default)]
+pub struct Collected {
+    notifications: Rc<RefCell<Vec<ServerMessage>>>,
+    pane_output: Rc<RefCell<Vec<PaneOutputChunk>>>,
+}
+
+impl Collected {
+    /// Everything delivered since the last take, removed as it is read, so
+    /// consecutive calls scope to disjoint windows rather than re-reporting.
+    pub fn take_notifications(&self) -> Vec<ServerMessage> {
+        std::mem::take(&mut *self.notifications.borrow_mut())
+    }
+
+    pub fn take_pane_output(&self) -> Vec<PaneOutputChunk> {
+        std::mem::take(&mut *self.pane_output.borrow_mut())
+    }
+
+    fn notification_sink(&self) -> impl FnMut(ServerMessage) + 'static {
+        let into = self.notifications.clone();
+        move |msg| into.borrow_mut().push(msg)
+    }
+
+    fn pane_output_sink(&self) -> impl FnMut(PaneId, Vec<u8>) + 'static {
+        let into = self.pane_output.clone();
+        move |pane, data| into.borrow_mut().push((pane, data))
+    }
+}
+
+/// A `Client` that starts `Ready` with no handshake ([`Client::new`]), with
+/// both required sinks collecting into the returned [`Collected`]. One
+/// builder for every test whether or not it reads the collector, so "does
+/// this test care about notifications" stays a fact about the assertions
+/// rather than about which constructor was called.
+pub fn collecting_client<T: Transport>(transport: T) -> (Client<T>, Collected) {
+    let collected = Collected::default();
+    let client = Client::new(
+        transport,
+        collected.notification_sink(),
+        collected.pane_output_sink(),
+    );
+    (client, collected)
+}
+
+/// The same, through the real greeting handshake ([`Client::connect`]).
+/// Wiring the collector before the handshake is the point rather than an
+/// accident of ordering: `connect()` dispatches whatever tmux wrote behind
+/// the greeting terminator, so it is the only way a test can observe it.
+pub fn collecting_connect<T: Transport>(transport: T) -> Result<(Client<T>, Collected), TmuxError> {
+    let collected = Collected::default();
+    let client = Client::connect(
+        transport,
+        collected.notification_sink(),
+        collected.pane_output_sink(),
+    )?;
+    Ok((client, collected))
 }
 
 /// Shared with a [`MockTransport`] after it has been moved into a `Client`,

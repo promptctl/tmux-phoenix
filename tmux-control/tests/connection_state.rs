@@ -3,38 +3,58 @@
 //! correlation itself using `Client::new` (no handshake); this file is
 //! entirely about the handshake and state machine ticket `.4` adds on top.
 
-use tmux_control::{Client, CloseReason, ConnectionState, TmuxError};
+use tmux_control::{CloseReason, ConnectionState, TmuxError};
 
 const GREETING: &str = "%begin 1699900000 0 0\n%end 1699900000 0 0\n";
 
 #[test]
 fn connect_consumes_an_empty_greeting_and_becomes_ready() {
     let (transport, _state) = MockTransport::new(vec![GREETING]);
-    let client = Client::connect(transport).unwrap();
+    let (client, _collected) = collecting_connect(transport).unwrap();
     assert_eq!(client.state(), ConnectionState::Ready);
 }
 
 #[test]
-fn connect_discards_greeting_output_without_buffering_it_as_a_notification() {
+fn connect_discards_greeting_output_without_dispatching_it_as_a_notification() {
     let (transport, _state) = MockTransport::new(vec![
         "%begin 1699900000 0 0\nsome greeting-body line\n%end 1699900000 0 0\n",
     ]);
-    let mut client = Client::connect(transport).unwrap();
-    assert_eq!(client.drain_notifications(), vec![]);
+    let (_client, collected) = collecting_connect(transport).unwrap();
+    assert_eq!(collected.take_notifications(), vec![]);
 }
 
 #[test]
-fn connect_buffers_a_real_notification_that_arrives_during_the_greeting_phase() {
+fn connect_dispatches_a_real_notification_that_arrives_during_the_greeting_phase() {
     // Distinct from CommandOutput inside the greeting's own block (discarded
     // above): a genuine notification can arrive interleaved with, but
     // outside, the greeting's guard block.
+    //
+    // This is why both sinks are constructor arguments rather than
+    // registrations: connect() dispatches this message before it returns, so
+    // a sink the caller attached to the finished client would already have
+    // missed it. Requiring the sinks is what lets the crate hold no queue.
     let (transport, _state) = MockTransport::new(vec![
         "%begin 1699900000 0 0\n%end 1699900000 0 0\n%sessions-changed\n",
     ]);
-    let mut client = Client::connect(transport).unwrap();
+    let (_client, collected) = collecting_connect(transport).unwrap();
     assert_eq!(
-        client.drain_notifications(),
+        collected.take_notifications(),
         vec![tmux_control::ServerMessage::SessionsChanged]
+    );
+}
+
+#[test]
+fn connect_dispatches_pane_output_that_arrives_during_the_greeting_phase() {
+    // The same window, on the other sink — and the one that bit for real:
+    // attaching races the pane's own startup output, so `%output` written
+    // behind the greeting terminator is a live case, not a hypothetical.
+    let (transport, _state) = MockTransport::new(vec![
+        "%begin 1699900000 0 0\n%end 1699900000 0 0\n%output %1 startup\\012\n",
+    ]);
+    let (_client, collected) = collecting_connect(transport).unwrap();
+    assert_eq!(
+        collected.take_pane_output(),
+        vec![(tmux_control::PaneId(1), b"startup\n".to_vec())]
     );
 }
 
@@ -45,7 +65,7 @@ fn connect_treats_a_greeting_error_as_a_successful_handshake() {
     // failure (there's no pending command). The phase still closes to Ready.
     let (transport, _state) =
         MockTransport::new(vec!["%begin 1699900000 0 0\n%error 1699900000 0 0\n"]);
-    let client = Client::connect(transport).unwrap();
+    let (client, _collected) = collecting_connect(transport).unwrap();
     assert_eq!(client.state(), ConnectionState::Ready);
 }
 
@@ -53,14 +73,14 @@ fn connect_treats_a_greeting_error_as_a_successful_handshake() {
 fn connect_treats_a_malformed_greeting_terminator_as_a_successful_handshake() {
     let (transport, _state) =
         MockTransport::new(vec!["%begin 1699900000 0 0\n%end 1699900000 0\n"]);
-    let client = Client::connect(transport).unwrap();
+    let (client, _collected) = collecting_connect(transport).unwrap();
     assert_eq!(client.state(), ConnectionState::Ready);
 }
 
 #[test]
 fn connect_fails_and_closes_when_transport_closes_before_the_greeting_settles() {
     let (transport, _state) = MockTransport::new(vec!["%begin 1699900000 0 0\n"]); // no terminator, then EOF
-    let err = match Client::connect(transport) {
+    let err = match collecting_connect(transport) {
         Err(err) => err,
         Ok(_) => panic!("expected connect() to fail before the greeting settled"),
     };
@@ -74,7 +94,7 @@ fn execute_before_connect_finishes_would_correlate_the_greeting_wrongly() {
     // finding a way to call execute() mid-connect() — connect() itself
     // can't return a not-yet-ready client, by construction.
     let (transport, _state) = MockTransport::new(vec![GREETING]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     // Without a handshake, the "greeting" block is indistinguishable from
     // a real reply and gets consumed as this command's own (empty) output.
     let result = client.execute(&line("some-command", NO_ARGS)).unwrap();
@@ -84,7 +104,7 @@ fn execute_before_connect_finishes_would_correlate_the_greeting_wrongly() {
 #[test]
 fn execute_refuses_while_not_ready() {
     let (transport, _state) = MockTransport::new(vec![]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     // Force a non-Ready state the only way available post-construction.
     client.close();
     let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
@@ -104,7 +124,7 @@ fn execute_refuses_while_not_ready() {
 #[test]
 fn execute_transitions_to_closed_on_transport_closed_eof() {
     let (transport, _state) = MockTransport::new(vec![]); // no chunks: immediate EOF
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed));
     assert_eq!(
@@ -118,7 +138,7 @@ fn execute_transitions_to_closed_on_transport_closed_eof() {
 #[test]
 fn reconnect_swaps_transport_and_re_consumes_the_greeting() {
     let (first, _first_state) = MockTransport::new(vec![]); // dies with no greeting
-    let mut client = Client::new(first); // starts Ready via new(), then dies below
+    let (mut client, _collected) = collecting_client(first); // starts Ready, then dies below
     let _ = client.execute(&line("cmd-before-death", NO_ARGS));
     assert_eq!(
         client.state(),
@@ -137,7 +157,7 @@ fn reconnect_swaps_transport_and_re_consumes_the_greeting() {
 #[test]
 fn reconnect_failure_reports_the_attempt_that_failed() {
     let (first, _first_state) = MockTransport::new(vec![]);
-    let mut client = Client::new(first);
+    let (mut client, _collected) = collecting_client(first);
     let (second, _second_state) = MockTransport::new(vec![]); // also dies before any greeting
     let err = client.reconnect(second, 3).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed));
@@ -154,7 +174,7 @@ fn reconnect_failure_reports_the_attempt_that_failed() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
+use support::{collecting_client, collecting_connect, line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -171,7 +191,8 @@ fn live_tmux_connect_handshakes_and_then_executes() {
 
     // Unlike client.rs's live test, this drives the real handshake through
     // Client::connect() itself rather than draining the greeting by hand.
-    let mut client = Client::connect(transport).expect("handshake failed against real tmux");
+    let (mut client, _collected) =
+        collecting_connect(transport).expect("handshake failed against real tmux");
     assert_eq!(client.state(), ConnectionState::Ready);
 
     let result = client

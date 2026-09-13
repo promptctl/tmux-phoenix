@@ -258,11 +258,11 @@ fn subscription_and_buffers_transcript_parses_into_the_exact_recorded_skeleton()
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, NO_ARGS};
+use support::{collecting_connect, line, IsolatedTmux, NO_ARGS};
 use tmux_control::commands::{
     query_tmux_version, set_no_output, subscribe, unsubscribe, SubscriptionName, SubscriptionScope,
 };
-use tmux_control::{Client, ConnectionState, SpawnOptions, SpawnTransport};
+use tmux_control::{ConnectionState, SpawnOptions, SpawnTransport};
 
 #[test]
 fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
@@ -276,8 +276,11 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
     )
     .expect("failed to spawn tmux -C");
 
-    // Connect: real handshake, must reach Ready.
-    let mut client = Client::connect(transport).expect("handshake failed against real tmux");
+    // Connect: real handshake, must reach Ready. The sinks are wired before
+    // the handshake runs, which is the only way anything tmux writes behind
+    // the greeting terminator is observable at all.
+    let (mut client, collected) =
+        collecting_connect(transport).expect("handshake failed against real tmux");
     assert_eq!(client.state(), ConnectionState::Ready);
 
     // Version gating: real probe must clear this crate's own floor.
@@ -287,11 +290,12 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
     // Efficiency thesis (DESIGN.md §3.4): set no-output.
     set_no_output(&mut client).expect("set_no_output failed");
     // Attaching can race the pane's own startup output (lifecycle.bin caught
-    // exactly that), so discard anything buffered from before the flag
+    // exactly that), so discard anything collected from before the flag
     // existed: only output arriving after this point can falsify no-output.
     // `execute` read through this command's %end guard, and tmux writes in
-    // order, so every pre-flag %output has already been dispatched here.
-    client.drain_pane_output();
+    // order, so every pre-flag %output has already been dispatched into the
+    // sink by now — which is why the window closes here and not earlier.
+    collected.take_pane_output();
 
     // Subscriptions: subscribe, force a change, observe it, unsubscribe.
     // Parsed once and held (`[LAW:parse-dont-validate]`): the name tmux is
@@ -316,7 +320,7 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
         client
             .execute(&line("list-sessions", NO_ARGS))
             .expect("poll command failed — the connection died while waiting for notifications");
-        for msg in client.drain_notifications() {
+        for msg in collected.take_notifications() {
             match msg {
                 tmux_control::ServerMessage::SubscriptionChanged { ref name, .. }
                     if name == sub_name.as_str() =>
@@ -358,9 +362,9 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
         .execute(&line("list-windows", NO_ARGS))
         .expect("client should still be usable after a command error");
 
-    // Still empty after the baseline drain, so the flag reached tmux rather
+    // Still empty after the baseline take, so the flag reached tmux rather
     // than merely parsing: with no-output active tmux never sends %output.
-    assert_eq!(client.drain_pane_output(), vec![]);
+    assert_eq!(collected.take_pane_output(), vec![]);
 
     // Detach then explicit close — both teardown paths (IMPL.md §2.4)
     // reachable from one still-Ready client.

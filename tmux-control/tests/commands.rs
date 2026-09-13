@@ -5,7 +5,7 @@ use tmux_control::commands::{
     clear_flags, query_tmux_version, require_version, set_flags, set_no_output, set_pane_action,
     subscribe, unsubscribe, ClientFlag, PaneAction, SubscriptionName, SubscriptionScope,
 };
-use tmux_control::{Client, PaneId, TmuxError, TmuxVersion, WindowId};
+use tmux_control::{PaneId, TmuxError, TmuxVersion, WindowId};
 
 /// A name the parse boundary accepts, for the tests that are about
 /// something else.
@@ -18,7 +18,7 @@ const OK_REPLY: &str = "%begin 1 1 1\n%end 1 1 1\n";
 #[test]
 fn subscribe_sends_name_what_and_format_as_one_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     subscribe(
         &mut client,
         &name("sub1"),
@@ -35,7 +35,7 @@ fn subscribe_sends_name_what_and_format_as_one_argument() {
 #[test]
 fn subscribe_encodes_an_apostrophe_in_an_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     subscribe(
         &mut client,
         &name("it's-a-sub"),
@@ -52,7 +52,7 @@ fn subscribe_encodes_an_apostrophe_in_an_argument() {
 #[test]
 fn unsubscribe_builds_the_name_only_form() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     unsubscribe(&mut client, &name("sub1")).unwrap();
     assert_eq!(
         *state.sent.borrow(),
@@ -77,7 +77,7 @@ fn a_format_may_hold_colons_because_tmux_splits_on_the_first_two_only() {
     // back `%subscription-changed nm $0 - - - : pre:probe:post`, colons
     // intact. Rejecting them here would break every conditional format.
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     subscribe(
         &mut client,
         &name("nm"),
@@ -104,7 +104,7 @@ fn subscription_scopes_render_the_what_field_tmux_documents() {
         (SubscriptionScope::AllWindows, "refresh-client -B s:@*:f"),
     ] {
         let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-        let mut client = Client::new(transport);
+        let (mut client, _collected) = collecting_client(transport);
         subscribe(&mut client, &name("s"), scope, "f").unwrap();
         assert_eq!(*state.sent.borrow(), vec![expected.to_string()]);
     }
@@ -122,7 +122,7 @@ fn every_client_flag_renders_as_tmux_spells_it() {
         (ClientFlag::WaitExit, "wait-exit"),
     ] {
         let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-        let mut client = Client::new(transport);
+        let (mut client, _collected) = collecting_client(transport);
         set_flags(&mut client, &[flag]).unwrap();
         assert_eq!(
             *state.sent.borrow(),
@@ -134,7 +134,7 @@ fn every_client_flag_renders_as_tmux_spells_it() {
 #[test]
 fn set_pane_action_sends_the_whole_pane_colon_action_token_as_one_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     set_pane_action(&mut client, PaneId(5), PaneAction::Pause).unwrap();
     assert_eq!(
         *state.sent.borrow(),
@@ -151,7 +151,7 @@ fn pane_action_variants_map_to_spec_13_strings() {
         (PaneAction::Continue, "continue"),
     ] {
         let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-        let mut client = Client::new(transport);
+        let (mut client, _collected) = collecting_client(transport);
         set_pane_action(&mut client, PaneId(1), action).unwrap();
         assert_eq!(
             *state.sent.borrow(),
@@ -163,7 +163,7 @@ fn pane_action_variants_map_to_spec_13_strings() {
 #[test]
 fn set_flags_joins_flags_with_commas_unquoted() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     set_flags(&mut client, &[ClientFlag::NoOutput, ClientFlag::ReadOnly]).unwrap();
     assert_eq!(
         *state.sent.borrow(),
@@ -174,7 +174,7 @@ fn set_flags_joins_flags_with_commas_unquoted() {
 #[test]
 fn clear_flags_prefixes_each_flag_with_a_bang() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     clear_flags(&mut client, &[ClientFlag::NoOutput]).unwrap();
     assert_eq!(
         *state.sent.borrow(),
@@ -185,7 +185,7 @@ fn clear_flags_prefixes_each_flag_with_a_bang() {
 #[test]
 fn set_no_output_is_set_flags_with_exactly_that_flag() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     set_no_output(&mut client).unwrap();
     assert_eq!(
         *state.sent.borrow(),
@@ -196,7 +196,7 @@ fn set_no_output_is_set_flags_with_exactly_that_flag() {
 #[test]
 fn query_tmux_version_parses_the_display_message_reply() {
     let (transport, _state) = MockTransport::new(vec!["%begin 1 1 1\n3.5a\n%end 1 1 1\n"]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     let version = query_tmux_version(&mut client).unwrap();
     assert_eq!(version, TmuxVersion { major: 3, minor: 5 });
 }
@@ -204,7 +204,7 @@ fn query_tmux_version_parses_the_display_message_reply() {
 #[test]
 fn query_tmux_version_fails_loudly_on_unparseable_reply() {
     let (transport, _state) = MockTransport::new(vec!["%begin 1 1 1\nnot a version\n%end 1 1 1\n"]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     let err = query_tmux_version(&mut client).unwrap_err();
     match err {
         TmuxError::VersionProbeFailed { output } => {
@@ -246,7 +246,7 @@ fn require_version_rejects_older_with_a_named_error() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
+use support::{collecting_client, collecting_connect, line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -260,7 +260,8 @@ fn live_tmux_query_version_returns_a_real_version_at_least_the_crate_floor() {
         },
     )
     .expect("failed to spawn tmux -C");
-    let mut client = Client::connect(transport).expect("handshake failed against real tmux");
+    let (mut client, _collected) =
+        collecting_connect(transport).expect("handshake failed against real tmux");
 
     let version = query_tmux_version(&mut client).expect("version probe failed");
     assert!(
@@ -283,7 +284,8 @@ fn live_tmux_subscribe_produces_a_subscription_changed_notification() {
         },
     )
     .expect("failed to spawn tmux -C");
-    let mut client = Client::connect(transport).expect("handshake failed against real tmux");
+    let (mut client, collected) =
+        collecting_connect(transport).expect("handshake failed against real tmux");
 
     subscribe(
         &mut client,
@@ -303,7 +305,7 @@ fn live_tmux_subscribe_produces_a_subscription_changed_notification() {
     let mut found = false;
     for _ in 0..30 {
         let _ = client.execute(&line("list-sessions", NO_ARGS));
-        if client.drain_notifications().iter().any(|m| {
+        if collected.take_notifications().iter().any(|m| {
             matches!(
                 m,
                 tmux_control::ServerMessage::SubscriptionChanged { name, .. } if name == "phoenix-sub"
