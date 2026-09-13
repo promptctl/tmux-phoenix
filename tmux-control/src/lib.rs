@@ -3,12 +3,14 @@
 //! phoenix-specific.
 //!
 //! Three layers, each a clean seam: a pure codec (no I/O), an effect
-//! transport, and a correlation client. The client layer is not built yet.
+//! transport, and a correlation client.
 
+pub mod client;
 pub mod protocol;
 pub mod transport;
 pub mod version;
 
+pub use client::{Client, CloseReason, CommandOutput, ConnectionState, TmuxError};
 pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
     SessionId, WindowId,
