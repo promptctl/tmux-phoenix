@@ -3,9 +3,15 @@
 
 use tmux_control::commands::{
     clear_flags, query_tmux_version, require_version, set_flags, set_no_output, set_pane_action,
-    subscribe, unsubscribe, PaneAction,
+    subscribe, unsubscribe, ClientFlag, PaneAction, SubscriptionName, SubscriptionScope,
 };
-use tmux_control::{Client, PaneId, TmuxError, TmuxVersion};
+use tmux_control::{Client, PaneId, TmuxError, TmuxVersion, WindowId};
+
+/// A name the parse boundary accepts, for the tests that are about
+/// something else.
+fn name(raw: &str) -> SubscriptionName {
+    SubscriptionName::new(raw).expect("test subscription name holds no colon")
+}
 
 const OK_REPLY: &str = "%begin 1 1 1\n%end 1 1 1\n";
 
@@ -13,7 +19,13 @@ const OK_REPLY: &str = "%begin 1 1 1\n%end 1 1 1\n";
 fn subscribe_sends_name_what_and_format_as_one_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
-    subscribe(&mut client, "sub1", "%*", "#{pane_dead}").unwrap();
+    subscribe(
+        &mut client,
+        &name("sub1"),
+        SubscriptionScope::AllPanes,
+        "#{pane_dead}",
+    )
+    .unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec![r##"refresh-client -B "sub1:%*:#{pane_dead}""##.to_string()]
@@ -24,7 +36,13 @@ fn subscribe_sends_name_what_and_format_as_one_argument() {
 fn subscribe_encodes_an_apostrophe_in_an_argument() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
-    subscribe(&mut client, "it's-a-sub", "", "#{session_name}").unwrap();
+    subscribe(
+        &mut client,
+        &name("it's-a-sub"),
+        SubscriptionScope::AttachedSession,
+        "#{session_name}",
+    )
+    .unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec![r##"refresh-client -B "it's-a-sub::#{session_name}""##.to_string()]
@@ -35,11 +53,82 @@ fn subscribe_encodes_an_apostrophe_in_an_argument() {
 fn unsubscribe_builds_the_name_only_form() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
-    unsubscribe(&mut client, "sub1").unwrap();
+    unsubscribe(&mut client, &name("sub1")).unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec!["refresh-client -B sub1".to_string()]
     );
+}
+
+#[test]
+fn a_colon_in_a_subscription_name_is_rejected_at_construction() {
+    // tmux dispatches `-B` on whether the argument holds a colon, so
+    // "phase:1" would not fail loudly — `unsubscribe` would *subscribe* a
+    // subscription named "phase", and `subscribe` would shift what/format
+    // one field left. Neither call is reachable: the name cannot be built.
+    let err = SubscriptionName::new("phase:1").unwrap_err();
+    assert_eq!(err.name, "phase:1");
+    assert!(SubscriptionName::new("phase-1").is_ok());
+}
+
+#[test]
+fn a_format_may_hold_colons_because_tmux_splits_on_the_first_two_only() {
+    // Verified against tmux 3.6a: `-B nm::pre:#{session_name}:post` reports
+    // back `%subscription-changed nm $0 - - - : pre:probe:post`, colons
+    // intact. Rejecting them here would break every conditional format.
+    let (transport, state) = MockTransport::new(vec![OK_REPLY]);
+    let mut client = Client::new(transport);
+    subscribe(
+        &mut client,
+        &name("nm"),
+        SubscriptionScope::AttachedSession,
+        "pre:#{session_name}:post",
+    )
+    .unwrap();
+    assert_eq!(
+        *state.sent.borrow(),
+        vec![r##"refresh-client -B "nm::pre:#{session_name}:post""##.to_string()]
+    );
+}
+
+#[test]
+fn subscription_scopes_render_the_what_field_tmux_documents() {
+    // Whole wire lines rather than just the `what` field, so the quoting is
+    // asserted too: `%` is in tmux's needs-quotes set and `@`/`:` are not,
+    // which is why only the pane scopes come back quoted.
+    for (scope, expected) in [
+        (SubscriptionScope::AttachedSession, "refresh-client -B s::f"),
+        (SubscriptionScope::Pane(PaneId(0)), r#"refresh-client -B "s:%0:f""#),
+        (SubscriptionScope::AllPanes, r#"refresh-client -B "s:%*:f""#),
+        (SubscriptionScope::Window(WindowId(3)), "refresh-client -B s:@3:f"),
+        (SubscriptionScope::AllWindows, "refresh-client -B s:@*:f"),
+    ] {
+        let (transport, state) = MockTransport::new(vec![OK_REPLY]);
+        let mut client = Client::new(transport);
+        subscribe(&mut client, &name("s"), scope, "f").unwrap();
+        assert_eq!(*state.sent.borrow(), vec![expected.to_string()]);
+    }
+}
+
+#[test]
+fn every_client_flag_renders_as_tmux_spells_it() {
+    for (flag, expected) in [
+        (ClientFlag::ActivePane, "active-pane"),
+        (ClientFlag::IgnoreSize, "ignore-size"),
+        (ClientFlag::NoDetachOnDestroy, "no-detach-on-destroy"),
+        (ClientFlag::NoOutput, "no-output"),
+        (ClientFlag::PauseAfter { seconds: 30 }, "pause-after=30"),
+        (ClientFlag::ReadOnly, "read-only"),
+        (ClientFlag::WaitExit, "wait-exit"),
+    ] {
+        let (transport, state) = MockTransport::new(vec![OK_REPLY]);
+        let mut client = Client::new(transport);
+        set_flags(&mut client, &[flag]).unwrap();
+        assert_eq!(
+            *state.sent.borrow(),
+            vec![format!("refresh-client -f {expected}")]
+        );
+    }
 }
 
 #[test]
@@ -75,7 +164,7 @@ fn pane_action_variants_map_to_spec_13_strings() {
 fn set_flags_joins_flags_with_commas_unquoted() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
-    set_flags(&mut client, &["no-output", "read-only"]).unwrap();
+    set_flags(&mut client, &[ClientFlag::NoOutput, ClientFlag::ReadOnly]).unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec!["refresh-client -f no-output,read-only".to_string()]
@@ -86,7 +175,7 @@ fn set_flags_joins_flags_with_commas_unquoted() {
 fn clear_flags_prefixes_each_flag_with_a_bang() {
     let (transport, state) = MockTransport::new(vec![OK_REPLY]);
     let mut client = Client::new(transport);
-    clear_flags(&mut client, &["no-output"]).unwrap();
+    clear_flags(&mut client, &[ClientFlag::NoOutput]).unwrap();
     assert_eq!(
         *state.sent.borrow(),
         vec!["refresh-client -f !no-output".to_string()]
@@ -196,7 +285,13 @@ fn live_tmux_subscribe_produces_a_subscription_changed_notification() {
     .expect("failed to spawn tmux -C");
     let mut client = Client::connect(transport).expect("handshake failed against real tmux");
 
-    subscribe(&mut client, "phoenix-sub", "", "#{session_windows}").expect("subscribe failed");
+    subscribe(
+        &mut client,
+        &name("phoenix-sub"),
+        SubscriptionScope::AttachedSession,
+        "#{session_windows}",
+    )
+    .expect("subscribe failed");
 
     // The subscription timer fires at most once per second (SPEC §14) and
     // only reports a *change* — add a window so the window count changes,
@@ -224,6 +319,6 @@ fn live_tmux_subscribe_produces_a_subscription_changed_notification() {
         "expected a %subscription-changed notification for phoenix-sub"
     );
 
-    unsubscribe(&mut client, "phoenix-sub").unwrap();
+    unsubscribe(&mut client, &name("phoenix-sub")).unwrap();
     client.close();
 }

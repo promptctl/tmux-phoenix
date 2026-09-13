@@ -6,9 +6,10 @@
 //! `send-keys`, and friends are a later ticket's job.
 
 use crate::client::{Client, CommandOutput, TmuxError};
-use crate::protocol::{CommandLine, PaneId};
+use crate::protocol::{CommandLine, PaneId, WindowId};
 use crate::transport::Transport;
 use crate::version::{parse_tmux_version, TmuxVersion};
+use std::fmt;
 
 /// `refresh-client -A <pane>:<action>` actions (SPEC §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +31,128 @@ impl PaneAction {
     }
 }
 
-/// The flag DESIGN.md §3.4's efficiency thesis is built on: suppresses all
-/// pane output notifications so `%output` never needs to be read, decoded,
-/// or discarded.
-pub const NO_OUTPUT_FLAG: &str = "no-output";
+/// The client flags `refresh-client -f` accepts (SPEC §9; tmux documents
+/// the vocabulary under `attach-session`). A closed set rather than
+/// strings, because `-f` takes them comma-joined and tmux splits on those
+/// commas itself: a `&str` flag could carry a comma and silently become
+/// two flags, or carry a leading `!` and clear what the caller meant to
+/// set (`[LAW:types-are-the-program]` — the enum makes both unsayable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientFlag {
+    /// The client has an independent active pane.
+    ActivePane,
+    /// The client does not affect the size of other clients.
+    IgnoreSize,
+    /// Do not detach when the attached session is destroyed, if other
+    /// sessions remain.
+    NoDetachOnDestroy,
+    /// Suppresses all pane output notifications, so `%output` never needs
+    /// to be read, decoded, or discarded — the flag DESIGN.md §3.4's
+    /// efficiency thesis is built on.
+    NoOutput,
+    /// Pause output once the pane is `seconds` behind in control mode.
+    PauseAfter { seconds: u32 },
+    /// Only keys bound to `detach-client`/`switch-client` have any effect.
+    ReadOnly,
+    /// Wait for an empty input line before exiting in control mode.
+    WaitExit,
+}
+
+impl ClientFlag {
+    /// The flag as tmux spells it. `pause-after` is the one that carries a
+    /// value, which is why this returns an owned `String` rather than
+    /// `&'static str`.
+    fn to_field(self) -> String {
+        match self {
+            ClientFlag::ActivePane => "active-pane".to_owned(),
+            ClientFlag::IgnoreSize => "ignore-size".to_owned(),
+            ClientFlag::NoDetachOnDestroy => "no-detach-on-destroy".to_owned(),
+            ClientFlag::NoOutput => "no-output".to_owned(),
+            ClientFlag::PauseAfter { seconds } => format!("pause-after={seconds}"),
+            ClientFlag::ReadOnly => "read-only".to_owned(),
+            ClientFlag::WaitExit => "wait-exit".to_owned(),
+        }
+    }
+}
+
+/// A subscription name that cannot shift tmux's field boundaries: the
+/// first colon-delimited field of `refresh-client -B` (SPEC §14).
+///
+/// Parsed once, here, so nothing downstream re-checks it
+/// (`[LAW:parse-dont-validate]`). A colon in this field is not a malformed
+/// string tmux would reject — it is a *different command*: tmux splits the
+/// `-B` argument on its first two colons, and dispatches on whether the
+/// argument contains one at all. So `"phase:1"` passed to `unsubscribe`
+/// would silently subscribe a subscription named `phase`, and passed to
+/// `subscribe` would shift `what` and `format` one field left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionName(String);
+
+/// A subscription name held a `:`, so no `refresh-client -B` argument
+/// exists that means what the caller asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColonInSubscriptionName {
+    pub name: String,
+}
+
+impl fmt::Display for ColonInSubscriptionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "subscription name {:?} contains a ':', which tmux would read as a field separator",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for ColonInSubscriptionName {}
+
+impl SubscriptionName {
+    pub fn new(name: impl Into<String>) -> Result<Self, ColonInSubscriptionName> {
+        let name = name.into();
+        if name.contains(':') {
+            return Err(ColonInSubscriptionName { name });
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The `what` field of `refresh-client -B` (SPEC §14): which items the
+/// subscription's format is evaluated against. tmux documents exactly
+/// these five shapes, so they are an enum and not a string — the `%`/`@`
+/// sigils stay where the rest of this crate keeps them, at the boundary
+/// (`[LAW:one-source-of-truth]` with [`crate::PaneId`]/[`crate::WindowId`]),
+/// and no caller can put a colon in this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionScope {
+    /// Evaluate the format against the attached session (tmux's empty
+    /// `what`).
+    AttachedSession,
+    /// One pane, by id.
+    Pane(PaneId),
+    /// Every pane in the attached session.
+    AllPanes,
+    /// One window, by id.
+    Window(WindowId),
+    /// Every window in the attached session.
+    AllWindows,
+}
+
+impl SubscriptionScope {
+    fn to_field(self) -> String {
+        match self {
+            SubscriptionScope::AttachedSession => String::new(),
+            SubscriptionScope::Pane(pane) => format!("%{}", pane.0),
+            SubscriptionScope::AllPanes => "%*".to_owned(),
+            SubscriptionScope::Window(window) => format!("@{}", window.0),
+            SubscriptionScope::AllWindows => "@*".to_owned(),
+        }
+    }
+}
 
 /// `refresh-client -B <name>:<what>:<format>` (SPEC §14): subscribe to
 /// changes in a tmux format string, reported via `%subscription-changed`.
@@ -42,12 +161,16 @@ pub const NO_OUTPUT_FLAG: &str = "no-output";
 /// windows (SPEC §14's table).
 pub fn subscribe<T: Transport>(
     client: &mut Client<T>,
-    name: &str,
-    what: &str,
+    name: &SubscriptionName,
+    scope: SubscriptionScope,
     format: &str,
 ) -> Result<CommandOutput, TmuxError> {
-    // tmux takes `name:what:format` as one argument and splits it itself.
-    let target = format!("{name}:{what}:{format}");
+    // tmux takes `name:what:format` as one argument and splits it on the
+    // first two colons only, so `format` may hold colons freely — tmux 3.6a
+    // reports `pre:probe:post` back intact for `nm::pre:#{session_name}:post`
+    // — while `name` and `scope` are the fields that must not, and are
+    // typed so they cannot.
+    let target = format!("{}:{}:{}", name.as_str(), scope.to_field(), format);
     client.execute(&CommandLine::new(
         "refresh-client",
         ["-B", target.as_str()],
@@ -55,12 +178,14 @@ pub fn subscribe<T: Transport>(
 }
 
 /// `refresh-client -B <name>` (SPEC §14, name-only form): remove a
-/// subscription.
+/// subscription. tmux decides remove-versus-subscribe by whether the
+/// argument contains a colon, which is why the name is a
+/// [`SubscriptionName`] and not a `&str`.
 pub fn unsubscribe<T: Transport>(
     client: &mut Client<T>,
-    name: &str,
+    name: &SubscriptionName,
 ) -> Result<CommandOutput, TmuxError> {
-    client.execute(&CommandLine::new("refresh-client", ["-B", name])?)
+    client.execute(&CommandLine::new("refresh-client", ["-B", name.as_str()])?)
 }
 
 /// `refresh-client -A <pane>:<action>` (SPEC §13).
@@ -80,30 +205,41 @@ pub fn set_pane_action<T: Transport>(
 /// `refresh-client -f <flags>` (SPEC §9), comma-joined.
 pub fn set_flags<T: Transport>(
     client: &mut Client<T>,
-    flags: &[&str],
+    flags: &[ClientFlag],
 ) -> Result<CommandOutput, TmuxError> {
     client.execute(&CommandLine::new(
         "refresh-client",
-        ["-f", flags.join(",").as_str()],
+        ["-f", join_flags(flags, "").as_str()],
     )?)
 }
 
 /// `refresh-client -f !<flags>` (SPEC §9): `!`-prefixing a flag clears it.
 pub fn clear_flags<T: Transport>(
     client: &mut Client<T>,
-    flags: &[&str],
+    flags: &[ClientFlag],
 ) -> Result<CommandOutput, TmuxError> {
-    let negated: Vec<String> = flags.iter().map(|f| format!("!{f}")).collect();
     client.execute(&CommandLine::new(
         "refresh-client",
-        ["-f", negated.join(",").as_str()],
+        ["-f", join_flags(flags, "!").as_str()],
     )?)
 }
 
-/// Convenience wrapper for `set_flags(client, &[NO_OUTPUT_FLAG])` — DESIGN.md
-/// §3.4's efficiency thesis names this the one flag phoenix always sets.
+/// The one place `-f`'s argument is built (`[LAW:one-source-of-truth]`):
+/// set and clear differ only by the prefix each flag carries, so that is
+/// the parameter rather than a second join.
+fn join_flags(flags: &[ClientFlag], prefix: &str) -> String {
+    flags
+        .iter()
+        .map(|flag| format!("{prefix}{}", flag.to_field()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Convenience wrapper for `set_flags(client, &[ClientFlag::NoOutput])` —
+/// DESIGN.md §3.4's efficiency thesis names this the one flag phoenix
+/// always sets.
 pub fn set_no_output<T: Transport>(client: &mut Client<T>) -> Result<CommandOutput, TmuxError> {
-    set_flags(client, &[NO_OUTPUT_FLAG])
+    set_flags(client, &[ClientFlag::NoOutput])
 }
 
 /// Probe the connected tmux server's version over the live control-mode

@@ -12,7 +12,9 @@ pub mod transport;
 pub mod version;
 
 pub use client::{Client, CloseReason, CommandOutput, ConnectionState, TmuxError};
-pub use commands::PaneAction;
+pub use commands::{
+    ClientFlag, ColonInSubscriptionName, PaneAction, SubscriptionName, SubscriptionScope,
+};
 pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
     SessionId, WindowId,
