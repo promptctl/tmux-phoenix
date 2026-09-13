@@ -286,6 +286,12 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
 
     // Efficiency thesis (DESIGN.md §3.4): set no-output.
     set_no_output(&mut client).expect("set_no_output failed");
+    // Attaching can race the pane's own startup output (lifecycle.bin caught
+    // exactly that), so discard anything buffered from before the flag
+    // existed: only output arriving after this point can falsify no-output.
+    // `execute` read through this command's %end guard, and tmux writes in
+    // order, so every pre-flag %output has already been dispatched here.
+    client.drain_pane_output();
 
     // Subscriptions: subscribe, force a change, observe it, unsubscribe.
     // Parsed once and held (`[LAW:parse-dont-validate]`): the name tmux is
@@ -307,7 +313,9 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
     let mut saw_subscription_changed = false;
     let mut saw_window_add = false;
     for _ in 0..30 {
-        let _ = client.execute(&line("list-sessions", NO_ARGS));
+        client
+            .execute(&line("list-sessions", NO_ARGS))
+            .expect("poll command failed — the connection died while waiting for notifications");
         for msg in client.drain_notifications() {
             match msg {
                 tmux_control::ServerMessage::SubscriptionChanged { ref name, .. }
@@ -350,11 +358,8 @@ fn live_round_trip_exercises_the_full_crate_against_a_real_server() {
         .execute(&line("list-windows", NO_ARGS))
         .expect("client should still be usable after a command error");
 
-    // no-output was set, but pane_output must remain empty regardless —
-    // nothing routes there without a live pane actually producing bytes we
-    // read while set, since with no-output active tmux never even sends
-    // %output. Confirms the flag call actually reached tmux, not just that
-    // the command succeeded syntactically.
+    // Still empty after the baseline drain, so the flag reached tmux rather
+    // than merely parsing: with no-output active tmux never sends %output.
     assert_eq!(client.drain_pane_output(), vec![]);
 
     // Detach then explicit close — both teardown paths (IMPL.md §2.4)
