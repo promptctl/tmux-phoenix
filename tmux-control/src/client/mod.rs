@@ -22,17 +22,26 @@
 //!   transport reintroduces the exact off-by-one this module exists to
 //!   prevent — `connect()` is the safe default.
 //!
-//! Notifications dispatch as typed [`ServerMessage`] events to a registered
-//! subscriber. Pane output (`%output`/`%extended-output`) never goes
+//! Notifications dispatch as typed [`ServerMessage`] events to the
+//! notification sink. Pane output (`%output`/`%extended-output`) never goes
 //! through that path — it is high-volume and mixing it into the
 //! notification stream is how you get head-of-line blocking — it routes
-//! through a separate byte sink instead ([`Client::on_pane_output`]). If no
-//! sink is registered for either path, messages are buffered rather than
-//! dropped ([`Client::drain_notifications`], [`Client::drain_pane_output`]):
-//! nothing is silently lost just because a caller hasn't wired up a
-//! subscriber yet.
+//! through a separate byte sink instead. Both sinks are supplied at
+//! construction and neither is optional, so a parsed message with nowhere
+//! to go is not a state this client can be in.
 //!
-//! A registered sink only fires while some blocking call
+//! That requirement is load-bearing rather than ceremonial: [`Client::connect`]
+//! dispatches whatever tmux wrote behind the greeting terminator, which is
+//! strictly before any caller could have registered a sink afterwards. The
+//! crate used to cover that one-handshake window with unbounded queues that
+//! then retained for the entire connection — paying a connection-lifetime
+//! price for a startup guarantee. Requiring the sinks removes the window
+//! instead of paying for it, and leaves this crate holding no queue at all.
+//! A caller wanting a stream discarded says so with a discarding closure; a
+//! caller wanting it buffered owns that buffer, which is where this module
+//! already places the polling policy it declines to own.
+//!
+//! A sink only fires while some blocking call
 //! (`execute`/`connect`/`reconnect`) is actively reading — this client has
 //! no background thread of its own, so "dispatch" here means "synchronously
 //! invoked the moment a message is parsed during one of those calls," not
@@ -49,7 +58,6 @@ pub use error::TmuxError;
 
 use crate::protocol::{Codec, CommandLine, Guard, PaneId, ServerMessage};
 use crate::transport::Transport;
-use std::collections::VecDeque;
 
 /// A completed command's guard-framed output.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,14 +74,11 @@ type PaneOutputSink = Box<dyn FnMut(PaneId, Vec<u8>)>;
 pub struct Client<T: Transport> {
     transport: T,
     codec: Codec,
-    /// Non-pane-output `ServerMessage`s with no registered
-    /// [`Client::on_notification`] sink — buffered, not dropped.
-    notifications: VecDeque<ServerMessage>,
-    /// `%output`/`%extended-output` bytes with no registered
-    /// [`Client::on_pane_output`] sink — buffered, not dropped.
-    pane_output: VecDeque<(PaneId, Vec<u8>)>,
-    notification_sink: Option<NotificationSink>,
-    pane_output_sink: Option<PaneOutputSink>,
+    /// Every dispatched message's destination. Not `Option`
+    /// (`[LAW:types-are-the-program]`): "a message with nowhere to go" was
+    /// the illegal state whose only cover was an unbounded queue per sink.
+    notification_sink: NotificationSink,
+    pane_output_sink: PaneOutputSink,
     state: ConnectionState,
 }
 
@@ -84,22 +89,39 @@ impl<T: Transport> Client<T> {
     /// (`[LAW:one-source-of-truth]`), so a field added later cannot be
     /// initialized in one entry point and forgotten in the other. The
     /// starting state is all the two differ by.
-    fn with_state(transport: T, state: ConnectionState) -> Self {
+    fn with_state(
+        transport: T,
+        state: ConnectionState,
+        on_notification: impl FnMut(ServerMessage) + 'static,
+        on_pane_output: impl FnMut(PaneId, Vec<u8>) + 'static,
+    ) -> Self {
         Self {
             transport,
             codec: Codec::new(),
-            notifications: VecDeque::new(),
-            pane_output: VecDeque::new(),
-            notification_sink: None,
-            pane_output_sink: None,
+            notification_sink: Box::new(on_notification),
+            pane_output_sink: Box::new(on_pane_output),
             state,
         }
     }
 
     /// Build a client that starts `Ready` immediately, with no greeting
     /// handshake. See the module docs for when this is (and isn't) safe.
-    pub fn new(transport: T) -> Self {
-        Self::with_state(transport, ConnectionState::Ready)
+    ///
+    /// `on_notification` receives every non-pane-output [`ServerMessage`];
+    /// `on_pane_output` receives `%output`/`%extended-output` bytes. Pass a
+    /// closure that drops its argument to discard a stream — an intent this
+    /// crate would otherwise have to infer from a missing registration.
+    pub fn new(
+        transport: T,
+        on_notification: impl FnMut(ServerMessage) + 'static,
+        on_pane_output: impl FnMut(PaneId, Vec<u8>) + 'static,
+    ) -> Self {
+        Self::with_state(
+            transport,
+            ConnectionState::Ready,
+            on_notification,
+            on_pane_output,
+        )
     }
 
     /// Build a client against a freshly-attached transport: synchronously
@@ -107,8 +129,21 @@ impl<T: Transport> Client<T> {
     /// so the result is guaranteed `Ready` (or the handshake's own failure
     /// is returned instead of a half-initialized client). This is the
     /// entry point real usage against a live tmux should call.
-    pub fn connect(transport: T) -> Result<Self, TmuxError> {
-        let mut client = Self::with_state(transport, ConnectionState::Connecting);
+    ///
+    /// The sinks are taken here, rather than registered on the returned
+    /// client, because the handshake itself dispatches: anything tmux wrote
+    /// behind the greeting terminator reaches them during this call.
+    pub fn connect(
+        transport: T,
+        on_notification: impl FnMut(ServerMessage) + 'static,
+        on_pane_output: impl FnMut(PaneId, Vec<u8>) + 'static,
+    ) -> Result<Self, TmuxError> {
+        let mut client = Self::with_state(
+            transport,
+            ConnectionState::Connecting,
+            on_notification,
+            on_pane_output,
+        );
         client.consume_greeting()?;
         Ok(client)
     }
@@ -196,8 +231,10 @@ impl<T: Transport> Client<T> {
                 match msg {
                     ServerMessage::GuardBegin(_) | ServerMessage::CommandOutput { .. } => {
                         // Framing and body of the greeting block — no
-                        // caller is waiting on it, so its output (if any)
-                        // is intentionally discarded, not buffered.
+                        // caller is waiting on it, so its output (if any) is
+                        // intentionally dropped rather than dispatched as a
+                        // notification the caller would have to recognize
+                        // and ignore.
                     }
                     ServerMessage::GuardEnd(_)
                     | ServerMessage::GuardError(_)
@@ -213,24 +250,20 @@ impl<T: Transport> Client<T> {
         Ok(())
     }
 
-    /// Route a parsed message to its sink (`[LAW:single-enforcer]` — the
-    /// one place that decides notification vs. pane-output vs. buffered
-    /// fallback). Only ever called with messages that are neither guard
-    /// framing nor command output — those are handled by their own callers
-    /// before reaching here.
+    /// Route a parsed message to its sink (`[LAW:single-enforcer]` — the one
+    /// place that decides notification vs. pane-output). The only branch left
+    /// is the domain's own discriminator: with both sinks required, "is there
+    /// somewhere to put this" is no longer a question the code can ask
+    /// (`[LAW:dataflow-not-control-flow]`). Only ever called with messages
+    /// that are neither guard framing nor command output — those are handled
+    /// by their own callers before reaching here.
     fn dispatch(&mut self, msg: ServerMessage) {
         match msg {
             ServerMessage::Output { pane, data }
             | ServerMessage::ExtendedOutput { pane, data, .. } => {
-                match &mut self.pane_output_sink {
-                    Some(sink) => sink(pane, data),
-                    None => self.pane_output.push_back((pane, data)),
-                }
+                (self.pane_output_sink)(pane, data)
             }
-            other => match &mut self.notification_sink {
-                Some(sink) => sink(other),
-                None => self.notifications.push_back(other),
-            },
+            other => (self.notification_sink)(other),
         }
     }
 
@@ -306,34 +339,6 @@ impl<T: Transport> Client<T> {
         }
 
         outcome.expect("loop only exits once outcome is Some")
-    }
-
-    /// Register the sink every non-pane-output `ServerMessage` dispatches
-    /// to from now on, replacing any previously registered sink. Messages
-    /// already buffered before this call stay buffered — call
-    /// [`Client::drain_notifications`] first if you want them too.
-    pub fn on_notification(&mut self, sink: impl FnMut(ServerMessage) + 'static) {
-        self.notification_sink = Some(Box::new(sink));
-    }
-
-    /// Register the sink `%output`/`%extended-output` bytes dispatch to
-    /// from now on, replacing any previously registered sink. High-volume
-    /// and kept off the notification path entirely (module docs) so it
-    /// never head-of-line-blocks other notifications.
-    pub fn on_pane_output(&mut self, sink: impl FnMut(PaneId, Vec<u8>) + 'static) {
-        self.pane_output_sink = Some(Box::new(sink));
-    }
-
-    /// Drain every non-pane-output `ServerMessage` that arrived with no
-    /// [`Client::on_notification`] sink registered at the time.
-    pub fn drain_notifications(&mut self) -> Vec<ServerMessage> {
-        self.notifications.drain(..).collect()
-    }
-
-    /// Drain every `%output`/`%extended-output` chunk that arrived with no
-    /// [`Client::on_pane_output`] sink registered at the time.
-    pub fn drain_pane_output(&mut self) -> Vec<(PaneId, Vec<u8>)> {
-        self.pane_output.drain(..).collect()
     }
 
     /// The wire-level detach signal: a bare `\n` (SPEC §4.1). Deliberately

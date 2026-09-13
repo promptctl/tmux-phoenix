@@ -2,19 +2,20 @@
 //! from a live tmux via a `MockTransport` that hands back pre-scripted
 //! byte chunks — exactly the testability DESIGN.md §3.2 calls out
 //! (`Transport` exists so codec and client are testable without a live
-//! tmux). Uses `Client::new` throughout, which starts `Ready` with no
-//! greeting handshake — the right choice here since these tests are about
-//! FIFO correlation, not the handshake itself. `Client::connect`'s greeting
-//! consumption and the `ConnectionState` gate it enforces are covered
-//! separately in `connection_state.rs`.
+//! tmux). Uses `collecting_client` throughout — `Client::new` plus sinks
+//! that collect, starting `Ready` with no greeting handshake, the right
+//! choice here since these tests are about FIFO correlation, not the
+//! handshake itself. `Client::connect`'s greeting consumption and the
+//! `ConnectionState` gate it enforces are covered separately in
+//! `connection_state.rs`.
 
-use tmux_control::{Client, CloseReason, ConnectionState, ServerMessage, TmuxError};
+use tmux_control::{CloseReason, ConnectionState, ServerMessage, TmuxError};
 
 #[test]
 fn execute_sends_the_command_and_returns_output_on_end() {
     let (transport, state) =
         MockTransport::new(vec!["%begin 1000 1 1\n0: bash* (1 panes)\n%end 1000 1 1\n"]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let result = client.execute(&line("list-windows", NO_ARGS)).unwrap();
 
@@ -28,7 +29,7 @@ fn execute_sends_exactly_the_command_line_unmodified() {
     // Line-termination is the transport's job (SpawnTransport tests cover
     // that); the client passes the command through as given, untouched.
     let (transport, state) = MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n"]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     client
         .execute(&line("display-message", ["-p", "test"]))
         .unwrap();
@@ -43,7 +44,7 @@ fn execute_returns_command_error_on_tmux_error_reply() {
     let (transport, _state) = MockTransport::new(vec![
         "%begin 1000 3 1\nparse error: unknown command\n%error 1000 3 1\n",
     ]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let err = client.execute(&line("bad-command", NO_ARGS)).unwrap_err();
     match err {
@@ -65,7 +66,7 @@ fn execute_reads_across_multiple_transport_chunks() {
         "line two\n",
         "%end 1 5 1\n",
     ]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let result = client.execute(&line("list-panes", NO_ARGS)).unwrap();
     assert_eq!(
@@ -75,7 +76,7 @@ fn execute_reads_across_multiple_transport_chunks() {
 }
 
 #[test]
-fn execute_buffers_a_notification_that_arrives_before_the_reply_block_opens() {
+fn execute_dispatches_a_notification_that_arrives_before_the_reply_block_opens() {
     // A notification genuinely can't appear *inside* a guard block (SPEC
     // §6's block-purity invariant, enforced by the codec) — the realistic
     // "arrives while execute() is waiting" case is a notification on the
@@ -84,17 +85,19 @@ fn execute_buffers_a_notification_that_arrives_before_the_reply_block_opens() {
         "%sessions-changed\n", // unrelated background notification
         "%begin 1 7 1\n0: bash* (1 panes)\n%end 1 7 1\n",
     ]);
-    let mut client = Client::new(transport);
+    let (mut client, collected) = collecting_client(transport);
 
     let result = client.execute(&line("list-windows", NO_ARGS)).unwrap();
     assert_eq!(result.lines, vec![b"0: bash* (1 panes)".to_vec()]);
 
-    let notifications = client.drain_notifications();
-    assert_eq!(notifications, vec![ServerMessage::SessionsChanged]);
+    assert_eq!(
+        collected.take_notifications(),
+        vec![ServerMessage::SessionsChanged]
+    );
 }
 
 #[test]
-fn execute_buffers_a_notification_trailing_in_the_same_read_chunk_as_the_reply() {
+fn execute_dispatches_a_notification_trailing_in_the_same_read_chunk_as_the_reply() {
     // Regression: a single read() can return a chunk containing our reply's
     // GuardEnd *and* bytes written right after it in the same burst — e.g.
     // tmux emitting a notification immediately behind our block, delivered
@@ -104,25 +107,14 @@ fn execute_buffers_a_notification_trailing_in_the_same_read_chunk_as_the_reply()
     // already parsed out of the transport, not left to read again).
     let (transport, _state) =
         MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n%sessions-changed\n"]);
-    let mut client = Client::new(transport);
+    let (mut client, collected) = collecting_client(transport);
 
     client.execute(&line("noop", NO_ARGS)).unwrap();
 
     assert_eq!(
-        client.drain_notifications(),
+        collected.take_notifications(),
         vec![ServerMessage::SessionsChanged]
     );
-}
-
-#[test]
-fn drain_notifications_empties_the_buffer() {
-    let (transport, _state) =
-        MockTransport::new(vec!["%sessions-changed\n%begin 1 1 1\n%end 1 1 1\n"]);
-    let mut client = Client::new(transport);
-    client.execute(&line("noop", NO_ARGS)).unwrap();
-
-    assert_eq!(client.drain_notifications().len(), 1);
-    assert_eq!(client.drain_notifications(), vec![]); // already drained
 }
 
 #[test]
@@ -130,7 +122,7 @@ fn execute_surfaces_malformed_terminator_as_protocol_error() {
     let (transport, _state) = MockTransport::new(vec![
         "%begin 1699900000 7 0\n%end 1699900000 7\n", // truncated %end
     ]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     match err {
@@ -148,7 +140,7 @@ fn execute_surfaces_malformed_terminator_as_protocol_error() {
 #[test]
 fn execute_returns_transport_closed_on_eof_before_reply_completes() {
     let (transport, _state) = MockTransport::new(vec!["%begin 1 1 1\n"]); // no %end ever arrives
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let err = client.execute(&line("hangs", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed));
@@ -158,7 +150,7 @@ fn execute_returns_transport_closed_on_eof_before_reply_completes() {
 fn execute_propagates_send_failure_without_reading() {
     let (mut transport, _state) = MockTransport::empty();
     transport.fail_next_send = true;
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let err = client.execute(&line("anything", NO_ARGS)).unwrap_err();
     assert!(matches!(err, TmuxError::Send(_)));
@@ -170,7 +162,7 @@ fn sequential_execute_calls_correlate_independently() {
         "%begin 1 1 1\nfirst\n%end 1 1 1\n",
         "%begin 2 2 1\nsecond\n%end 2 2 1\n",
     ]);
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     let first = client.execute(&line("cmd-one", NO_ARGS)).unwrap();
     let second = client.execute(&line("cmd-two", NO_ARGS)).unwrap();
@@ -188,7 +180,7 @@ fn sequential_execute_calls_correlate_independently() {
 #[test]
 fn detach_sends_a_bare_newline_bypassing_execute() {
     let (transport, state) = MockTransport::empty();
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     client.detach().unwrap();
     // detach() must succeed against a transport with zero scripted read
     // chunks, proving it never entered execute()'s read loop — and it must
@@ -201,7 +193,7 @@ fn detach_sends_a_bare_newline_bypassing_execute() {
 fn a_failed_detach_reports_the_connection_closed() {
     let (mut transport, _state) = MockTransport::empty();
     transport.fail_next_send = true;
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     assert!(matches!(client.detach(), Err(TmuxError::Send(_))));
     // The transport is known dead, so state() has to say so on its own:
@@ -219,7 +211,7 @@ fn a_failed_detach_reports_the_connection_closed() {
 fn the_harness_refuses_only_the_next_send_not_every_later_one() {
     let (mut transport, state) = MockTransport::empty();
     transport.fail_next_send = true;
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     // `detach()` is not state-gated, so it reaches the transport twice and
     // can show that the refusal was one-shot. A sticky flag would fail the
@@ -233,7 +225,7 @@ fn the_harness_refuses_only_the_next_send_not_every_later_one() {
 #[test]
 fn a_detach_after_close_keeps_the_disposed_reason() {
     let (transport, _state) = MockTransport::empty();
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
 
     client.close();
     // detach() is documented as callable from any state, best-effort, and
@@ -254,7 +246,7 @@ fn a_detach_after_close_keeps_the_disposed_reason() {
 // ---------------------------------------------------------------------------
 
 mod support;
-use support::{line, IsolatedTmux, MockTransport, NO_ARGS};
+use support::{collecting_client, line, IsolatedTmux, MockTransport, NO_ARGS};
 use tmux_control::SpawnTransport;
 
 #[test]
@@ -291,7 +283,7 @@ fn live_tmux_execute_round_trips_against_a_real_server() {
 
     // Rebuild a fresh Client wired to the same transport, past the
     // greeting. execute() from here on should correlate cleanly.
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     let result = client
         .execute(&line("display-message", ["-p", "PHOENIX-CLIENT-MARKER"]))
         .unwrap();
@@ -316,7 +308,7 @@ fn live_tmux_execute_round_trips_against_a_real_server() {
 #[test]
 fn close_delegates_to_transport_close() {
     let (transport, state) = MockTransport::empty();
-    let mut client = Client::new(transport);
+    let (mut client, _collected) = collecting_client(transport);
     client.close();
     assert!(*state.closed.borrow());
     assert_eq!(
