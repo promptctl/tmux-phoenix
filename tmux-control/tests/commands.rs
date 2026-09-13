@@ -98,9 +98,15 @@ fn subscription_scopes_render_the_what_field_tmux_documents() {
     // which is why only the pane scopes come back quoted.
     for (scope, expected) in [
         (SubscriptionScope::AttachedSession, "refresh-client -B s::f"),
-        (SubscriptionScope::Pane(PaneId(0)), r#"refresh-client -B "s:%0:f""#),
+        (
+            SubscriptionScope::Pane(PaneId(0)),
+            r#"refresh-client -B "s:%0:f""#,
+        ),
         (SubscriptionScope::AllPanes, r#"refresh-client -B "s:%*:f""#),
-        (SubscriptionScope::Window(WindowId(3)), "refresh-client -B s:@3:f"),
+        (
+            SubscriptionScope::Window(WindowId(3)),
+            "refresh-client -B s:@3:f",
+        ),
         (SubscriptionScope::AllWindows, "refresh-client -B s:@*:f"),
     ] {
         let (transport, state) = MockTransport::new(vec![OK_REPLY]);
