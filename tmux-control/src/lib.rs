@@ -19,5 +19,5 @@ pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,
     SessionId, WindowId,
 };
-pub use transport::{SpawnOptions, SpawnTransport, Transport};
+pub use transport::{KillHandle, SpawnOptions, SpawnTransport, Transport};
 pub use version::{TmuxVersion, MIN_TMUX_VERSION};
