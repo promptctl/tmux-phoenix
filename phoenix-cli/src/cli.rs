@@ -1,12 +1,20 @@
 //! Pure argument parsing (DESIGN.md §9) — no I/O, testable without a tmux
-//! server. Hand-rolled: the surface is two subcommands and two flags.
+//! server. Hand-rolled: the surface is three subcommands and a few flags.
 
 pub const DEFAULT_KEEP_GENERATIONS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Save { keep: usize, socket: Option<String> },
+    Save {
+        keep: usize,
+        socket: Option<String>,
+    },
     List,
+    Restore {
+        dry_run: bool,
+        file: Option<String>,
+        socket: Option<String>,
+    },
     Help,
 }
 
@@ -19,9 +27,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             }
             Ok(Command::List)
         }
+        Some("restore") => parse_restore(&args[1..]),
         Some("--help") | Some("-h") | None => Ok(Command::Help),
         Some(other) => Err(format!(
-            "unknown subcommand {other:?} (try \"save\" or \"list\")"
+            "unknown subcommand {other:?} (try \"save\", \"list\" or \"restore\")"
         )),
     }
 }
@@ -48,6 +57,33 @@ fn parse_save(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
     Ok(Command::Save { keep, socket })
+}
+
+fn parse_restore(args: &[String]) -> Result<Command, String> {
+    let mut dry_run = false;
+    let mut file = None;
+    let mut socket = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => dry_run = true,
+            "--file" => {
+                i += 1;
+                file = Some(args.get(i).ok_or("--file requires a value")?.clone());
+            }
+            "--socket" => {
+                i += 1;
+                socket = Some(args.get(i).ok_or("--socket requires a value")?.clone());
+            }
+            other => return Err(format!("restore: unknown argument {other:?}")),
+        }
+        i += 1;
+    }
+    Ok(Command::Restore {
+        dry_run,
+        file,
+        socket,
+    })
 }
 
 #[cfg(test)]
@@ -120,5 +156,47 @@ mod tests {
     #[test]
     fn list_rejects_extra_arguments() {
         assert!(parse_args(&args(&["list", "--socket", "/tmp/s"])).is_err());
+    }
+
+    #[test]
+    fn bare_restore_uses_defaults() {
+        assert_eq!(
+            parse_args(&args(&["restore"])).unwrap(),
+            Command::Restore {
+                dry_run: false,
+                file: None,
+                socket: None,
+            }
+        );
+    }
+
+    #[test]
+    fn restore_with_all_flags() {
+        assert_eq!(
+            parse_args(&args(&[
+                "restore",
+                "--dry-run",
+                "--file",
+                "/tmp/snap",
+                "--socket",
+                "/tmp/s"
+            ]))
+            .unwrap(),
+            Command::Restore {
+                dry_run: true,
+                file: Some("/tmp/snap".to_string()),
+                socket: Some("/tmp/s".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_dangling_file_flag() {
+        assert!(parse_args(&args(&["restore", "--file"])).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_unknown_flags() {
+        assert!(parse_args(&args(&["restore", "--nope"])).is_err());
     }
 }

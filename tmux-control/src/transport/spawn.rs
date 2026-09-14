@@ -97,18 +97,24 @@ fn lock(slot: &ChildSlot) -> MutexGuard<'_, Option<Child>> {
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The tmux argv that selects `socket`: `-S <path>` for a path (anything
+/// holding a `/`), `-L <name>` for a bare name, nothing for the default.
+/// Public because callers that run plain `tmux` helpers beside the
+/// control-mode child must select the same server the same way
+/// (`[LAW:one-source-of-truth]`).
+pub fn socket_args(socket: Option<&str>) -> Vec<String> {
+    match socket {
+        None => Vec::new(),
+        Some(socket) if socket.contains('/') => vec!["-S".to_string(), socket.to_string()],
+        Some(socket) => vec!["-L".to_string(), socket.to_string()],
+    }
+}
+
 /// `-C` plus the socket selector plus the caller's own tmux command/args, in
 /// that order (mirrors the reference transport's `buildArgv`).
 fn build_argv(socket: Option<&str>, user_args: &[&str]) -> Vec<String> {
     let mut argv = vec!["-C".to_string()];
-    if let Some(socket) = socket {
-        if socket.contains('/') {
-            argv.push("-S".to_string());
-        } else {
-            argv.push("-L".to_string());
-        }
-        argv.push(socket.to_string());
-    }
+    argv.extend(socket_args(socket));
     argv.extend(user_args.iter().map(|s| s.to_string()));
     argv
 }
@@ -205,5 +211,32 @@ impl Transport for SpawnTransport {
 impl Drop for SpawnTransport {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_args_is_empty_for_the_default_server() {
+        assert_eq!(socket_args(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn socket_args_selects_a_bare_name_with_dash_l_and_a_path_with_dash_s() {
+        assert_eq!(
+            socket_args(Some("phoenix-test")),
+            vec!["-L", "phoenix-test"]
+        );
+        assert_eq!(socket_args(Some("/tmp/sock")), vec!["-S", "/tmp/sock"]);
+    }
+
+    #[test]
+    fn build_argv_puts_control_mode_first_then_socket_then_the_command() {
+        assert_eq!(
+            build_argv(Some("/tmp/sock"), &["attach-session", "-t", "x"]),
+            vec!["-C", "-S", "/tmp/sock", "attach-session", "-t", "x"]
+        );
     }
 }

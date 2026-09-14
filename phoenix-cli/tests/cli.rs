@@ -174,3 +174,245 @@ fn unknown_subcommand_exits_nonzero() {
         .expect("failed to run phoenix bogus");
     assert!(!output.status.success());
 }
+
+#[test]
+fn restore_dry_run_prints_commands_and_touches_nothing() {
+    let harness = IsolatedTmux::new("cli-restore-dry-run");
+    let data_dir = TestDataDir::new("restore-dry-run");
+
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+    assert!(save.status.success());
+
+    let dry_run = Command::new(phoenix_bin())
+        .args(["restore", "--dry-run"])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix restore --dry-run");
+
+    assert!(dry_run.status.success());
+    let stdout = String::from_utf8(dry_run.stdout).unwrap();
+    assert!(
+        stdout.contains("new-session"),
+        "dry-run output should contain the plan's commands, got: {stdout:?}"
+    );
+
+    // Only one session should exist on the server: --dry-run must not have
+    // created anything.
+    let sessions = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()
+        .expect("failed to list sessions");
+    let session_names = String::from_utf8(sessions.stdout).unwrap();
+    assert_eq!(session_names.lines().count(), 1);
+}
+
+#[test]
+fn restore_rebuilds_a_killed_session_onto_the_same_server() {
+    let harness = IsolatedTmux::new("cli-restore-apply");
+    let data_dir = TestDataDir::new("restore-apply");
+
+    // Give the captured session some real structure beyond the default
+    // single window/pane.
+    let status = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "split-window",
+            "-t",
+            &harness.session,
+        ])
+        .status()
+        .expect("failed to split-window");
+    assert!(status.success());
+
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+    assert!(save.status.success());
+
+    // This is the populated-server case (tmux-parity-ure.1 criterion 3): a
+    // second, unrelated session survives, so restore attaches to the live
+    // server with no bootstrap involved -- the empty/not-running cases get
+    // their own tests below. Simulate "the captured session is gone, restore
+    // it" by killing only the captured one and keeping this one alive.
+    let status = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "new-session",
+            "-d",
+            "-s",
+            "keepalive",
+        ])
+        .status()
+        .expect("failed to create the keepalive session");
+    assert!(status.success());
+    let status = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "kill-session",
+            "-t",
+            &harness.session,
+        ])
+        .status()
+        .expect("failed to kill-session");
+    assert!(status.success());
+
+    let restore = Command::new(phoenix_bin())
+        .args(["restore", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix restore");
+    assert!(
+        restore.status.success(),
+        "phoenix restore failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    let panes = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "list-panes",
+            "-t",
+            &harness.session,
+            "-F",
+            "#{pane_index}",
+        ])
+        .output()
+        .expect("failed to list-panes");
+    assert!(panes.status.success());
+    let pane_count = String::from_utf8(panes.stdout).unwrap().lines().count();
+    assert_eq!(
+        pane_count, 2,
+        "restored session should have the 2 panes that were captured"
+    );
+
+    let _ = Command::new("tmux")
+        .args(["-S", &harness.socket, "kill-session", "-t", "keepalive"])
+        .status();
+}
+
+/// tmux-parity-ure.1 criteria 1, 2, 4 & 5: restoring onto a server with no
+/// sessions used to die with "transport closed before the command's reply
+/// arrived" because bare `attach-session` had nothing to attach to. It now
+/// bootstraps a throwaway session, restores, and tears the bootstrap down.
+///
+/// Criteria 1 ("no server process running") and 2 ("running server, zero
+/// sessions") are one and the same to `restore`: tmux tears a server down the
+/// instant it has no sessions (a running-but-empty server is not a state that
+/// persists long enough to invoke a separate command against), and the shared
+/// connection strategy keys off `count_sessions == 0`, which is identical for
+/// both. So the reachable "no server running" case exercises both.
+#[test]
+fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
+    let source = IsolatedTmux::new("cli-restore-empty-source");
+    let data_dir = TestDataDir::new("restore-empty");
+
+    // Give the captured session real structure (two panes) so the assertion
+    // proves the *full* tree was recreated, not just that a session appeared.
+    let status = Command::new("tmux")
+        .args(["-S", &source.socket, "split-window", "-t", &source.session])
+        .status()
+        .expect("failed to split-window");
+    assert!(status.success());
+
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &source.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+    assert!(save.status.success());
+
+    // A separate socket with no tmux server running at all — the exact
+    // scenario the old CLI could not handle.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let target_socket = format!(
+        "/tmp/phoenix-cli-test-empty-target-{}-{nanos}",
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&target_socket);
+
+    let restore = Command::new(phoenix_bin())
+        .args(["restore", "--socket", &target_socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix restore");
+    let restore_stderr = String::from_utf8_lossy(&restore.stderr);
+    assert!(
+        restore.status.success(),
+        "restore onto an empty server should succeed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&restore.stdout),
+        restore_stderr
+    );
+    assert!(
+        !restore_stderr.contains("transport closed"),
+        "the cryptic transport error must be gone; got stderr={restore_stderr:?}"
+    );
+
+    // Only the restored session remains — the phoenix-boot scaffolding is
+    // gone (criterion 4).
+    let sessions = Command::new("tmux")
+        .args([
+            "-S",
+            &target_socket,
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()
+        .expect("failed to list sessions on the target");
+    let session_names: Vec<String> = String::from_utf8_lossy(&sessions.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        session_names,
+        vec![source.session.clone()],
+        "the restored session should be the only one, with no bootstrap residue"
+    );
+
+    // The full pane tree was recreated (criterion 1).
+    let panes = Command::new("tmux")
+        .args([
+            "-S",
+            &target_socket,
+            "list-panes",
+            "-t",
+            &source.session,
+            "-F",
+            "#{pane_index}",
+        ])
+        .output()
+        .expect("failed to list-panes on the target");
+    assert_eq!(
+        String::from_utf8_lossy(&panes.stdout).lines().count(),
+        2,
+        "the restored session should have the 2 panes that were captured"
+    );
+
+    // Clean up the target server one session at a time — never a server-wide kill.
+    for name in &session_names {
+        let _ = Command::new("tmux")
+            .args(["-S", &target_socket, "kill-session", "-t", name])
+            .status();
+    }
+    let _ = std::fs::remove_file(&target_socket);
+}

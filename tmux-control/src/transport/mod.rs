@@ -13,7 +13,7 @@
 
 mod spawn;
 
-pub use spawn::{KillHandle, SpawnOptions, SpawnTransport};
+pub use spawn::{socket_args, KillHandle, SpawnOptions, SpawnTransport};
 
 use crate::protocol::CommandLine;
 use std::io;

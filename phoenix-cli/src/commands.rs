@@ -3,6 +3,8 @@
 //! diagnostic goes to stderr, prefixed with the subcommand so `phoenix save`
 //! and `phoenix list` output can be told apart in a combined log.
 
+use std::path::Path;
+
 use phoenix_core::Snapshot;
 use phoenix_store::Store;
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
@@ -14,7 +16,8 @@ pub const EXIT_FAIL: i32 = 1;
 
 /// Bare `attach-session` (no `-t`) attaches to the server's most recently
 /// used session, which `save` can rely on existing: it reads a live server
-/// the user is looking at.
+/// the user is looking at. `restore` cannot rely on that, so it goes through
+/// `phoenix_restore::connect_and_apply`, which bootstraps an empty server.
 fn connect(socket: Option<String>) -> Result<Client<SpawnTransport>, String> {
     let transport = SpawnTransport::spawn(
         &["attach-session"],
@@ -124,6 +127,84 @@ pub fn run_list() -> i32 {
         }
         Err(e) => {
             eprintln!("phoenix list: {e}");
+            EXIT_FAIL
+        }
+    }
+}
+
+/// `file`: load that snapshot file directly (DESIGN.md §9's `restore
+/// --file`); otherwise load the store's `latest`.
+fn load_snapshot(file: Option<&str>) -> Result<Snapshot, String> {
+    let store = open_store()?;
+    match file {
+        Some(path) => store
+            .load_file(Path::new(path))
+            .map_err(|e| format!("failed to load {path:?}: {e}")),
+        None => store
+            .load_latest()
+            .map_err(|e| format!("failed to load the latest snapshot: {e}")),
+    }
+}
+
+/// `--dry-run` prints the tmux command lines that would run and executes
+/// nothing — DESIGN.md §6's safety property for a tool that can `send-keys`
+/// into live shells. A scrollback replay prints as a `#` summary: its command
+/// names a temp file that apply time creates.
+pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) -> i32 {
+    let snapshot = match load_snapshot(file.as_deref()) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("phoenix restore: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    let restore_plan = phoenix_restore::plan(&snapshot);
+
+    if dry_run {
+        // Render the whole plan before printing any of it: a plan holding an
+        // unencodable name is not a plan a human should half-see.
+        let lines: Result<Vec<String>, _> = restore_plan
+            .commands
+            .iter()
+            .map(|step| step.describe())
+            .collect();
+        return match lines {
+            Ok(lines) => {
+                lines.iter().for_each(|line| println!("{line}"));
+                EXIT_OK
+            }
+            Err(err) => {
+                eprintln!("phoenix restore: {err}");
+                EXIT_FAIL
+            }
+        };
+    }
+
+    let report = |outcome: &phoenix_restore::ApplyOutcome| {
+        println!(
+            "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
+            snapshot.sessions.len(),
+            outcome.executed,
+            outcome.skipped_move_window
+        )
+    };
+    match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan) {
+        Ok((mut client, outcome)) => {
+            client.close();
+            report(&outcome);
+            EXIT_OK
+        }
+        // The sessions exist; restore holds no client past this point, so a
+        // failed reattach costs nothing the command needed. Say so, but don't
+        // report a restore that happened as one that didn't.
+        Err(phoenix_restore::ConnectApplyError::Reattach { outcome, source }) => {
+            report(&outcome);
+            eprintln!("phoenix restore: warning: could not reattach after restoring: {source}");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("phoenix restore: {e}");
             EXIT_FAIL
         }
     }

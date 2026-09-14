@@ -16,6 +16,7 @@ version = "0.1.0"
 dependencies = [
  "phoenix-capture",
  "phoenix-core",
+ "phoenix-restore",
  "phoenix-store",
  "tmux-control",
 ]
@@ -23,6 +24,14 @@ dependencies = [
 [[package]]
 name = "phoenix-core"
 version = "0.1.0"
+
+[[package]]
+name = "phoenix-restore"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+ "tmux-control",
+]
 
 [[package]]
 name = "phoenix-store"
