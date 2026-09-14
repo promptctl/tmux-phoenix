@@ -72,6 +72,15 @@ pub enum ConnectApplyError {
         primary: Box<ConnectApplyError>,
         teardown: Box<ConnectApplyError>,
     },
+    /// The plan applied in full, so the snapshot's sessions exist on the
+    /// server, but reattaching to a restored session afterwards failed, so
+    /// there is no client to hand back. Carries the outcome because the
+    /// restore itself succeeded: reporting it as a plain failure would invite
+    /// a re-run that collides with the sessions it already created.
+    Reattach {
+        outcome: ApplyOutcome,
+        source: Box<ConnectApplyError>,
+    },
     /// The snapshot has a session named [`BOOTSTRAP_SESSION`], and the server
     /// is empty, so restoring it would need that name twice at once. Checked
     /// before anything touches the server.
@@ -91,6 +100,12 @@ impl std::fmt::Display for ConnectApplyError {
                 f,
                 "{primary}; and the {BOOTSTRAP_SESSION} session it bootstrapped is still \
                  on the server because cleanup also failed: {teardown}"
+            ),
+            ConnectApplyError::Reattach { outcome, source } => write!(
+                f,
+                "restored the snapshot ({} commands applied) but could not reattach \
+                 to it afterwards: {source}",
+                outcome.executed
             ),
             ConnectApplyError::ReservedSessionName => write!(
                 f,
@@ -284,12 +299,21 @@ fn restore_over_bootstrap(
     let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
 
     let target = snapshot.sessions.first().name().as_str().to_string();
-    let fresh = SpawnTransport::spawn(&["attach-session", "-t", &target], &spawn_options(socket))
-        .map_err(ConnectApplyError::Spawn)?;
-    client
-        .reconnect(fresh, 0)
-        .map_err(ConnectApplyError::Connect)?;
-    Ok((client, outcome))
+    let reattached =
+        SpawnTransport::spawn(&["attach-session", "-t", &target], &spawn_options(socket))
+            .map_err(ConnectApplyError::Spawn)
+            .and_then(|fresh| {
+                client
+                    .reconnect(fresh, 0)
+                    .map_err(ConnectApplyError::Connect)
+            });
+    match reattached {
+        Ok(_) => Ok((client, outcome)),
+        Err(source) => Err(ConnectApplyError::Reattach {
+            outcome,
+            source: Box::new(source),
+        }),
+    }
 }
 
 #[cfg(test)]

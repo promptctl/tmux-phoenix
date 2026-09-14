@@ -146,7 +146,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// A window's `session:index` target — one argument, not two tokens.
-fn window_target(session: &SessionName, window: WindowIndex) -> String {
+pub(crate) fn window_target(session: &SessionName, window: WindowIndex) -> String {
     format!("{}:{}", session.as_str(), window.0)
 }
 

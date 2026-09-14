@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
-use crate::command::{shell_quote, PlanStep, TmuxCommand};
+use crate::command::{shell_quote, window_target, PlanStep, TmuxCommand};
 use crate::plan::RestorePlan;
 
 #[derive(Debug)]
@@ -127,7 +127,7 @@ fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource
             lines,
         } => {
             let path = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
-            let target = format!("{}:{}", session.as_str(), window.0);
+            let target = window_target(session, *window);
             let quoted = shell_quote(&path.to_string_lossy());
             let shell_command = format!("cat {quoted}; rm -f {quoted}");
             CommandLine::new("send-keys", ["-t", &target, &shell_command, "Enter"])

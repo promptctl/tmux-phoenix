@@ -146,9 +146,10 @@ fn load_snapshot(file: Option<&str>) -> Result<Snapshot, String> {
     }
 }
 
-/// `--dry-run` prints exactly the tmux command lines that would run and
-/// executes nothing — DESIGN.md §6's safety property for a tool that can
-/// `send-keys` into live shells.
+/// `--dry-run` prints the tmux command lines that would run and executes
+/// nothing — DESIGN.md §6's safety property for a tool that can `send-keys`
+/// into live shells. A scrollback replay prints as a `#` summary: its command
+/// names a temp file that apply time creates.
 pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) -> i32 {
     let snapshot = match load_snapshot(file.as_deref()) {
         Ok(s) => s,
@@ -180,15 +181,26 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
         };
     }
 
+    let report = |outcome: &phoenix_restore::ApplyOutcome| {
+        println!(
+            "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
+            snapshot.sessions.len(),
+            outcome.executed,
+            outcome.skipped_move_window
+        )
+    };
     match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan) {
         Ok((mut client, outcome)) => {
             client.close();
-            println!(
-                "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
-                snapshot.sessions.len(),
-                outcome.executed,
-                outcome.skipped_move_window
-            );
+            report(&outcome);
+            EXIT_OK
+        }
+        // The sessions exist; restore holds no client past this point, so a
+        // failed reattach costs nothing the command needed. Say so, but don't
+        // report a restore that happened as one that didn't.
+        Err(phoenix_restore::ConnectApplyError::Reattach { outcome, source }) => {
+            report(&outcome);
+            eprintln!("phoenix restore: warning: could not reattach after restoring: {source}");
             EXIT_OK
         }
         Err(e) => {
