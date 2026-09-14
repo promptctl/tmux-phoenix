@@ -15,6 +15,7 @@ use super::Transport;
 use crate::protocol::CommandLine;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Options for spawning a tmux child process.
 #[derive(Debug, Default, Clone)]
@@ -35,18 +36,65 @@ pub struct SpawnOptions {
 /// process. Owns the child and its stdin/stdout pipes; this is the only
 /// place in the crate a process is spawned or an OS byte is read.
 pub struct SpawnTransport {
-    state: State,
+    child: ChildSlot,
+    pipes: Pipes,
 }
 
-/// `close()` moves the child out of `Open` and reaps it, so it is reaped
-/// exactly once and a closed transport holds no pipes.
-enum State {
+/// The spawned child, shared with every [`KillHandle`] this transport hands
+/// out. Emptied exactly once, by whichever of `close()`/`Drop` runs first,
+/// which is what makes a handle safe to outlive its transport: a pid can only
+/// be signalled while this slot still holds the `Child` that owns it, so
+/// "signal a pid the OS has already recycled" is unrepresentable rather than
+/// merely unlikely (`[LAW:types-are-the-program]`).
+type ChildSlot = Arc<Mutex<Option<Child>>>;
+
+/// The stdio pipes, dropped as a pair by `close()` — so a closed transport
+/// holds neither, and `send`/`read` have nothing left to lie about
+/// (`[LAW:types-are-the-program]`: "closed, but still holding a pipe" cannot
+/// be written down).
+enum Pipes {
     Open {
-        child: Child,
         stdin: ChildStdin,
         stdout: ChildStdout,
     },
     Closed,
+}
+
+/// Terminates a [`SpawnTransport`]'s child from outside the thread that holds
+/// the transport. `Send + Sync + Clone`, so it can be parked wherever a
+/// shutdown is decided.
+///
+/// This is the only shutdown path available to a caller that reads on its own
+/// thread — a daemon supervising a `tmux -C` child being the motivating one.
+/// [`Transport::read`] blocks, and interrupting it takes `&mut self`, which
+/// the blocked reader is already holding; `close()` is therefore reachable
+/// only by the one thread that cannot call it. Killing the child closes the
+/// stdout pipe, which is what returns that reader from `read()` with EOF.
+#[derive(Clone)]
+pub struct KillHandle {
+    child: ChildSlot,
+}
+
+impl KillHandle {
+    /// Signal the child to die, unblocking any read in flight. Reaping stays
+    /// the transport's job, so this returns as soon as the signal is sent
+    /// rather than waiting for the child to go. A child that has already
+    /// exited, or that its transport has already reaped, is a no-op: the
+    /// caller asked for it to be dead and it is.
+    pub fn kill(&self) {
+        if let Some(child) = lock(&self.child).as_mut() {
+            // Fails harmlessly on a child that already exited.
+            let _ = child.kill();
+        }
+    }
+}
+
+/// A poisoned slot means a thread panicked mid-kill. Recovering the guard
+/// rather than propagating is the choice that keeps the child reapable — and
+/// `[LAW:no-silent-failure]` is not bent by it, because the panic that
+/// poisoned the lock has already been raised somewhere louder than here.
+fn lock(slot: &ChildSlot) -> MutexGuard<'_, Option<Child>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// `-C` plus the socket selector plus the caller's own tmux command/args, in
@@ -97,12 +145,19 @@ impl SpawnTransport {
             .expect("child.stdout missing despite Stdio::piped()");
 
         Ok(Self {
-            state: State::Open {
-                child,
-                stdin,
-                stdout,
-            },
+            child: Arc::new(Mutex::new(Some(child))),
+            pipes: Pipes::Open { stdin, stdout },
         })
+    }
+
+    /// A handle that can terminate this transport's child from another thread.
+    /// Handing one out on a transport whose child is already reaped is not an
+    /// error — the handle's `kill` is simply a no-op, since the state it would
+    /// establish already holds.
+    pub fn kill_handle(&self) -> KillHandle {
+        KillHandle {
+            child: self.child.clone(),
+        }
     }
 }
 
@@ -112,21 +167,33 @@ fn closed_err() -> io::Error {
 
 impl Transport for SpawnTransport {
     fn send(&mut self, line: &CommandLine) -> io::Result<()> {
-        match &mut self.state {
-            State::Open { stdin, .. } => stdin.write_all(line.wire()),
-            State::Closed => Err(closed_err()),
+        match &mut self.pipes {
+            Pipes::Open { stdin, .. } => stdin.write_all(line.wire()),
+            Pipes::Closed => Err(closed_err()),
         }
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.state {
-            State::Open { stdout, .. } => stdout.read(buf),
-            State::Closed => Err(closed_err()),
+        match &mut self.pipes {
+            Pipes::Open { stdout, .. } => stdout.read(buf),
+            Pipes::Closed => Err(closed_err()),
         }
     }
 
     fn close(&mut self) {
-        if let State::Open { mut child, .. } = std::mem::replace(&mut self.state, State::Closed) {
+        self.pipes = Pipes::Closed;
+        // Taking the child is what makes this idempotent, and what a
+        // [`KillHandle`] racing us observes: one of us empties the slot, and
+        // the loser finds nothing to signal (`[LAW:single-enforcer]`).
+        //
+        // The take is its own statement so the guard dies at its semicolon:
+        // the lock covers the handoff and nothing else. Written as the
+        // scrutinee of the `if let` below, the guard would live to the closing
+        // brace and a racing handle would block through `wait()` — an extent
+        // chosen by the language's temporary-scope rule rather than by us
+        // (`[LAW:no-ambient-temporal-coupling]`).
+        let taken = lock(&self.child).take();
+        if let Some(mut child) = taken {
             // `kill()` fails harmlessly on a child that already exited; `wait()`
             // reaps it either way, which `std::process::Child` never does on drop.
             let _ = child.kill();
