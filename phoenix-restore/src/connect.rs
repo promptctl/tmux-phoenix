@@ -16,14 +16,23 @@
 //!   restored session, then kill the now-unattached bootstrap — leaving no
 //!   scaffolding behind.
 //!
-//! Both the CLI `restore` and the daemon's boot restore call this, so the
-//! bootstrap dance has exactly one implementation (`[LAW:single-enforcer]`)
-//! instead of one per caller that would drift. The three verified-live
-//! mechanics that make the empty case work — bare `tmux -C` always creates a
-//! new session so the count must be taken out-of-band first; you can't kill
-//! the session you're attached to without ending your own connection; a
-//! structure subscription only sees the attached session — are documented in
-//! `phoenix-daemon`'s `boot.rs`, the original home of this logic.
+//! Every restore entry point calls this, so the bootstrap dance has exactly
+//! one implementation (`[LAW:single-enforcer]`) instead of one per caller
+//! that would drift.
+//!
+//! **Verified live, and surprising enough to be worth recording:**
+//! - Bare `tmux -C` (no session target) never attaches to an existing
+//!   session — it unconditionally creates a new one. So the session count has
+//!   to be taken out-of-band with a plain `list-sessions` ([`count_sessions`])
+//!   before any control-mode connection opens.
+//! - Killing the session a control-mode client is attached to ends that
+//!   client's connection (`%exit`). So the bootstrap session can't be torn
+//!   down from the connection attached to it; this reconnects onto a real
+//!   restored session first, then kills the bootstrap from outside.
+//! - A structure subscription observes only the attached session's windows,
+//!   not the whole server — so reconnecting onto a real restored session,
+//!   rather than leaving the client parked on the bootstrap, matters for any
+//!   caller that keeps the client, not just for cleanliness.
 
 use std::process::Command;
 
@@ -34,8 +43,8 @@ use crate::apply::{apply, ApplyError, ApplyOutcome};
 use crate::plan::RestorePlan;
 
 /// The throwaway session name used to give control mode something to attach
-/// to on an otherwise-empty server. Exported so `phoenix-daemon`'s other boot
-/// branches name the same session (`[LAW:one-source-of-truth]`).
+/// to on an otherwise-empty server. Exported so every caller that reasons
+/// about the bootstrap names the same session (`[LAW:one-source-of-truth]`).
 pub const BOOTSTRAP_SESSION: &str = "phoenix-boot";
 
 #[derive(Debug)]
@@ -98,8 +107,7 @@ fn spawn_options(socket: Option<String>) -> SpawnOptions {
 /// effect, so it can't be used for this check). `0` covers both "server isn't
 /// running" and "running with no sessions" identically — exactly the cases
 /// that need bootstrapping — so callers never have to tell them apart. The one
-/// implementation of this query (`[LAW:one-source-of-truth]`), shared with
-/// `phoenix-daemon`'s boot decision.
+/// implementation of this query (`[LAW:one-source-of-truth]`).
 pub fn count_sessions(socket: Option<&str>) -> usize {
     let mut cmd = Command::new("tmux");
     cmd.args(socket_args(socket));

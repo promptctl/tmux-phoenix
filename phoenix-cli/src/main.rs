@@ -20,7 +20,9 @@ list: one saved generation per line on stdout, tab-separated
 restore: rebuilds the latest (or --file) snapshot into new tmux sessions,
 each pane back at its captured working directory and running the program it
 was running. A pane that was idle at its shell comes back as an idle shell.
---dry-run prints the exact tmux commands that would run without running them.";
+--dry-run prints the tmux commands that would run without running them. A pane's
+scrollback replay prints as a `#` summary line: its command names a temp file
+that only exists once restore actually runs.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
