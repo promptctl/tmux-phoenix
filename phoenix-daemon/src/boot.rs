@@ -47,6 +47,14 @@ impl std::error::Error for BootError {}
 ///
 /// `on_notification` becomes the returned client's notification sink.
 /// `on_log` receives one line saying which branch was taken.
+///
+/// The session count is a snapshot of a server nothing locks: a session the
+/// user starts after it is taken can still be on the server when the restore
+/// runs. No number of re-checks closes that window, and none is needed to
+/// keep the promise that matters: restore only ever adds sessions, never
+/// kills or rewrites one it did not create, and a snapshot session whose name
+/// is already taken fails the restore loudly rather than touching the live
+/// one.
 pub fn connect_and_boot(
     socket: Option<String>,
     store: &Store,
