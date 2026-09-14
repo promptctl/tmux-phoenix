@@ -1,7 +1,29 @@
 //! Pure argument parsing (DESIGN.md §9) — no I/O, testable without a tmux
-//! server. Hand-rolled: the surface is three subcommands and a few flags.
+//! server. Hand-rolled: the surface is five subcommands and a few flags.
 
 pub const DEFAULT_KEEP_GENERATIONS: usize = 10;
+pub const DEFAULT_DEBOUNCE_SECS: u64 = 10;
+pub const DEFAULT_MAX_INTERVAL_SECS: u64 = 300;
+
+/// What `phoenix daemon` runs with. `install` takes the same flags and
+/// writes them into the service it generates, so the two can't disagree on
+/// what a flag means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonSettings {
+    pub keep: usize,
+    pub debounce_secs: u64,
+    pub max_interval_secs: u64,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            keep: DEFAULT_KEEP_GENERATIONS,
+            debounce_secs: DEFAULT_DEBOUNCE_SECS,
+            max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -14,6 +36,15 @@ pub enum Command {
         dry_run: bool,
         file: Option<String>,
         socket: Option<String>,
+    },
+    Daemon {
+        settings: DaemonSettings,
+        socket: Option<String>,
+    },
+    /// No socket: the installed service runs `phoenix daemon` against the
+    /// default server, the one a login session uses.
+    Install {
+        settings: DaemonSettings,
     },
     Help,
 }
@@ -28,9 +59,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             Ok(Command::List)
         }
         Some("restore") => parse_restore(&args[1..]),
+        Some("daemon") => parse_daemon(&args[1..]),
+        Some("install") => parse_install(&args[1..]),
         Some("--help") | Some("-h") | None => Ok(Command::Help),
         Some(other) => Err(format!(
-            "unknown subcommand {other:?} (try \"save\", \"list\" or \"restore\")"
+            "unknown subcommand {other:?} (try \"save\", \"list\", \"restore\", \"daemon\" or \"install\")"
         )),
     }
 }
@@ -84,6 +117,64 @@ fn parse_restore(args: &[String]) -> Result<Command, String> {
         file,
         socket,
     })
+}
+
+/// The value after the flag at `args[*i]`, parsed; advances `*i` onto it.
+fn flag_value<T: std::str::FromStr>(args: &[String], i: &mut usize) -> Result<T, String> {
+    let flag = &args[*i];
+    *i += 1;
+    let value = args.get(*i).ok_or(format!("{flag} requires a value"))?;
+    value
+        .parse()
+        .map_err(|_| format!("{flag}: {value:?} is not a non-negative integer"))
+}
+
+/// Consumes `args[*i]` into `settings` when it is one of the
+/// [`DaemonSettings`] flags; `Ok(false)` leaves any other argument to the
+/// caller.
+fn take_setting(
+    settings: &mut DaemonSettings,
+    args: &[String],
+    i: &mut usize,
+) -> Result<bool, String> {
+    match args[*i].as_str() {
+        "--keep" => settings.keep = flag_value(args, i)?,
+        "--debounce" => settings.debounce_secs = flag_value(args, i)?,
+        "--max-interval" => settings.max_interval_secs = flag_value(args, i)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_daemon(args: &[String]) -> Result<Command, String> {
+    let mut settings = DaemonSettings::default();
+    let mut socket = None;
+    let mut i = 0;
+    while i < args.len() {
+        if !take_setting(&mut settings, args, &mut i)? {
+            match args[i].as_str() {
+                "--socket" => {
+                    i += 1;
+                    socket = Some(args.get(i).ok_or("--socket requires a value")?.clone());
+                }
+                other => return Err(format!("daemon: unknown argument {other:?}")),
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::Daemon { settings, socket })
+}
+
+fn parse_install(args: &[String]) -> Result<Command, String> {
+    let mut settings = DaemonSettings::default();
+    let mut i = 0;
+    while i < args.len() {
+        if !take_setting(&mut settings, args, &mut i)? {
+            return Err(format!("install: unknown argument {:?}", args[i]));
+        }
+        i += 1;
+    }
+    Ok(Command::Install { settings })
 }
 
 #[cfg(test)]
@@ -198,5 +289,69 @@ mod tests {
     #[test]
     fn restore_rejects_unknown_flags() {
         assert!(parse_args(&args(&["restore", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn bare_daemon_uses_defaults() {
+        assert_eq!(
+            parse_args(&args(&["daemon"])).unwrap(),
+            Command::Daemon {
+                settings: DaemonSettings::default(),
+                socket: None,
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_with_all_flags() {
+        assert_eq!(
+            parse_args(&args(&[
+                "daemon",
+                "--keep",
+                "3",
+                "--debounce",
+                "5",
+                "--max-interval",
+                "120",
+                "--socket",
+                "/tmp/s"
+            ]))
+            .unwrap(),
+            Command::Daemon {
+                settings: DaemonSettings {
+                    keep: 3,
+                    debounce_secs: 5,
+                    max_interval_secs: 120,
+                },
+                socket: Some("/tmp/s".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_unknown_flags_dangling_values_and_non_numbers() {
+        assert!(parse_args(&args(&["daemon", "--nope"])).is_err());
+        assert!(parse_args(&args(&["daemon", "--debounce"])).is_err());
+        assert!(parse_args(&args(&["daemon", "--max-interval", "soon"])).is_err());
+    }
+
+    #[test]
+    fn install_takes_the_daemon_settings() {
+        assert_eq!(
+            parse_args(&args(&["install", "--keep", "3", "--debounce", "5"])).unwrap(),
+            Command::Install {
+                settings: DaemonSettings {
+                    keep: 3,
+                    debounce_secs: 5,
+                    max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn install_rejects_a_socket_flag_and_unknown_flags() {
+        assert!(parse_args(&args(&["install", "--socket", "/tmp/s"])).is_err());
+        assert!(parse_args(&args(&["install", "--nope"])).is_err());
     }
 }
