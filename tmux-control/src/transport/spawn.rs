@@ -185,7 +185,15 @@ impl Transport for SpawnTransport {
         // Taking the child is what makes this idempotent, and what a
         // [`KillHandle`] racing us observes: one of us empties the slot, and
         // the loser finds nothing to signal (`[LAW:single-enforcer]`).
-        if let Some(mut child) = lock(&self.child).take() {
+        //
+        // The take is its own statement so the guard dies at its semicolon:
+        // the lock covers the handoff and nothing else. Written as the
+        // scrutinee of the `if let` below, the guard would live to the closing
+        // brace and a racing handle would block through `wait()` — an extent
+        // chosen by the language's temporary-scope rule rather than by us
+        // (`[LAW:no-ambient-temporal-coupling]`).
+        let taken = lock(&self.child).take();
+        if let Some(mut child) = taken {
             // `kill()` fails harmlessly on a child that already exited; `wait()`
             // reaps it either way, which `std::process::Child` never does on drop.
             let _ = child.kill();
