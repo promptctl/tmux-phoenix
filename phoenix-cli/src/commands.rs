@@ -14,6 +14,11 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_DEGRADED: i32 = 3;
 pub const EXIT_FAIL: i32 = 1;
 
+/// How long `save` waits for a concurrent save (typically the daemon's) to
+/// finish before failing: one save is an encode and a few fsyncs, so this is
+/// generous for one in flight, and short enough for a person at a prompt.
+const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Bare `attach-session` (no `-t`) attaches to the server's most recently
 /// used session, which `save` can rely on existing: it reads a live server
 /// the user is looking at. `restore` cannot rely on that, so it goes through
@@ -80,7 +85,7 @@ pub fn run_save(keep: usize, socket: Option<String>) -> i32 {
         }
     };
 
-    let outcome = match store.save(&snapshot, keep) {
+    let outcome = match store.save(&snapshot, keep, SAVE_WAIT) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("phoenix save: failed to write snapshot: {e}");
