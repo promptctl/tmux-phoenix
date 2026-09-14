@@ -1,0 +1,176 @@
+//! End-to-end tests: the actual compiled `phoenix` binary, run as a
+//! subprocess against a real isolated tmux server and a throwaway
+//! `XDG_DATA_HOME`, exercising exactly what a real invocation would.
+
+mod support;
+use support::IsolatedTmux;
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TestDataDir(PathBuf);
+
+impl TestDataDir {
+    fn new(name: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "phoenix-cli-test-{name}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        Self(path)
+    }
+}
+
+impl Drop for TestDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn phoenix_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_phoenix")
+}
+
+#[test]
+fn save_then_list_round_trips_through_the_real_binary() {
+    let harness = IsolatedTmux::new("cli-save-list");
+    let data_dir = TestDataDir::new("save-list");
+
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+
+    assert!(
+        save.status.success(),
+        "phoenix save failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&save.stdout),
+        String::from_utf8_lossy(&save.stderr)
+    );
+    let saved_path = String::from_utf8(save.stdout).unwrap().trim().to_string();
+    assert!(
+        std::path::Path::new(&saved_path).exists(),
+        "phoenix save printed a path that doesn't exist: {saved_path}"
+    );
+
+    let list = Command::new(phoenix_bin())
+        .args(["list"])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix list");
+
+    assert!(list.status.success());
+    let stdout = String::from_utf8(list.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one generation, got: {stdout:?}"
+    );
+    let fields: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(
+        fields.len(),
+        3,
+        "expected captured_at\\tformat_version\\tpath"
+    );
+    assert_eq!(fields[2], saved_path);
+
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    let loaded = store
+        .load_latest()
+        .expect("saved snapshot should load back");
+    assert_eq!(loaded.sessions.first().name().as_str(), harness.session);
+}
+
+#[test]
+fn save_exit_code_is_zero_when_a_pane_is_idle() {
+    let harness = IsolatedTmux::new("cli-exit-code");
+    let data_dir = TestDataDir::new("exit-code");
+
+    // Give the shell a moment to settle at its prompt so argv recovery
+    // reliably finds it as the foreground process.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+
+    assert_eq!(
+        save.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+}
+
+#[test]
+fn list_before_any_save_succeeds_with_empty_output() {
+    let data_dir = TestDataDir::new("empty-list");
+
+    let list = Command::new(phoenix_bin())
+        .args(["list"])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix list");
+
+    assert!(list.status.success());
+    assert!(String::from_utf8(list.stdout).unwrap().is_empty());
+}
+
+#[test]
+fn save_respects_the_keep_flag() {
+    let harness = IsolatedTmux::new("cli-keep");
+    let data_dir = TestDataDir::new("keep");
+
+    for _ in 0..3 {
+        let save = Command::new(phoenix_bin())
+            .args(["save", "--socket", &harness.socket, "--keep", "1"])
+            .env("XDG_DATA_HOME", &data_dir.0)
+            .output()
+            .expect("failed to run phoenix save");
+        assert!(save.status.success());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    let list = Command::new(phoenix_bin())
+        .args(["list"])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix list");
+    let stdout = String::from_utf8(list.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "expected --keep 1 to prune down to one generation"
+    );
+}
+
+#[test]
+fn help_exits_zero_and_prints_usage() {
+    let output = Command::new(phoenix_bin())
+        .args(["--help"])
+        .output()
+        .expect("failed to run phoenix --help");
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("USAGE"));
+}
+
+#[test]
+fn unknown_subcommand_exits_nonzero() {
+    let output = Command::new(phoenix_bin())
+        .args(["bogus"])
+        .output()
+        .expect("failed to run phoenix bogus");
+    assert!(!output.status.success());
+}

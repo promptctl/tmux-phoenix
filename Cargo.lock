@@ -3,8 +3,33 @@
 version = 4
 
 [[package]]
+name = "phoenix-capture"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+ "tmux-control",
+]
+
+[[package]]
+name = "phoenix-cli"
+version = "0.1.0"
+dependencies = [
+ "phoenix-capture",
+ "phoenix-core",
+ "phoenix-store",
+ "tmux-control",
+]
+
+[[package]]
 name = "phoenix-core"
 version = "0.1.0"
+
+[[package]]
+name = "phoenix-store"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+]
 
 [[package]]
 name = "tmux-control"

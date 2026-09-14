@@ -1,0 +1,8 @@
+[package]
+name = "phoenix-store"
+version = "0.1.0"
+edition.workspace = true
+description = "Atomic, versioned, generational persistence for phoenix-core Snapshots"
+
+[dependencies]
+phoenix-core = { path = "../phoenix-core" }
