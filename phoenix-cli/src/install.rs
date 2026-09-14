@@ -9,6 +9,11 @@ use crate::cli::DaemonSettings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPlan {
+    /// Every directory the installed service needs, created before the file
+    /// is written: the file's own directory, plus any directory the
+    /// definition names for the supervisor to write into (launchd opens its
+    /// log paths without creating their parents).
+    pub directories: Vec<PathBuf>,
     pub file_path: PathBuf,
     pub contents: String,
     /// The shell command the user runs to activate the service —
@@ -100,6 +105,7 @@ pub fn launchd_plan(exe: &Path, home: &Path, settings: DaemonSettings) -> Instal
         shell_quote(&file_path.display().to_string())
     );
     InstallPlan {
+        directories: vec![home.join("Library/LaunchAgents"), log_dir],
         file_path,
         contents,
         enable_hint,
@@ -107,9 +113,8 @@ pub fn launchd_plan(exe: &Path, home: &Path, settings: DaemonSettings) -> Instal
 }
 
 pub fn systemd_plan(exe: &Path, home: &Path, settings: DaemonSettings) -> InstallPlan {
-    let file_path = home
-        .join(".config/systemd/user")
-        .join("tmux-phoenix.service");
+    let unit_dir = home.join(".config/systemd/user");
+    let file_path = unit_dir.join("tmux-phoenix.service");
 
     let exec_start = std::iter::once(exe.display().to_string())
         .chain(daemon_args(settings))
@@ -130,6 +135,7 @@ pub fn systemd_plan(exe: &Path, home: &Path, settings: DaemonSettings) -> Instal
     );
 
     InstallPlan {
+        directories: vec![unit_dir],
         file_path,
         contents,
         enable_hint: "systemctl --user enable --now tmux-phoenix.service".to_string(),
@@ -152,8 +158,8 @@ pub fn plan_for_this_platform(
 }
 
 pub fn write(plan: &InstallPlan) -> std::io::Result<()> {
-    if let Some(parent) = plan.file_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    for dir in &plan.directories {
+        std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&plan.file_path, &plan.contents)
 }
@@ -188,6 +194,22 @@ mod tests {
         assert!(plan.contents.contains("<string>15</string>"));
         assert!(plan.contents.contains("<string>600</string>"));
         assert!(plan.enable_hint.starts_with("launchctl bootstrap gui/"));
+    }
+
+    #[test]
+    fn every_plan_creates_its_files_directory_and_launchd_also_its_log_directory() {
+        let home = Path::new("/Users/test");
+        let launchd = launchd_plan(Path::new("/bin/phoenix"), home, settings());
+        assert!(launchd
+            .directories
+            .contains(&launchd.file_path.parent().unwrap().to_path_buf()));
+        assert!(launchd.directories.contains(&home.join("Library/Logs")));
+
+        let systemd = systemd_plan(Path::new("/bin/phoenix"), home, settings());
+        assert_eq!(
+            systemd.directories,
+            vec![systemd.file_path.parent().unwrap().to_path_buf()]
+        );
     }
 
     #[test]
@@ -233,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn write_creates_parent_directories_and_the_file() {
+    fn write_creates_every_listed_directory_and_the_file() {
         let dir = std::env::temp_dir().join(format!(
             "phoenix-install-test-{}-{}",
             std::process::id(),
@@ -243,12 +265,17 @@ mod tests {
                 .as_nanos()
         ));
         let plan = InstallPlan {
+            directories: vec![dir.join("nested"), dir.join("logs/deeper")],
             file_path: dir.join("nested/tmux-phoenix.service"),
             contents: "hello".to_string(),
             enable_hint: String::new(),
         };
         write(&plan).unwrap();
         assert_eq!(std::fs::read_to_string(&plan.file_path).unwrap(), "hello");
+        assert!(
+            dir.join("logs/deeper").is_dir(),
+            "every listed directory is created"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
