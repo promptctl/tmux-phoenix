@@ -1,10 +1,12 @@
-//! A UTF-8-checked path, standing in for `camino::Utf8PathBuf` (DESIGN.md
-//! §4). This environment has no network access to fetch external crates
-//! (confirmed: `cargo add` against crates.io times out), so this crate is
-//! std-only like `tmux-control` — see [`crate::time::OffsetDateTime`] for the
-//! same story. tmux's control-mode wire protocol is line-oriented text, so a
-//! checked-UTF-8 path is the right domain type regardless of which crate
-//! provides it.
+//! A pane's working directory as tmux reports it (DESIGN.md §4).
+//!
+//! tmux reports `pane_current_path` as the empty string when it cannot read
+//! the foreground process's working directory (`top` on macOS does this), so
+//! "" is an absence, not a path: [`Utf8PathBuf::parse`] refuses it once at
+//! the boundary and a `Pane` carries `Option<Utf8PathBuf>`
+//! (`[LAW:parse-dont-validate]`). A `String` rather than `PathBuf` because
+//! the value crosses tmux's UTF-8 wire both ways and never touches the
+//! filesystem from this crate.
 
 use std::fmt;
 
@@ -12,24 +14,18 @@ use std::fmt;
 pub struct Utf8PathBuf(String);
 
 impl Utf8PathBuf {
-    pub fn new(path: impl Into<String>) -> Self {
-        Self(path.into())
+    /// `None` for the empty string, which is tmux's "unknown".
+    pub fn parse(path: impl Into<String>) -> Option<Self> {
+        let path = path.into();
+        if path.is_empty() {
+            None
+        } else {
+            Some(Self(path))
+        }
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl From<String> for Utf8PathBuf {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for Utf8PathBuf {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
     }
 }
 
@@ -44,22 +40,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_through_as_str() {
-        let p = Utf8PathBuf::new("/home/user/project");
+    fn parse_rejects_the_empty_string() {
+        assert_eq!(Utf8PathBuf::parse(""), None);
+    }
+
+    #[test]
+    fn round_trips_through_as_str_and_display() {
+        let p = Utf8PathBuf::parse("/home/user/project").unwrap();
         assert_eq!(p.as_str(), "/home/user/project");
-    }
-
-    #[test]
-    fn from_str_and_string_agree() {
-        assert_eq!(
-            Utf8PathBuf::from("/tmp"),
-            Utf8PathBuf::from("/tmp".to_string())
-        );
-    }
-
-    #[test]
-    fn display_matches_as_str() {
-        let p = Utf8PathBuf::new("/a/b");
-        assert_eq!(p.to_string(), "/a/b");
+        assert_eq!(p.to_string(), "/home/user/project");
     }
 }

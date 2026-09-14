@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-cli"
+version = "0.1.0"
+edition.workspace = true
+description = "phoenix: the tmux-phoenix command-line tool"
+
+[[bin]]
+name = "phoenix"
+path = "src/main.rs"
+
+[dependencies]
+phoenix-capture = { path = "../phoenix-capture" }
+phoenix-core = { path = "../phoenix-core" }
+phoenix-store = { path = "../phoenix-store" }
+tmux-control = { path = "../tmux-control" }

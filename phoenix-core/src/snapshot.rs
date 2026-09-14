@@ -84,7 +84,8 @@ impl std::error::Error for SnapshotError {}
 pub struct Pane {
     pub id: PaneId,
     pub index: PaneIndex,
-    pub cwd: Utf8PathBuf,
+    /// `None` when tmux could not read the foreground process's cwd.
+    pub cwd: Option<Utf8PathBuf>,
     pub program: CapturedProgram,
     pub content: Option<PaneContent>,
 }
@@ -234,7 +235,7 @@ mod tests {
         Pane {
             id: PaneId(index),
             index: PaneIndex(index),
-            cwd: Utf8PathBuf::new("/home/user"),
+            cwd: Utf8PathBuf::parse("/home/user"),
             program: CapturedProgram {
                 command: ProgramName::parse("zsh").unwrap(),
                 argv: None,
