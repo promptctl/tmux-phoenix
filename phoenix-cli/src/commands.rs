@@ -189,7 +189,7 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
             outcome.skipped_move_window
         )
     };
-    match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan) {
+    match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan, drop) {
         Ok((mut client, outcome)) => {
             client.close();
             report(&outcome);
@@ -205,6 +205,84 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
         }
         Err(e) => {
             eprintln!("phoenix restore: {e}");
+            EXIT_FAIL
+        }
+    }
+}
+
+/// Runs in the foreground (DESIGN.md §8: "`phoenix daemon` runs it
+/// foreground for debugging"); the service `install` writes runs this same
+/// subcommand. Returns only if the store can't be opened:
+/// `phoenix_daemon::run_resilient` reconnects, boot restore included, for as
+/// long as the process lives, and reports every failure on stderr.
+pub fn run_daemon(settings: crate::cli::DaemonSettings, socket: Option<String>) -> i32 {
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("phoenix daemon: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    let config = phoenix_daemon::RunConfig {
+        policy: phoenix_daemon::DebouncePolicy {
+            debounce: std::time::Duration::from_secs(settings.debounce_secs),
+            max_interval: std::time::Duration::from_secs(settings.max_interval_secs),
+        },
+        poll_interval: std::time::Duration::from_secs(1),
+        reconnect_interval: std::time::Duration::from_secs(5),
+        keep_generations: settings.keep,
+    };
+
+    phoenix_daemon::run_resilient(
+        socket,
+        &store,
+        &config,
+        |line| eprintln!("phoenix daemon: {line}"),
+        || true,
+    );
+
+    EXIT_OK
+}
+
+/// Writes a launchd/systemd service definition and prints the command to
+/// activate it — never runs that command itself: starting a persistent,
+/// reboot-surviving background process is the user's call, not a side effect
+/// of writing a config file.
+pub fn run_install(settings: crate::cli::DaemonSettings) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("phoenix install: couldn't determine this binary's path: {e}");
+            return EXIT_FAIL;
+        }
+    };
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => {
+            eprintln!("phoenix install: HOME is not set");
+            return EXIT_FAIL;
+        }
+    };
+
+    let Some(plan) = crate::install::plan_for_this_platform(&exe, &home, settings) else {
+        eprintln!(
+            "phoenix install: unsupported platform (only macOS launchd and Linux systemd --user are supported)"
+        );
+        return EXIT_FAIL;
+    };
+
+    match crate::install::write(&plan) {
+        Ok(()) => {
+            println!("wrote {}", plan.file_path.display());
+            println!("to enable now: {}", plan.enable_hint);
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!(
+                "phoenix install: failed to write {}: {e}",
+                plan.file_path.display()
+            );
             EXIT_FAIL
         }
     }

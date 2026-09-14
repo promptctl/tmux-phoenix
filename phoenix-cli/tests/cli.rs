@@ -44,6 +44,7 @@ fn save_then_list_round_trips_through_the_real_binary() {
     let harness = IsolatedTmux::new("cli-save-list");
     let data_dir = TestDataDir::new("save-list");
 
+    harness.wait_until_settled();
     let save = Command::new(phoenix_bin())
         .args(["save", "--socket", &harness.socket])
         .env("XDG_DATA_HOME", &data_dir.0)
@@ -96,10 +97,7 @@ fn save_exit_code_is_zero_when_a_pane_is_idle() {
     let harness = IsolatedTmux::new("cli-exit-code");
     let data_dir = TestDataDir::new("exit-code");
 
-    // Give the shell a moment to settle at its prompt so argv recovery
-    // reliably finds it as the foreground process.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
+    harness.wait_until_settled();
     let save = Command::new(phoenix_bin())
         .args(["save", "--socket", &harness.socket])
         .env("XDG_DATA_HOME", &data_dir.0)
@@ -134,6 +132,7 @@ fn save_respects_the_keep_flag() {
     let data_dir = TestDataDir::new("keep");
 
     for _ in 0..3 {
+        harness.wait_until_settled();
         let save = Command::new(phoenix_bin())
             .args(["save", "--socket", &harness.socket, "--keep", "1"])
             .env("XDG_DATA_HOME", &data_dir.0)
@@ -180,6 +179,7 @@ fn restore_dry_run_prints_commands_and_touches_nothing() {
     let harness = IsolatedTmux::new("cli-restore-dry-run");
     let data_dir = TestDataDir::new("restore-dry-run");
 
+    harness.wait_until_settled();
     let save = Command::new(phoenix_bin())
         .args(["save", "--socket", &harness.socket])
         .env("XDG_DATA_HOME", &data_dir.0)
@@ -235,6 +235,7 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         .expect("failed to split-window");
     assert!(status.success());
 
+    harness.wait_until_settled();
     let save = Command::new(phoenix_bin())
         .args(["save", "--socket", &harness.socket])
         .env("XDG_DATA_HOME", &data_dir.0)
@@ -331,6 +332,7 @@ fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
         .expect("failed to split-window");
     assert!(status.success());
 
+    source.wait_until_settled();
     let save = Command::new(phoenix_bin())
         .args(["save", "--socket", &source.socket])
         .env("XDG_DATA_HOME", &data_dir.0)
@@ -415,4 +417,59 @@ fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
             .status();
     }
     let _ = std::fs::remove_file(&target_socket);
+}
+
+#[test]
+fn daemon_saves_after_a_structural_change_through_the_real_binary() {
+    let harness = IsolatedTmux::new("cli-daemon");
+    let data_dir = TestDataDir::new("daemon");
+
+    let mut child = Command::new(phoenix_bin())
+        .args([
+            "daemon",
+            "--socket",
+            &harness.socket,
+            "--debounce",
+            "1",
+            "--max-interval",
+            "3600",
+        ])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .spawn()
+        .expect("failed to spawn phoenix daemon");
+
+    // Give the daemon a moment to connect, set no-output, and subscribe
+    // before making a structural change for it to notice.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let status = Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "split-window",
+            "-t",
+            &harness.session,
+        ])
+        .status()
+        .expect("failed to split-window");
+    assert!(status.success());
+
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    let mut saved = None;
+    for _ in 0..50 {
+        if let Ok(s) = store.load_latest() {
+            saved = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let saved = saved.expect("expected the daemon to have saved after the debounce settled");
+    assert_eq!(
+        saved.sessions.first().active_window().panes().len(),
+        2,
+        "the save should reflect the split that triggered it"
+    );
 }

@@ -2,13 +2,9 @@
 
 A single Rust binary that captures the full state of a running tmux server — every session, window and pane, their layout, working directories and optionally their scrollback — persists it, and rebuilds it later. It is a replacement for the [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) + [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) pair, built around one persistent tmux control-mode connection instead of shell scripts that `fork`/`exec` tmux once per pane.
 
-## Status: you cannot use this yet
+## Status: builds from source, not released
 
-Nothing is released. There is no published crate, no binary to download, and no install command — if you came here looking for a tmux-resurrect alternative you can run today, use tmux-resurrect and tmux-continuum; come back later.
-
-What is on GitHub right now is the design document, the license, and one open pull request carrying the first code slice (the control-mode codec and transport). The rest of the implementation is written and tested but unmerged, waiting behind that review. No dates are promised here because none are known.
-
-Read on if you want to evaluate the approach, follow the work, or contribute to it.
+Nothing is released: there is no published crate and no binary to download. Everything described below is on `main` and builds from source (see Building), with its tests passing against a live tmux server. It has not had long-term daily use yet, and it does not match tmux-resurrect feature for feature; the next section but one lists what is missing. If you need those behaviors today, keep using tmux-resurrect and tmux-continuum.
 
 ## What it does differently
 
@@ -30,7 +26,7 @@ These are documented tmux-resurrect/continuum behaviors that tmux-phoenix does n
 
 ## Design
 
-[`DESIGN.md`](DESIGN.md) is the engineering spec and the place to argue with the approach: the wire protocol, the crate boundaries, the on-disk format, and the reasoning behind each. It is on `main` and readable now. The product-level view above it — the full parity table both sections above are drawn from, and the roadmap past parity — lives in `design-docs/PROJECT-GOALS.md`, which arrives with the slice that introduces it.
+[`DESIGN.md`](DESIGN.md) is the engineering spec and the place to argue with the approach: the wire protocol, the crate boundaries, the on-disk format, and the reasoning behind each. It is on `main` and readable now. The product-level view above it — the full parity table both sections above are drawn from, and the roadmap past parity — lives in [`design-docs/PROJECT-GOALS.md`](design-docs/PROJECT-GOALS.md).
 
 The three stated priorities, in order, are stability, speed, and the efficiency that underwrites both; DESIGN.md §1 tabulates what each one rules out. Two consequences shape most of the code. The protocol codec is pure, total and panic-free, with an `Unknown` arm that absorbs anything unrecognized, so a malformed line degrades to data instead of crashing the daemon (§3.1). And a save is written to a temp file and `rename(2)`d into place, so a crash mid-save leaves the last good snapshot untouched (§7).
 
@@ -53,13 +49,15 @@ tmux-control      phoenix-core
 - **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
 - **`phoenix-cli`** — maps command lines onto the crates beneath it; builds the `phoenix` binary.
 
-## Where the work happens
+## Building and running
 
-`main` holds the design document and the license; there is no code on it yet. The implementation is split into a chain of review slices on `slice/*` branches that merge into `main` one at a time, and each becomes visible here when it is pushed for review — so far that is `slice/02-protocol-codec`, the `tmux-control` codec and transport, open as PR #2. The later slices exist but are not pushed yet, which is why the crates listed above are not all browsable on GitHub today.
+`cargo build --release` at the repository root builds the `phoenix` binary into `target/release/`. Every crate depends only on its siblings by path, so there is nothing to fetch from crates.io. `cargo test --workspace` runs the tests; many of them start their own isolated tmux servers, so tmux must be installed, and they never touch your running sessions.
 
-## Building
+- `phoenix save` captures the current server's structure and prints where it saved it; `phoenix list` shows saved generations.
+- `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it, onto a running server or one with no sessions.
+- `phoenix daemon` saves on structural change and restores the latest snapshot when it starts against a server with no sessions. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
 
-There is nothing to build on `main`. On a slice branch that carries the workspace, `cargo build` and `cargo test` at the repository root build the workspace and run its tests; every crate depends only on its siblings by path, so there is nothing to fetch from crates.io.
+`phoenix --help` lists every flag.
 
 ## License
 

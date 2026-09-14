@@ -23,10 +23,39 @@ fn connect(harness: &IsolatedTmux) -> Client<SpawnTransport> {
     Client::connect(transport, drop, |_, _| {}).expect("handshake failed against real tmux")
 }
 
+/// Blocks until the pane's dirty indicator holds still across consecutive
+/// reads. A fresh shell is still drawing its prompt when the session
+/// appears, and under load that output can land between two captures,
+/// moving the indicator the reuse assertion depends on.
+fn wait_for_quiet_pane(client: &mut Client<SpawnTransport>, target: &str) {
+    let indicator = |client: &mut Client<SpawnTransport>| {
+        client
+            .execute(&line(
+                "display-message",
+                ["-p", "-t", target, "#{history_size} #{history_bytes}"],
+            ))
+            .expect("display-message failed")
+            .lines
+    };
+    let mut last = indicator(client);
+    let mut stable_reads = 0;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = indicator(client);
+        stable_reads = if now == last { stable_reads + 1 } else { 0 };
+        if stable_reads == 3 {
+            return;
+        }
+        last = now;
+    }
+    panic!("pane {target} kept producing output for 5s");
+}
+
 #[test]
 fn unchanged_pane_reuses_previous_scrollback_and_changed_pane_re_captures() {
     let harness = IsolatedTmux::new("content-dirty-tracking");
     let mut client = connect(&harness);
+    wait_for_quiet_pane(&mut client, &harness.session);
 
     // First capture: no previous state at all, so the one pane is dirty by
     // definition (never seen before) and gets a real capture-pane pull.

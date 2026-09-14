@@ -236,8 +236,9 @@ struct Snapshot { format_version: FormatVersion, tmux_version: TmuxVersion,
 struct Session { name: SessionName, windows: NonEmpty<Window>, active: WindowIndex }
 struct Window  { index: WindowIndex, name: WindowName, layout: Layout,
                  panes: NonEmpty<Pane>, active: PaneIndex }
-struct Pane    { index: PaneIndex, cwd: Utf8PathBuf,
+struct Pane    { id: PaneId, index: PaneIndex, cwd: Option<Utf8PathBuf>,
                  program: CapturedProgram, content: Option<PaneContent> }
+struct CapturedProgram { command: ProgramName, argv: Option<NonEmpty<String>> }
 ```
 
 - `NonEmpty<T>` wherever a persisted snapshot needs ≥1, so restore never branches
@@ -245,9 +246,23 @@ struct Pane    { index: PaneIndex, cwd: Utf8PathBuf,
   it for windows and panes; for sessions, capture enforces it (§5).
 - A single `active: WindowIndex` that must resolve to a member — not a per-child
   `bool` that could encode two-active-or-none (`[LAW:one-source-of-truth]`,
-  validated at parse time).
+  validated at parse time). `active` is private on `Session`/`Window` behind a
+  validating `new()`, which also refuses duplicate indices, so no caller can swap in
+  an index that doesn't resolve.
+- Absence is a type, not a sentinel. tmux reports a working directory it can't read
+  as the empty string, which `Utf8PathBuf::parse` refuses, so the pane records `None`;
+  a pane whose foreground argv `ps` couldn't recover has `argv: None`. Either one
+  marks the save degraded (§9).
+- `id` is tmux's own pane id, stable across saves while the pane lives. It correlates
+  a pane with its previous capture for content dirty-tracking (§5); `index` is
+  window-relative and shifts when a sibling pane opens or closes.
 - Every type here is phoenix-core's own (`Layout` included, not `tmux-control`'s), so
   the crate depends on nothing; capture's fold parses tmux's strings into them.
+
+**Implementation note:** the workspace uses no external crates, so `phoenix-core` is
+std-only, like `tmux-control`. `OffsetDateTime` and `Utf8PathBuf` above are std-only
+stand-ins for the `time` and `camino` types of the same name, written because the
+environment the crates were built in could not reach crates.io.
 
 ---
 
@@ -268,21 +283,80 @@ is best-effort per pane: an unresponsive pane degrades *that* pane's content to 
 with a recorded warning and marks the save `degraded` — never nukes the snapshot, never
 pretends (`[LAW:no-silent-failure]`).
 
+**Content capture (verified live):** `#{history_size}`/`#{history_bytes}` are stable
+while a pane is idle and move on any output, so one `list-panes -a -F` pull of
+`#{pane_id} #{history_size} #{history_bytes}` is the free per-save dirty indicator. A
+pane whose indicator matches what the previous capture recorded reuses that scrollback
+unchanged; every other pane, including one never seen before, gets a fresh
+`capture-pane -p -e -S -`. The small visible screen (`capture-pane -p -e`, no `-S`) is
+always re-pulled, since an alt-screen TUI can redraw without touching scrollback.
+`capture-pane` targets a bare `%N` pane id directly. `phoenix-capture` has no
+persistence dependency, so it never loads the previous capture itself: the caller hands
+in a `HashMap<pane_id, PreviousPaneContent>`. Only the daemon does that today (§8);
+one-shot `phoenix save` captures structure only. Program output isn't guaranteed valid
+UTF-8 the way structural fields are, so captured lines are decoded lossily (U+FFFD for
+bad sequences) rather than failing the pane.
+
 ---
 
 ## 6. Restore — plan, then apply
 
-`plan(&Snapshot, &RestorePolicy) -> RestorePlan` is pure; `tmux-control` executes the
-resulting ordered `Vec<TmuxCommand>`. Because the plan is data, `phoenix restore
---dry-run` prints exactly what would run before it runs — a real safety property for a
-tool that can `send-keys` into live shells.
+`plan(&Snapshot) -> RestorePlan` is pure; `phoenix-restore`'s `apply` executes the
+resulting ordered steps over a `tmux-control` client. Because the plan is data, `phoenix
+restore --dry-run` prints what would run before it runs — a real safety property for a
+tool that can `send-keys` into live shells. Every step prints as its exact tmux command
+line except scrollback replay, which prints as a `#` summary: its command names a temp
+file that only exists at apply time.
 
-Program relaunch defaults to **cwd + shell only**; it never blind-replays captured
-argv. Which programs may relaunch is a learned, consent-gated ruleset (a matcher +
-verdict, resolved by a pure function into `Restore`/`Skip`/`Ask`): interactively an
-`Ask` prompts the user; non-interactively (boot restore) an `Ask` falls to the safe
-default and is logged, so a boot never blocks and never escalates. *(Full permission
-model deferred to a later milestone; the default-safe behavior ships first.)*
+A restored pane comes back **at its captured cwd, running the program it was
+running** — the captured argv is replayed into the pane, unconditionally, on every
+restore path (interactive `phoenix restore` and the daemon's unattended boot restore
+alike). Nothing is asked and nothing is configured: getting your programs back is the
+whole point of restoring. A pane with no captured cwd sends no `-c`, so it opens in
+tmux's default directory for the new session or window.
+
+**Implementation notes (found by running the plan against a real tmux server):**
+`new-session` has no flag to request a specific window index — the window lands wherever
+the target server's `base-index` puts it — so `plan` always follows a session's
+`new-session` with a `move-window` relocating it to the captured index. That move can
+legitimately fail with tmux's "same index" error when the window already landed there;
+the executor treats exactly that as success. Panes have no such fix-up at all —
+`split-window` takes no index and there's no pane equivalent of `move-window` — so the
+plan never targets a pane by index: each window's originally-active pane is always the
+last one split (verified live that the most recently split pane stays active through a
+following `select-layout`), so `select-pane` never appears in a plan.
+
+**Content replay:** "the authoritative grid comes from capture-pane, not a re-emulated
+stream" — a pane's captured `scrollback` is replayed by typing `cat <tempfile>; rm -f
+<tempfile>` into the pane immediately after it's created, using the same current-pane
+targeting `split-window` relies on. The temp file is created exclusively with mode 0600,
+so another local user can neither read the scrollback nor plant the path first, and the
+pane's own shell removes it once read, since only that shell knows when it has. This is
+the one plan step that isn't a `TmuxCommand` (`PlanStep::ReplayContent`), because its
+command line needs that temp file. A pane with `content: None` has nothing to replay.
+
+**Program relaunch:** a pane's captured `argv` (§5's best-effort `ps` recovery) becomes a
+`TmuxCommand::RelaunchProgram`, emitted right after that pane's content replay so
+captured history is visible before the program that produced it restarts on top (the
+order tmux-resurrect uses). The argv is shell-quoted element by element, so an argument
+containing spaces round-trips as one shell word. Two pane shapes come back as a plain
+shell at their cwd: one with `argv: None` (there is no command line to run), and one
+that was idle at its prompt, which tmux reports as the pane's own shell being its
+foreground process. The second is recognized by `pane_current_command` being an
+interactive shell (`zsh`, `bash`, `fish`, …) invoked with no non-flag argument —
+restore already creates every pane as a fresh shell, so re-running it would nest a
+second shell, whereas `bash deploy.sh` is a real program and does come back.
+
+**Connecting (`phoenix_restore::connect_and_apply`):** a control-mode client attaches to
+a session, so a server with none has nothing to attach to. Every restore path goes
+through one function that counts sessions with a plain `list-sessions` first (bare
+`tmux -C` always creates a session, so it can't be the check). Only tmux's own
+no-server replies count as zero; any other failure stops the restore rather than
+guessing. With sessions, it attaches and applies. With none, it creates a throwaway
+`phoenix-boot` session, applies over it, reattaches to a real restored session (killing
+the session a client is attached to ends that client's connection), and removes the
+bootstrap whether or not the restore succeeded. A snapshot holding a session named
+`phoenix-boot` is refused on that path before the server is touched.
 
 ---
 
@@ -298,6 +372,27 @@ last N generations. Body is MessagePack + zstd-compressed pane content by defaul
 (fast, compact), with a `--format=json` option over the same `serde` schema for
 inspection (`[LAW:one-type-per-behavior]`). A versioned header with a checksum; an
 unknown `format_version` is refused loudly, never guessed (`[LAW:no-mode-explosion]`).
+
+**Implementation note:** no `serde`/`rmp-serde`/`zstd`, for the same reason as §4's
+note. The body is a hand-rolled, length-prefixed little-endian binary encoding built
+directly on `phoenix-core`'s public constructors, so a corrupt file can produce a decode
+error but never an invalid `Snapshot`, with an FNV-1a-64 checksum in place of a
+cryptographic one — it only needs to catch local corruption, not tampering.
+`--format=json` is a hand-rolled, encode-only JSON writer over the same tree.
+`captured_at`/`format_version` live in a fixed 32-byte header ahead of the body, so
+`list` reads a per-generation summary without decoding the tree.
+
+**Content-addressed blob store:** a pane's `scrollback`/`visible` text is stored as a
+blob under its own hash in `${store_dir}/blobs/`, and the generation file holds only the
+hash. Two saves with byte-identical pane content (the common case for an unchanged pane,
+since dirty-tracking carries the same scrollback forward) write the same blob, and the
+second write is a no-op. Blobs use the same temp+fsync+rename atomicity as generation
+files; writers racing on the same blob need no lock, since same hash means same bytes.
+With no crypto-hash crate available, and a checksum-grade hash not enough (two blobs
+colliding would return the wrong pane's content), the hash is 128 bits from two
+independent, differently-salted FNV-1a-64 passes: adequate for a single-user,
+non-adversarial store, not a cryptographic guarantee. Pruning blobs no surviving
+generation references is not implemented yet.
 
 ---
 
@@ -319,6 +414,32 @@ subscriptions, and owns *when to save* as explicit state
   `phoenix daemon` runs it foreground for debugging. Independent of the tmux server —
   if tmux isn't running the connection sits in `Closed`/`Reconnecting` and the daemon
   idles.
+
+**Implementation notes:** the structure subscription is one `refresh-client -B
+phoenix-structure:@*:#{window_layout}` — verified live to fire on pane split, close and
+resize and on window add and remove. It observes only the attached session's windows, so
+a change in another session reaches the daemon through the max-interval backstop, not
+the debounce path. A client's notification sink is fixed when the client is built, so
+the daemon creates its activity flag (`StructureActivity`) first and builds the client
+around its sink, including the client boot restore hands back. The debounce decision
+(`DebounceState`) is pure, driven by timestamps the caller supplies, so its tests need
+no sleeping. The loop has no wait-with-timeout primitive: once per short poll interval a
+cheap heartbeat (`display-message -p ""`) makes `execute` read and dispatch whatever
+notifications arrived, then the loop reads the flag and decides. One capture-or-save
+failure is logged and the loop continues; only failing to set `no-output` or subscribe
+is fatal to a connection. The daemon carries each save's per-pane content forward
+(seeded from `latest` on start), which is why it is the one path with content capture
+on.
+
+Boot restore counts sessions first. With sessions, it attaches and never restores. With
+none and a saved `latest`, it restores through `connect_and_apply` (§6). With none and
+nothing saved, it attaches to nothing and waits: starting a server nobody asked for is
+not the daemon's call. `run_resilient` wraps all of this in a reconnect loop, so a
+reconnect after tmux comes back is itself a boot restore; `TmuxError::{Send, Read,
+TransportClosed, NotReady}` mark the connection dead, and every other error is one
+command failing. `phoenix install` writes the launchd plist or systemd unit with the
+binary's absolute path (from `current_exe`, since `$PATH` is minimal under both
+supervisors) and prints the activation command, but never runs it.
 
 ---
 
@@ -348,4 +469,3 @@ anywhere.
    session, rebuild it, assert `list-panes` geometry matches the snapshot.
 3. **Content capture + replay.**
 4. **Daemon: subscription-driven debounced save + boot restore + service install.**
-5. **Learned permission model for program relaunch.**

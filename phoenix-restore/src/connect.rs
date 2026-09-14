@@ -37,7 +37,7 @@
 use std::process::Command;
 
 use phoenix_core::Snapshot;
-use tmux_control::{socket_args, Client, SpawnOptions, SpawnTransport, TmuxError};
+use tmux_control::{socket_args, Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 
 use crate::apply::{apply, ApplyError, ApplyOutcome};
 use crate::plan::RestorePlan;
@@ -214,6 +214,7 @@ fn run_plain(
 fn attach(
     socket: Option<String>,
     target: Option<&str>,
+    on_notification: impl FnMut(ServerMessage) + 'static,
 ) -> Result<Client<SpawnTransport>, ConnectApplyError> {
     let mut args = vec!["attach-session"];
     if let Some(t) = target {
@@ -222,9 +223,10 @@ fn attach(
     }
     let transport =
         SpawnTransport::spawn(&args, &spawn_options(socket)).map_err(ConnectApplyError::Spawn)?;
-    // Restore issues commands and reads replies; the server's unsolicited
-    // notifications and pane output have no consumer here, so both drop.
-    Client::connect(transport, drop, |_, _| {}).map_err(ConnectApplyError::Connect)
+    // Pane output has no consumer in any restore caller, so it drops; what
+    // happens to notifications is the caller's, since a client's sinks are
+    // fixed for its whole life, reconnects included.
+    Client::connect(transport, on_notification, |_, _| {}).map_err(ConnectApplyError::Connect)
 }
 
 /// Connect to the server on `socket` and apply `plan`, bootstrapping a
@@ -237,17 +239,22 @@ fn attach(
 /// `snapshot` is the same one `plan` was built from: its first session names
 /// the reconnect target for the bootstrap teardown, so a caller can't hand
 /// over a target that the plan doesn't actually create.
+///
+/// `on_notification` becomes the returned client's notification sink. A
+/// caller that keeps the client listening (the daemon) passes its own; one
+/// that only restores passes `drop`.
 pub fn connect_and_apply(
     socket: Option<String>,
     snapshot: &Snapshot,
     plan: &RestorePlan,
+    on_notification: impl FnMut(ServerMessage) + 'static,
 ) -> Result<(Client<SpawnTransport>, ApplyOutcome), ConnectApplyError> {
     // [LAW:dataflow-not-control-flow] the single irreducible fork: an empty
     // server genuinely needs different *effects* (create + tear down a
     // bootstrap session) than a populated one, and the discriminator is one
     // out-of-band fact taken before any connection exists.
     if count_sessions(socket.as_deref())? > 0 {
-        let mut client = attach(socket, None)?;
+        let mut client = attach(socket, None, on_notification)?;
         let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
         return Ok((client, outcome));
     }
@@ -267,7 +274,7 @@ pub fn connect_and_apply(
     // Whatever restore_over_bootstrap does, the session created above is
     // removed by the code that created it: on success from a connection
     // already parked elsewhere, on failure from wherever it got to.
-    let restored = restore_over_bootstrap(socket.clone(), snapshot, plan);
+    let restored = restore_over_bootstrap(socket.clone(), snapshot, plan, on_notification);
     let teardown = run_plain(
         socket.as_deref(),
         &["kill-session", "-t", BOOTSTRAP_SESSION],
@@ -294,8 +301,9 @@ fn restore_over_bootstrap(
     socket: Option<String>,
     snapshot: &Snapshot,
     plan: &RestorePlan,
+    on_notification: impl FnMut(ServerMessage) + 'static,
 ) -> Result<(Client<SpawnTransport>, ApplyOutcome), ConnectApplyError> {
-    let mut client = attach(socket.clone(), Some(BOOTSTRAP_SESSION))?;
+    let mut client = attach(socket.clone(), Some(BOOTSTRAP_SESSION), on_notification)?;
     let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
 
     let target = snapshot.sessions.first().name().as_str().to_string();
@@ -400,7 +408,12 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let result = connect_and_apply(Some(socket.clone()), &snapshot, &crate::plan(&snapshot));
+        let result = connect_and_apply(
+            Some(socket.clone()),
+            &snapshot,
+            &crate::plan(&snapshot),
+            drop,
+        );
 
         assert!(
             matches!(result, Err(ConnectApplyError::ReservedSessionName)),
