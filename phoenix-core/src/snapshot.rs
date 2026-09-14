@@ -22,7 +22,9 @@ use crate::time::OffsetDateTime;
 use crate::version::{FormatVersion, TmuxVersion};
 
 /// A validated snapshot tree failed to construct: an `active` index didn't
-/// resolve to any member of its siblings.
+/// resolve to exactly one member of its siblings — either none carries it,
+/// or two siblings share an index, which would make "the active one"
+/// ambiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
     ActiveWindowNotFound {
@@ -33,6 +35,24 @@ pub enum SnapshotError {
         window: WindowIndex,
         active: PaneIndex,
     },
+    DuplicateWindowIndex {
+        session: SessionName,
+        index: WindowIndex,
+    },
+    DuplicatePaneIndex {
+        window: WindowIndex,
+        index: PaneIndex,
+    },
+}
+
+/// The first index that appears twice, if any. Indices are small and few, so
+/// the quadratic scan costs nothing and needs no allocation.
+fn duplicate<I: Copy + Eq>(indices: impl Iterator<Item = I> + Clone) -> Option<I> {
+    indices
+        .clone()
+        .enumerate()
+        .find(|(i, a)| indices.clone().take(*i).any(|b| b == *a))
+        .map(|(_, a)| a)
 }
 
 impl fmt::Display for SnapshotError {
@@ -48,6 +68,12 @@ impl fmt::Display for SnapshotError {
                 "window {} has no pane at active index {}",
                 window.0, active.0
             ),
+            SnapshotError::DuplicateWindowIndex { session, index } => {
+                write!(f, "session {session} has two windows at index {}", index.0)
+            }
+            SnapshotError::DuplicatePaneIndex { window, index } => {
+                write!(f, "window {} has two panes at index {}", window.0, index.0)
+            }
         }
     }
 }
@@ -73,9 +99,10 @@ pub struct Window {
 }
 
 impl Window {
-    /// Fails with [`SnapshotError::ActivePaneNotFound`] unless `active`
-    /// matches some pane in `panes` — the only way to build a `Window` is
-    /// one where the invariant already holds.
+    /// Fails unless `active` matches exactly one pane in `panes`: no pane
+    /// ([`SnapshotError::ActivePaneNotFound`]) or two panes sharing an index
+    /// ([`SnapshotError::DuplicatePaneIndex`]) are both refused, so the only
+    /// way to build a `Window` is one where the invariant already holds.
     pub fn new(
         index: WindowIndex,
         name: WindowName,
@@ -83,20 +110,25 @@ impl Window {
         panes: NonEmpty<Pane>,
         active: PaneIndex,
     ) -> Result<Self, SnapshotError> {
-        if panes.iter().any(|p| p.index == active) {
-            Ok(Self {
-                index,
-                name,
-                layout,
-                panes,
-                active,
-            })
-        } else {
-            Err(SnapshotError::ActivePaneNotFound {
+        if let Some(dup) = duplicate(panes.iter().map(|p| p.index)) {
+            return Err(SnapshotError::DuplicatePaneIndex {
+                window: index,
+                index: dup,
+            });
+        }
+        if !panes.iter().any(|p| p.index == active) {
+            return Err(SnapshotError::ActivePaneNotFound {
                 window: index,
                 active,
-            })
+            });
         }
+        Ok(Self {
+            index,
+            name,
+            layout,
+            panes,
+            active,
+        })
     }
 
     pub fn index(&self) -> WindowIndex {
@@ -137,25 +169,30 @@ pub struct Session {
 }
 
 impl Session {
-    /// Fails with [`SnapshotError::ActiveWindowNotFound`] unless `active`
-    /// matches some window in `windows`.
+    /// Fails unless `active` matches exactly one window in `windows`; see
+    /// [`Window::new`] for the two refusals.
     pub fn new(
         name: SessionName,
         windows: NonEmpty<Window>,
         active: WindowIndex,
     ) -> Result<Self, SnapshotError> {
-        if windows.iter().any(|w| w.index() == active) {
-            Ok(Self {
-                name,
-                windows,
-                active,
-            })
-        } else {
-            Err(SnapshotError::ActiveWindowNotFound {
+        if let Some(dup) = duplicate(windows.iter().map(|w| w.index())) {
+            return Err(SnapshotError::DuplicateWindowIndex {
+                session: name,
+                index: dup,
+            });
+        }
+        if !windows.iter().any(|w| w.index() == active) {
+            return Err(SnapshotError::ActiveWindowNotFound {
                 session: name,
                 active,
-            })
+            });
         }
+        Ok(Self {
+            name,
+            windows,
+            active,
+        })
     }
 
     pub fn name(&self) -> &SessionName {
@@ -227,6 +264,39 @@ mod tests {
             SnapshotError::ActivePaneNotFound {
                 window: WindowIndex(0),
                 active: PaneIndex(99),
+            }
+        );
+    }
+
+    #[test]
+    fn window_new_fails_when_two_panes_share_an_index() {
+        let panes = NonEmpty::from_vec(vec![pane(0), pane(1), pane(1)]).unwrap();
+        let err = window(0, panes, 1).unwrap_err();
+        assert_eq!(
+            err,
+            SnapshotError::DuplicatePaneIndex {
+                window: WindowIndex(0),
+                index: PaneIndex(1),
+            }
+        );
+    }
+
+    #[test]
+    fn session_new_fails_when_two_windows_share_an_index() {
+        let panes = NonEmpty::singleton(pane(0));
+        let w0 = window(3, panes.clone(), 0).unwrap();
+        let w1 = window(3, panes, 0).unwrap();
+        let err = Session::new(
+            SessionName::parse("main").unwrap(),
+            NonEmpty::new(w0, vec![w1]),
+            WindowIndex(3),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SnapshotError::DuplicateWindowIndex {
+                session: SessionName::parse("main").unwrap(),
+                index: WindowIndex(3),
             }
         );
     }

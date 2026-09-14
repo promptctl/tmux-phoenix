@@ -64,8 +64,8 @@ impl<T> NonEmpty<T> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        std::iter::once(&self.head).chain(self.tail.iter())
+    pub fn iter(&self) -> <&Self as IntoIterator>::IntoIter {
+        self.into_iter()
     }
 }
 
