@@ -228,13 +228,17 @@ pub struct Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ProgramName;
 
     fn pane(index: u32) -> Pane {
         Pane {
             id: PaneId(index),
             index: PaneIndex(index),
             cwd: Utf8PathBuf::new("/home/user"),
-            program: CapturedProgram::new("zsh", vec![]),
+            program: CapturedProgram {
+                command: ProgramName::parse("zsh").unwrap(),
+                argv: None,
+            },
             content: None,
         }
     }

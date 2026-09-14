@@ -1,24 +1,18 @@
 //! What tmux reports is running in a pane's foreground (DESIGN.md §5).
 
-/// `command` is always present — tmux's `pane_current_command` format var
-/// never comes back empty. `argv` is the full command line, recovered
-/// separately via a `ps` pass (`pane_current_command` gives only the command
-/// *name*); recovery is best-effort per pane, so an empty `argv` means
-/// recovery failed for *this* pane, not that the program was launched with
-/// no arguments (`[LAW:no-silent-failure]` — degraded, not absent).
+use crate::ids::ProgramName;
+use crate::nonempty::NonEmpty;
+
+/// `command` is tmux's `pane_current_command`: the program *name* only.
+/// `argv` is the full command line, recovered separately via a `ps` pass;
+/// recovery is best-effort per pane, so `None` means recovery failed for
+/// *this* pane. A recovered argv always carries at least `argv[0]`, which is
+/// why "failed" and "launched with no arguments" cannot be confused
+/// (`[LAW:parse-dont-validate]` — a typed absence, not an empty list).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedProgram {
-    pub command: String,
-    pub argv: Vec<String>,
-}
-
-impl CapturedProgram {
-    pub fn new(command: impl Into<String>, argv: Vec<String>) -> Self {
-        Self {
-            command: command.into(),
-            argv,
-        }
-    }
+    pub command: ProgramName,
+    pub argv: Option<NonEmpty<String>>,
 }
 
 #[cfg(test)]
@@ -27,14 +21,23 @@ mod tests {
 
     #[test]
     fn holds_command_and_argv() {
-        let p = CapturedProgram::new("vim", vec!["vim".to_string(), "DESIGN.md".to_string()]);
-        assert_eq!(p.command, "vim");
-        assert_eq!(p.argv, vec!["vim", "DESIGN.md"]);
+        let p = CapturedProgram {
+            command: ProgramName::parse("vim").unwrap(),
+            argv: Some(NonEmpty::new(
+                "vim".to_string(),
+                vec!["DESIGN.md".to_string()],
+            )),
+        };
+        assert_eq!(p.command.as_str(), "vim");
+        assert_eq!(p.argv.unwrap().len(), 2);
     }
 
     #[test]
-    fn empty_argv_is_representable_for_degraded_recovery() {
-        let p = CapturedProgram::new("zsh", vec![]);
-        assert!(p.argv.is_empty());
+    fn failed_recovery_is_a_typed_absence() {
+        let p = CapturedProgram {
+            command: ProgramName::parse("zsh").unwrap(),
+            argv: None,
+        };
+        assert!(p.argv.is_none());
     }
 }

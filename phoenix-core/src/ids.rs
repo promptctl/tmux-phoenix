@@ -1,7 +1,8 @@
 //! Typed identifiers for the domain tree (DESIGN.md §4).
 //!
-//! `SessionName`/`WindowName`/`Layout` are validated newtypes over `String`:
-//! tmux never hands back an empty name or layout string, so the empty state
+//! `SessionName`/`WindowName`/`Layout`/`ProgramName` are validated newtypes
+//! over `String`: tmux never hands back an empty name, layout or
+//! `pane_current_command`, so the empty state
 //! is rejected once, at [`SessionName::parse`]/[`WindowName::parse`]/
 //! [`Layout::parse`], rather than re-checked by every consumer
 //! (`[LAW:parse-dont-validate]`, matching `tmux_control::protocol::ids`'s
@@ -46,6 +47,7 @@ macro_rules! validated_name {
 validated_name!(SessionName);
 validated_name!(WindowName);
 validated_name!(Layout);
+validated_name!(ProgramName);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowIndex(pub u32);
@@ -74,6 +76,7 @@ mod tests {
         assert_eq!(SessionName::parse(""), None);
         assert_eq!(WindowName::parse(""), None);
         assert_eq!(Layout::parse(""), None);
+        assert_eq!(ProgramName::parse(""), None);
     }
 
     #[test]
