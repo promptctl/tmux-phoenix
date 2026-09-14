@@ -183,10 +183,15 @@ impl Store {
     /// one, a clock stepped backwards — would be pruned out from under
     /// `latest`.
     fn next_generation_id(&self, captured_at: i64) -> io::Result<i64> {
-        Ok(self
-            .generation_ids_desc()?
-            .first()
-            .map_or(captured_at, |newest| captured_at.max(newest + 1)))
+        match self.generation_ids_desc()?.first() {
+            None => Ok(captured_at),
+            Some(newest) => newest
+                .checked_add(1)
+                .map(|above_newest| captured_at.max(above_newest))
+                .ok_or_else(|| {
+                    io::Error::other(format!("generation id {newest} leaves no id above it"))
+                }),
+        }
     }
 
     fn repoint_latest(&self, target: &Path) -> io::Result<()> {
@@ -564,6 +569,25 @@ mod tests {
             .unwrap();
         release.join().unwrap();
         assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_save_with_no_id_above_the_newest_generation_fails_and_leaves_latest_alone() {
+        let dir = TestDir::new("id-overflow");
+        let store = Store::new(&dir.0);
+        store
+            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .unwrap();
+        fs::write(store.generation_path(i64::MAX), b"stray").unwrap();
+
+        assert!(matches!(
+            store.save(&snapshot_at(1_700_000_100), 5, Duration::ZERO),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(
+            store.load_latest().unwrap().captured_at.unix_timestamp(),
+            1_700_000_000
+        );
     }
 
     #[test]
