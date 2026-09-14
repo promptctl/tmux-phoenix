@@ -56,6 +56,13 @@ pub enum ConnectApplyError {
         action: &'static str,
         detail: String,
     },
+    /// The restore failed *and* removing the bootstrap session afterwards
+    /// failed too, so the server is left with scaffolding on it. Both are
+    /// reported: hiding either would misdescribe the server's state.
+    TeardownAfterFailure {
+        primary: Box<ConnectApplyError>,
+        teardown: Box<ConnectApplyError>,
+    },
 }
 
 impl std::fmt::Display for ConnectApplyError {
@@ -67,6 +74,11 @@ impl std::fmt::Display for ConnectApplyError {
             ConnectApplyError::Tmux { action, detail } => {
                 write!(f, "failed to {action}: {detail}")
             }
+            ConnectApplyError::TeardownAfterFailure { primary, teardown } => write!(
+                f,
+                "{primary}; and the {BOOTSTRAP_SESSION} session it bootstrapped is still \
+                 on the server because cleanup also failed: {teardown}"
+            ),
         }
     }
 }
@@ -175,27 +187,45 @@ pub fn connect_and_apply(
         &["new-session", "-d", "-s", BOOTSTRAP_SESSION],
         "create the temporary bootstrap session",
     )?;
-    let mut client = attach(socket.clone(), Some(BOOTSTRAP_SESSION))?;
-    let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
-
-    // Reconnect onto a real restored session before killing the bootstrap:
-    // killing the session you're attached to ends your own connection, so the
-    // teardown has to happen from a connection parked somewhere else first.
-    let target = snapshot.sessions.first().name().as_str().to_string();
-    let fresh = SpawnTransport::spawn(
-        &["attach-session", "-t", &target],
-        &spawn_options(socket.clone()),
-    )
-    .map_err(ConnectApplyError::Spawn)?;
-    client
-        .reconnect(fresh, 0)
-        .map_err(ConnectApplyError::Connect)?;
-
-    run_plain(
+    // Whatever restore_over_bootstrap does, the session created above is
+    // removed by the code that created it: on success from a connection
+    // already parked elsewhere, on failure from wherever it got to.
+    let restored = restore_over_bootstrap(socket.clone(), snapshot, plan);
+    let teardown = run_plain(
         socket.as_deref(),
         &["kill-session", "-t", BOOTSTRAP_SESSION],
         "remove the temporary bootstrap session",
-    )?;
+    );
+    match (restored, teardown) {
+        (Ok(restored), Ok(())) => Ok(restored),
+        (Ok(_), Err(teardown)) => Err(teardown),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(teardown)) => Err(ConnectApplyError::TeardownAfterFailure {
+            primary: Box::new(primary),
+            teardown: Box::new(teardown),
+        }),
+    }
+}
 
+/// Attach to the bootstrap session, apply, then reconnect onto a real
+/// restored session: killing the session you are attached to ends your own
+/// connection, so the caller's teardown has to happen from a connection
+/// parked somewhere else. On failure the returned client (if any) is
+/// dropped with the error, so the teardown's kill of the bootstrap session
+/// ends nothing the caller still holds.
+fn restore_over_bootstrap(
+    socket: Option<String>,
+    snapshot: &Snapshot,
+    plan: &RestorePlan,
+) -> Result<(Client<SpawnTransport>, ApplyOutcome), ConnectApplyError> {
+    let mut client = attach(socket.clone(), Some(BOOTSTRAP_SESSION))?;
+    let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
+
+    let target = snapshot.sessions.first().name().as_str().to_string();
+    let fresh = SpawnTransport::spawn(&["attach-session", "-t", &target], &spawn_options(socket))
+        .map_err(ConnectApplyError::Spawn)?;
+    client
+        .reconnect(fresh, 0)
+        .map_err(ConnectApplyError::Connect)?;
     Ok((client, outcome))
 }

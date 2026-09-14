@@ -5,8 +5,10 @@
 
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tmux_control::{Client, CommandLine, TmuxError, Transport};
 
@@ -112,10 +114,11 @@ static REPLAY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The command line a step actually sends. A [`PlanStep::Command`] already
 /// is one; [`PlanStep::ReplayContent`] becomes one only here, because it
-/// writes its content to a temp file first (not deleted afterward — the
-/// shell reads it asynchronously after `send-keys` returns, so there's no
-/// safe point to clean it up from here; left for the OS's own temp-dir
-/// hygiene) and sends a `cat` of that file into the target pane.
+/// writes its content to a temp file first and sends a `cat` of that file
+/// into the target pane. The shell reads the file asynchronously after
+/// `send-keys` returns, so the only party that knows when it has been
+/// consumed is that shell: the keystrokes remove the file right after
+/// reading it.
 fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource> {
     match step {
         PlanStep::ReplayContent {
@@ -125,7 +128,8 @@ fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource
         } => {
             let path = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
             let target = format!("{}:{}", session.as_str(), window.0);
-            let shell_command = format!("cat {}", shell_quote(&path.to_string_lossy()));
+            let quoted = shell_quote(&path.to_string_lossy());
+            let shell_command = format!("cat {quoted}; rm -f {quoted}");
             CommandLine::new("send-keys", ["-t", &target, &shell_command, "Enter"])
                 .map_err(|e| ApplyErrorSource::Tmux(e.into()))
         }
@@ -135,11 +139,26 @@ fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource
     }
 }
 
+/// Captured scrollback can hold anything the user saw in a terminal, and the
+/// temp dir is shared: the file is readable by its owner only, and the open
+/// is exclusive so a path another user pre-placed (a symlink, say) fails
+/// loudly instead of being written through. The name carries the clock as
+/// well as pid and counter so it is not guessable from `ps` alone.
 fn write_replay_temp_file(lines: &[String]) -> io::Result<PathBuf> {
     let n = REPLAY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("phoenix-restore-replay-{}-{n}", std::process::id()));
-    let mut f = fs::File::create(&path)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "phoenix-restore-replay-{}-{nanos}-{n}",
+        std::process::id()
+    ));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
     for line in lines {
         writeln!(f, "{line}")?;
     }
@@ -298,7 +317,25 @@ mod tests {
         // The keystrokes are one argument to tmux, and shell-quoted within
         // it, because a shell — not tmux — parses what gets typed.
         assert!(sent[0].contains("\"cat '"));
+        assert!(sent[0].contains("; rm -f '"));
         assert!(sent[0].ends_with(" Enter"));
+    }
+
+    #[test]
+    fn write_replay_temp_file_is_owner_only_and_refuses_an_existing_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = write_replay_temp_file(&["x".to_string()]).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // An exclusive open cannot be redirected through something already
+        // sitting at the path.
+        let err = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
