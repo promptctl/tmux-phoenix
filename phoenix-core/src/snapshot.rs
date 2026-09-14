@@ -14,7 +14,7 @@
 use std::fmt;
 
 use crate::content::PaneContent;
-use crate::ids::{Layout, PaneIndex, SessionName, WindowIndex, WindowName};
+use crate::ids::{Layout, PaneId, PaneIndex, SessionName, WindowIndex, WindowName};
 use crate::nonempty::NonEmpty;
 use crate::path::Utf8PathBuf;
 use crate::program::CapturedProgram;
@@ -56,6 +56,7 @@ impl std::error::Error for SnapshotError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
+    pub id: PaneId,
     pub index: PaneIndex,
     pub cwd: Utf8PathBuf,
     pub program: CapturedProgram,
@@ -193,6 +194,7 @@ mod tests {
 
     fn pane(index: u32) -> Pane {
         Pane {
+            id: PaneId(index),
             index: PaneIndex(index),
             cwd: Utf8PathBuf::new("/home/user"),
             program: CapturedProgram::new("zsh", vec![]),

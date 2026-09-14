@@ -2,8 +2,6 @@
 //! — `None` when capture-pane failed for that pane (unresponsive pane,
 //! degrades that pane alone rather than the whole snapshot).
 
-use crate::ids::PaneId;
-
 /// `history_size`/`history_bytes` are tmux's own scrollback change
 /// indicator (`#{history_size}`/`#{history_bytes}`, DESIGN.md §5): stable
 /// while a pane is idle, moves whenever it produces output — verified live
@@ -21,7 +19,6 @@ use crate::ids::PaneId;
 /// without ever touching scrollback at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneContent {
-    pub pane_id: PaneId,
     pub history_size: u64,
     pub history_bytes: u64,
     pub scrollback: Vec<String>,
@@ -30,14 +27,12 @@ pub struct PaneContent {
 
 impl PaneContent {
     pub fn new(
-        pane_id: PaneId,
         history_size: u64,
         history_bytes: u64,
         scrollback: Vec<String>,
         visible: Vec<String>,
     ) -> Self {
         Self {
-            pane_id,
             history_size,
             history_bytes,
             scrollback,
@@ -53,7 +48,6 @@ mod tests {
     #[test]
     fn holds_captured_lines() {
         let c = PaneContent::new(
-            PaneId(0),
             10,
             2048,
             vec!["$ ls".to_string(), "DESIGN.md".to_string()],
@@ -65,7 +59,7 @@ mod tests {
 
     #[test]
     fn blank_pane_is_representable_as_empty_lines() {
-        let c = PaneContent::new(PaneId(0), 0, 0, vec![], vec![]);
+        let c = PaneContent::new(0, 0, vec![], vec![]);
         assert!(c.scrollback.is_empty());
         assert!(c.visible.is_empty());
     }
