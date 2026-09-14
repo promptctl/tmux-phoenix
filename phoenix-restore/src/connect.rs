@@ -72,6 +72,10 @@ pub enum ConnectApplyError {
         primary: Box<ConnectApplyError>,
         teardown: Box<ConnectApplyError>,
     },
+    /// The snapshot has a session named [`BOOTSTRAP_SESSION`], and the server
+    /// is empty, so restoring it would need that name twice at once. Checked
+    /// before anything touches the server.
+    ReservedSessionName,
 }
 
 impl std::fmt::Display for ConnectApplyError {
@@ -87,6 +91,12 @@ impl std::fmt::Display for ConnectApplyError {
                 f,
                 "{primary}; and the {BOOTSTRAP_SESSION} session it bootstrapped is still \
                  on the server because cleanup also failed: {teardown}"
+            ),
+            ConnectApplyError::ReservedSessionName => write!(
+                f,
+                "the snapshot has a session named {BOOTSTRAP_SESSION}, which restore \
+                 reserves for bootstrapping an empty server; start any tmux session \
+                 on the target server first, then restore again"
             ),
         }
     }
@@ -104,21 +114,61 @@ fn spawn_options(socket: Option<String>) -> SpawnOptions {
 /// How many sessions the server on `socket` currently has. A plain,
 /// non-control-mode `list-sessions` — it doesn't attach and doesn't create
 /// anything (unlike a bare `tmux -C`, which always spawns a session as a side
-/// effect, so it can't be used for this check). `0` covers both "server isn't
-/// running" and "running with no sessions" identically — exactly the cases
-/// that need bootstrapping — so callers never have to tell them apart. The one
-/// implementation of this query (`[LAW:one-source-of-truth]`).
-pub fn count_sessions(socket: Option<&str>) -> usize {
+/// effect, so it can't be used for this check). `Ok(0)` covers both "server
+/// isn't running" and "running with no sessions" — exactly the cases that
+/// need bootstrapping. Every other failure is an error, never a zero: a
+/// failed query against a populated server must not send restore down the
+/// bootstrap path (`[LAW:no-silent-failure]`). The one implementation of this
+/// query (`[LAW:one-source-of-truth]`).
+pub fn count_sessions(socket: Option<&str>) -> Result<usize, ConnectApplyError> {
+    const ACTION: &str = "count the server's sessions";
     let mut cmd = Command::new("tmux");
     cmd.args(socket_args(socket));
     cmd.args(["list-sessions", "-F", "#{session_name}"]);
-    match cmd.output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .count(),
-        _ => 0,
+    let out = cmd.output().map_err(|e| ConnectApplyError::Tmux {
+        action: ACTION,
+        detail: e.to_string(),
+    })?;
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Ok(stdout.lines().filter(|l| !l.is_empty()).count());
     }
+    let detail = failure_detail(&out);
+    if reports_no_server(&detail) {
+        return Ok(0);
+    }
+    Err(ConnectApplyError::Tmux {
+        action: ACTION,
+        detail,
+    })
+}
+
+/// tmux's own stderr for a failed plain invocation, or the exit status when
+/// it printed nothing.
+fn failure_detail(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("tmux exited with {}", out.status)
+    } else {
+        stderr
+    }
+}
+
+/// Whether a failed `list-sessions`'s stderr says there is no server — as
+/// opposed to a server that exists but couldn't be queried. Verified against
+/// tmux 3.6a, the two absent shapes are:
+///
+/// | stderr | meaning | absent? |
+/// |---|---|---|
+/// | `no server running on <path>` | socket missing its server, or stale | yes |
+/// | `error connecting to <path> (No such file or directory)` | no socket file | yes |
+/// | `error connecting to <path> (Socket operation on non-socket)` | path is not a socket | no |
+/// | `error connecting to <path> (Permission denied)` | someone else's server | no |
+/// | anything else, or empty | unknown | no |
+fn reports_no_server(stderr: &str) -> bool {
+    stderr.starts_with("no server running on ")
+        || (stderr.starts_with("error connecting to ")
+            && stderr.ends_with(" (No such file or directory)"))
 }
 
 /// Run a plain `tmux` command (no `-C`) and hold it to account: an OS failure
@@ -140,13 +190,10 @@ fn run_plain(
     if out.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let detail = if stderr.is_empty() {
-        format!("tmux exited with {}", out.status)
-    } else {
-        stderr
-    };
-    Err(ConnectApplyError::Tmux { action, detail })
+    Err(ConnectApplyError::Tmux {
+        action,
+        detail: failure_detail(&out),
+    })
 }
 
 fn attach(
@@ -184,12 +231,19 @@ pub fn connect_and_apply(
     // server genuinely needs different *effects* (create + tear down a
     // bootstrap session) than a populated one, and the discriminator is one
     // out-of-band fact taken before any connection exists.
-    if count_sessions(socket.as_deref()) > 0 {
+    if count_sessions(socket.as_deref())? > 0 {
         let mut client = attach(socket, None)?;
         let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
         return Ok((client, outcome));
     }
 
+    if snapshot
+        .sessions
+        .iter()
+        .any(|session| session.name().as_str() == BOOTSTRAP_SESSION)
+    {
+        return Err(ConnectApplyError::ReservedSessionName);
+    }
     run_plain(
         socket.as_deref(),
         &["new-session", "-d", "-s", BOOTSTRAP_SESSION],
@@ -236,4 +290,109 @@ fn restore_over_bootstrap(
         .reconnect(fresh, 0)
         .map_err(ConnectApplyError::Connect)?;
     Ok((client, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_or_stale_socket_reports_no_server() {
+        assert!(reports_no_server(
+            "no server running on /tmp/tmux-501/default"
+        ));
+        assert!(reports_no_server(
+            "error connecting to /tmp/tmux-501/x (No such file or directory)"
+        ));
+    }
+
+    #[test]
+    fn any_other_list_sessions_failure_is_not_an_empty_server() {
+        for stderr in [
+            "error connecting to /tmp/x (Socket operation on non-socket)",
+            "error connecting to /tmp/x (Permission denied)",
+            "server exited unexpectedly",
+            "tmux exited with exit status: 1",
+        ] {
+            assert!(
+                !reports_no_server(stderr),
+                "{stderr:?} must not read as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn counting_sessions_on_a_path_that_is_not_a_socket_fails_loudly() {
+        let dir = std::env::temp_dir().join(format!("phoenix-not-a-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = count_sessions(dir.to_str());
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(
+            matches!(result, Err(ConnectApplyError::Tmux { .. })),
+            "a directory at the socket path must be an error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_holding_the_bootstrap_name_is_refused_before_the_server_is_touched() {
+        use phoenix_core::{
+            CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId,
+            PaneIndex, ProgramName, Session, SessionName, TmuxVersion, Window, WindowIndex,
+            WindowName,
+        };
+        let pane = Pane {
+            id: PaneId(0),
+            index: PaneIndex(0),
+            cwd: None,
+            program: CapturedProgram {
+                command: ProgramName::parse("zsh").unwrap(),
+                argv: None,
+            },
+            content: None,
+        };
+        let window = Window::new(
+            WindowIndex(0),
+            WindowName::parse("shell").unwrap(),
+            Layout::parse("b25d,80x24,0,0,0").unwrap(),
+            NonEmpty::singleton(pane),
+            PaneIndex(0),
+        )
+        .unwrap();
+        let session = Session::new(
+            SessionName::parse(BOOTSTRAP_SESSION).unwrap(),
+            NonEmpty::singleton(window),
+            WindowIndex(0),
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            format_version: FormatVersion::CURRENT,
+            tmux_version: TmuxVersion { major: 3, minor: 5 },
+            captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
+            sessions: NonEmpty::singleton(session),
+        };
+        let socket = std::env::temp_dir()
+            .join(format!("phoenix-reserved-{}", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let result = connect_and_apply(Some(socket.clone()), &snapshot, &crate::plan(&snapshot));
+
+        assert!(
+            matches!(result, Err(ConnectApplyError::ReservedSessionName)),
+            "expected ReservedSessionName, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            count_sessions(Some(&socket)).unwrap(),
+            0,
+            "no server may be started"
+        );
+    }
+
+    #[test]
+    fn counting_sessions_where_no_server_runs_is_zero() {
+        let socket = std::env::temp_dir().join(format!("phoenix-no-server-{}", std::process::id()));
+        assert_eq!(count_sessions(socket.to_str()).unwrap(), 0);
+    }
 }
