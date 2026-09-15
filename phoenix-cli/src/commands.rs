@@ -54,7 +54,7 @@ fn is_degraded(snapshot: &Snapshot) -> bool {
         .any(|p| p.program.argv.is_none() || p.cwd.is_none())
 }
 
-pub fn run_save(keep: usize, socket: Option<String>) -> i32 {
+pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
     let mut client = match connect(socket) {
         Ok(c) => c,
         Err(msg) => {

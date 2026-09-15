@@ -370,8 +370,9 @@ for the lock is a value its caller passes, not a mode: `phoenix save` waits up t
 then fails naming the contention; the daemon does not wait, so a contended cycle fails
 without counting as a save and its next poll tries again. A generation's id is its
 capture's Unix timestamp, raised above the newest existing id when it isn't already, so
-ids rise in save order: `latest` always names the highest id, so any retention of at
-least one keeps it.
+ids rise in save order: `latest` always names the highest id. Retention is a count of
+at least one from the `--keep` flag down (`--keep 0` is refused where it is parsed), so
+pruning always keeps the generation the save just wrote.
 Serialize to a temp file, `fsync`, `rename(2)` onto the final name, then atomically
 repoint `latest` — which therefore only ever names a fully-written snapshot; a crash
 mid-save leaves the last good one untouched (`[LAW:one-source-of-truth]`). Keep the

@@ -74,7 +74,7 @@ fn daemon_saves_after_a_structural_change_settles() {
         },
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(100),
-        keep_generations: 5,
+        keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
     };
 
     let socket = harness.socket.clone();
@@ -133,7 +133,7 @@ fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
         },
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(100),
-        keep_generations: 5,
+        keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
     };
 
     let errors = Rc::new(RefCell::new(Vec::new()));

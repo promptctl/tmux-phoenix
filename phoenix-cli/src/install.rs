@@ -170,7 +170,7 @@ mod tests {
 
     fn settings() -> DaemonSettings {
         DaemonSettings {
-            keep: 7,
+            keep: std::num::NonZeroUsize::new(7).unwrap(),
             debounce_secs: 15,
             max_interval_secs: 600,
         }

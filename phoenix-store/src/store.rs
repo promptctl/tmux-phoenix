@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -97,8 +98,8 @@ impl Store {
         BlobStore::new(self.dir.join(BLOBS_DIR))
     }
 
-    /// Save `snapshot`, then prune down to `keep_generations` (the newest
-    /// `keep_generations` files survive; `0` means "keep only this one").
+    /// Save `snapshot`, then prune down to the newest `keep_generations`
+    /// generations — always including this one, since ids rise in save order.
     ///
     /// `wait` is how long to wait for another save into this store to
     /// finish before failing with [`StoreError::Contended`];
@@ -106,7 +107,7 @@ impl Store {
     pub fn save(
         &self,
         snapshot: &Snapshot,
-        keep_generations: usize,
+        keep_generations: NonZeroUsize,
         wait: Duration,
     ) -> Result<SaveOutcome, StoreError> {
         fs::create_dir_all(&self.dir)?;
@@ -259,11 +260,11 @@ impl Store {
             .collect()
     }
 
-    fn prune(&self, keep: usize) -> Result<PruneResult, StoreError> {
+    fn prune(&self, keep: NonZeroUsize) -> Result<PruneResult, StoreError> {
         let ids = self.generation_ids_desc()?;
         let mut pruned = Vec::new();
         let mut errors = Vec::new();
-        for generation in ids.into_iter().skip(keep) {
+        for generation in ids.into_iter().skip(keep.get()) {
             let path = self.generation_path(generation);
             match fs::remove_file(&path) {
                 Ok(()) => pruned.push(path),
@@ -293,6 +294,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn keep(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
 
     struct TestDir(PathBuf);
 
@@ -356,7 +361,7 @@ mod tests {
         let store = Store::new(&dir.0);
         let snapshot = snapshot_at(1_700_000_000);
 
-        store.save(&snapshot, 5, Duration::ZERO).unwrap();
+        store.save(&snapshot, keep(5), Duration::ZERO).unwrap();
         let loaded = store.load_latest().unwrap();
         assert_eq!(loaded, snapshot);
     }
@@ -367,7 +372,7 @@ mod tests {
         let store = Store::new(&dir.0);
         let snapshot = snapshot_at(1_700_000_000);
 
-        let outcome = store.save(&snapshot, 5, Duration::ZERO).unwrap();
+        let outcome = store.save(&snapshot, keep(5), Duration::ZERO).unwrap();
         let loaded = store.load_file(&outcome.path).unwrap();
         assert_eq!(loaded, snapshot);
     }
@@ -385,10 +390,10 @@ mod tests {
         let store = Store::new(&dir.0);
 
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
         store
-            .save(&snapshot_at(1_700_000_100), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_100), keep(5), Duration::ZERO)
             .unwrap();
 
         let loaded = store.load_latest().unwrap();
@@ -401,10 +406,10 @@ mod tests {
         let store = Store::new(&dir.0);
 
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
 
         let generations = store.list().unwrap();
@@ -417,7 +422,9 @@ mod tests {
         let store = Store::new(&dir.0);
 
         for ts in [1_700_000_000, 1_700_000_100, 1_700_000_200, 1_700_000_300] {
-            store.save(&snapshot_at(ts), 2, Duration::ZERO).unwrap();
+            store
+                .save(&snapshot_at(ts), keep(2), Duration::ZERO)
+                .unwrap();
         }
 
         let generations = store.list().unwrap();
@@ -435,7 +442,7 @@ mod tests {
         let dir = TestDir::new("interrupted-save");
         let store = Store::new(&dir.0);
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
 
         // Simulate a save that wrote its temp file but crashed before the
@@ -452,7 +459,7 @@ mod tests {
         let dir = TestDir::new("corrupt-latest");
         let store = Store::new(&dir.0);
         let outcome = store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
 
         let mut bytes = fs::read(&outcome.path).unwrap();
@@ -470,7 +477,7 @@ mod tests {
     /// store dir. Each writer builds its own `Store`, so each opens its own
     /// lock file description — `flock` excludes those from one another
     /// exactly as it excludes separate processes.
-    fn race_saves(dir: &Path, keep: usize) -> Vec<PathBuf> {
+    fn race_saves(dir: &Path, keep: NonZeroUsize) -> Vec<PathBuf> {
         const WRITERS: usize = 8;
         const ROUNDS: usize = 10;
         let start = std::sync::Barrier::new(WRITERS);
@@ -505,7 +512,7 @@ mod tests {
     #[test]
     fn concurrent_saves_each_land_their_own_generation() {
         let dir = TestDir::new("concurrent-keep-all");
-        let paths = race_saves(&dir.0, usize::MAX);
+        let paths = race_saves(&dir.0, NonZeroUsize::MAX);
 
         let distinct: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(distinct.len(), paths.len(), "two saves reported one path");
@@ -518,7 +525,7 @@ mod tests {
     #[test]
     fn concurrent_saves_with_pruning_never_leave_latest_dangling() {
         let dir = TestDir::new("concurrent-prune");
-        race_saves(&dir.0, 2);
+        race_saves(&dir.0, keep(2));
 
         let store = Store::new(&dir.0);
         assert_eq!(store.list().unwrap().len(), 2);
@@ -530,14 +537,14 @@ mod tests {
         let dir = TestDir::new("contended");
         let store = Store::new(&dir.0);
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
 
         let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
         holder.lock().unwrap();
         for wait in [Duration::ZERO, Duration::from_millis(50)] {
             let err = store
-                .save(&snapshot_at(1_700_000_100), 5, wait)
+                .save(&snapshot_at(1_700_000_100), keep(5), wait)
                 .unwrap_err();
             assert!(matches!(err, StoreError::Contended { .. }), "{err}");
         }
@@ -554,7 +561,7 @@ mod tests {
         let dir = TestDir::new("waits");
         let store = Store::new(&dir.0);
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
 
         let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
@@ -565,10 +572,31 @@ mod tests {
         });
 
         store
-            .save(&snapshot_at(1_700_000_100), 5, Duration::from_secs(30))
+            .save(
+                &snapshot_at(1_700_000_100),
+                keep(5),
+                Duration::from_secs(30),
+            )
             .unwrap();
         release.join().unwrap();
         assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_retention_of_one_keeps_exactly_the_generation_just_written() {
+        let dir = TestDir::new("keep-one");
+        let store = Store::new(&dir.0);
+        for ts in [1_700_000_000, 1_700_000_100] {
+            let outcome = store
+                .save(&snapshot_at(ts), keep(1), Duration::ZERO)
+                .unwrap();
+            assert!(outcome.path.exists());
+            assert_eq!(store.list().unwrap().len(), 1);
+            assert_eq!(
+                store.load_latest().unwrap().captured_at.unix_timestamp(),
+                ts
+            );
+        }
     }
 
     #[test]
@@ -576,12 +604,12 @@ mod tests {
         let dir = TestDir::new("id-overflow");
         let store = Store::new(&dir.0);
         store
-            .save(&snapshot_at(1_700_000_000), 5, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
             .unwrap();
         fs::write(store.generation_path(i64::MAX), b"stray").unwrap();
 
         assert!(matches!(
-            store.save(&snapshot_at(1_700_000_100), 5, Duration::ZERO),
+            store.save(&snapshot_at(1_700_000_100), keep(5), Duration::ZERO),
             Err(StoreError::Io(_))
         ));
         assert_eq!(
@@ -596,10 +624,10 @@ mod tests {
         let store = Store::new(&dir.0);
 
         store
-            .save(&snapshot_at(1_700_000_100), 1, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_100), keep(1), Duration::ZERO)
             .unwrap();
         let outcome = store
-            .save(&snapshot_at(1_700_000_000), 1, Duration::ZERO)
+            .save(&snapshot_at(1_700_000_000), keep(1), Duration::ZERO)
             .unwrap();
 
         assert!(outcome.path.exists());

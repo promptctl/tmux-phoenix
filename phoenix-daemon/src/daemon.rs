@@ -4,6 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -109,7 +110,7 @@ fn capture_and_save<T: Transport>(
     client: &mut Client<T>,
     store: &Store,
     previous: &HashMap<u32, PreviousPaneContent>,
-    keep_generations: usize,
+    keep_generations: NonZeroUsize,
 ) -> Result<Snapshot, DaemonError> {
     let snapshot = phoenix_capture::capture(
         client,
@@ -235,7 +236,7 @@ pub struct RunConfig {
     pub poll_interval: Duration,
     /// How long [`run_resilient`] waits between connection attempts.
     pub reconnect_interval: Duration,
-    pub keep_generations: usize,
+    pub keep_generations: NonZeroUsize,
 }
 
 /// Runs until `should_continue` returns `false`, reconnecting — including
@@ -338,7 +339,7 @@ mod tests {
             },
             poll_interval: Duration::from_millis(1),
             reconnect_interval: Duration::from_millis(1),
-            keep_generations: 5,
+            keep_generations: NonZeroUsize::new(5).unwrap(),
         };
         let store = Store::new(std::env::temp_dir().join(format!(
             "phoenix-daemon-dead-transport-test-{}",

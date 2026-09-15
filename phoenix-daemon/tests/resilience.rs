@@ -65,7 +65,7 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
         },
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(300),
-        keep_generations: 5,
+        keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
     };
 
     let log = Arc::new(Mutex::new(Vec::<String>::new()));

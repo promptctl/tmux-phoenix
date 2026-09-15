@@ -18,6 +18,8 @@ USAGE:
 save: exit 0 on a clean save, 3 if some pane's foreground program or working
 directory couldn't be fully recovered (the snapshot is still saved), 1 on
 failure. Prints the saved generation's path on stdout.
+--keep N (save, daemon, install): how many generations to keep, at least 1
+(default 10); older ones are pruned after each save.
 list: one saved generation per line on stdout, tab-separated
 (captured_at_unix, format_version, path), newest first.
 restore: rebuilds the latest (or --file) snapshot into new tmux sessions,

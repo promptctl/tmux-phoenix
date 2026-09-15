@@ -1,7 +1,11 @@
 //! Pure argument parsing (DESIGN.md §9) — no I/O, testable without a tmux
 //! server. Hand-rolled: the surface is five subcommands and a few flags.
 
-pub const DEFAULT_KEEP_GENERATIONS: usize = 10;
+use std::num::NonZeroUsize;
+
+// [LAW:parse-dont-validate] retention is non-zero from the flag down: a
+// store that keeps zero generations would delete the save it just wrote.
+pub const DEFAULT_KEEP_GENERATIONS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 pub const DEFAULT_DEBOUNCE_SECS: u64 = 10;
 pub const DEFAULT_MAX_INTERVAL_SECS: u64 = 300;
 
@@ -10,7 +14,7 @@ pub const DEFAULT_MAX_INTERVAL_SECS: u64 = 300;
 /// what a flag means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonSettings {
-    pub keep: usize,
+    pub keep: NonZeroUsize,
     pub debounce_secs: u64,
     pub max_interval_secs: u64,
 }
@@ -28,7 +32,7 @@ impl Default for DaemonSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Save {
-        keep: usize,
+        keep: NonZeroUsize,
         socket: Option<String>,
     },
     List,
@@ -74,13 +78,7 @@ fn parse_save(args: &[String]) -> Result<Command, String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--keep" => {
-                i += 1;
-                let value = args.get(i).ok_or("--keep requires a value")?;
-                keep = value
-                    .parse()
-                    .map_err(|_| format!("--keep: {value:?} is not a non-negative integer"))?;
-            }
+            "--keep" => keep = flag_value(args, &mut i)?,
             "--socket" => {
                 i += 1;
                 socket = Some(args.get(i).ok_or("--socket requires a value")?.clone());
@@ -120,13 +118,17 @@ fn parse_restore(args: &[String]) -> Result<Command, String> {
 }
 
 /// The value after the flag at `args[*i]`, parsed; advances `*i` onto it.
-fn flag_value<T: std::str::FromStr>(args: &[String], i: &mut usize) -> Result<T, String> {
+fn flag_value<T>(args: &[String], i: &mut usize) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
     let flag = &args[*i];
     *i += 1;
     let value = args.get(*i).ok_or(format!("{flag} requires a value"))?;
     value
         .parse()
-        .map_err(|_| format!("{flag}: {value:?} is not a non-negative integer"))
+        .map_err(|e| format!("{flag}: {value:?} is not accepted ({e})"))
 }
 
 /// Consumes `args[*i]` into `settings` when it is one of the
@@ -217,7 +219,7 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["save", "--keep", "3", "--socket", "/tmp/s"])).unwrap(),
             Command::Save {
-                keep: 3,
+                keep: NonZeroUsize::new(3).unwrap(),
                 socket: Some("/tmp/s".to_string())
             }
         );
@@ -226,6 +228,14 @@ mod tests {
     #[test]
     fn save_rejects_a_non_numeric_keep() {
         assert!(parse_args(&args(&["save", "--keep", "abc"])).is_err());
+    }
+
+    #[test]
+    fn every_keep_flag_rejects_zero_where_it_is_parsed() {
+        for subcommand in ["save", "daemon", "install"] {
+            let err = parse_args(&args(&[subcommand, "--keep", "0"])).unwrap_err();
+            assert!(err.contains("--keep"), "{subcommand}: {err}");
+        }
     }
 
     #[test]
@@ -319,7 +329,7 @@ mod tests {
             .unwrap(),
             Command::Daemon {
                 settings: DaemonSettings {
-                    keep: 3,
+                    keep: NonZeroUsize::new(3).unwrap(),
                     debounce_secs: 5,
                     max_interval_secs: 120,
                 },
@@ -341,7 +351,7 @@ mod tests {
             parse_args(&args(&["install", "--keep", "3", "--debounce", "5"])).unwrap(),
             Command::Install {
                 settings: DaemonSettings {
-                    keep: 3,
+                    keep: NonZeroUsize::new(3).unwrap(),
                     debounce_secs: 5,
                     max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
                 },
