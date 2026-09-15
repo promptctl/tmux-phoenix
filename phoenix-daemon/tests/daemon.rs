@@ -121,6 +121,7 @@ fn daemon_saves_after_a_structural_change_settles() {
 #[test]
 fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
     let harness = IsolatedTmux::new("daemon-backstop");
+    harness.build();
     let activity = StructureActivity::new();
     let mut client = connect(&harness, &activity);
     let data_dir = TestDataDir::new("backstop");
@@ -160,4 +161,78 @@ fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
         .expect("the max-interval backstop should have saved even with no activity");
 
     client.close();
+}
+
+/// Blocks until the server holds only bootstrap sessions as `probe` sees
+/// them: a session just created is still starting its shell.
+fn wait_until_bootstrap_only(socket: &str) {
+    for _ in 0..50 {
+        if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
+            phoenix_restore::probe(Some(socket))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{socket} never settled into a bootstrap-only server within 5s");
+}
+
+/// tmux-parity-ure.j0f criterion 3: a server holding only a login terminal's
+/// bootstrap session never replaces the real prior state as `latest`, and
+/// the declined save ends `run`, so `run_resilient` boots again.
+#[test]
+fn a_bootstrap_only_server_never_replaces_latest() {
+    let data_dir = TestDataDir::new("bootstrap-only");
+    let store = Store::new(&data_dir.0);
+
+    let prior = IsolatedTmux::new("daemon-bootstrap-prior");
+    prior.build();
+    let mut prior_client = connect(&prior, &StructureActivity::new());
+    let prior_state =
+        phoenix_capture::capture(&mut prior_client, phoenix_capture::ContentCapture::Off)
+            .expect("failed to capture the prior state");
+    prior_client.close();
+    store
+        .save(
+            &prior_state,
+            std::num::NonZeroUsize::new(5).unwrap(),
+            Duration::ZERO,
+        )
+        .expect("failed to seed the prior state");
+
+    let login = IsolatedTmux::new("daemon-bootstrap-login");
+    wait_until_bootstrap_only(&login.socket);
+    let activity = StructureActivity::new();
+    let mut client = connect(&login, &activity);
+    let config = RunConfig {
+        policy: DebouncePolicy {
+            debounce: Duration::from_secs(60),
+            max_interval: Duration::from_millis(400),
+        },
+        poll_interval: Duration::from_millis(100),
+        reconnect_interval: Duration::from_millis(100),
+        keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+    };
+
+    let result = phoenix_daemon::run(
+        &mut client,
+        &activity,
+        &store,
+        &config,
+        |e| panic!("unexpected daemon error: {e}"),
+        bounded_continue(12), // 1.2s: well past the first max-interval cycle
+    );
+    client.close();
+
+    assert!(
+        matches!(
+            result,
+            Err(phoenix_daemon::DaemonError::Store(
+                phoenix_store::StoreError::BootstrapOnly
+            ))
+        ),
+        "the declined save should end the run: {result:?}"
+    );
+    assert_eq!(store.load_latest().unwrap(), prior_state);
+    assert_eq!(store.list().unwrap().len(), 1);
 }

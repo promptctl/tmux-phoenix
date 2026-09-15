@@ -120,6 +120,83 @@ fn single_pane_snapshot(session_name: &str) -> Snapshot {
     )
 }
 
+/// Blocks until the server holds only bootstrap sessions as `probe` sees
+/// them: a session just created is still starting its shell.
+fn wait_until_bootstrap_only(socket: &str) {
+    for _ in 0..50 {
+        if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
+            phoenix_restore::probe(Some(socket))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{socket} never settled into a bootstrap-only server within 5s");
+}
+
+/// tmux-parity-ure.j0f criterion 1: a terminal that reaches tmux before the
+/// daemon leaves a lone bootstrap session, named `0` exactly like the
+/// snapshot's own session. Boot restore puts the snapshot in its place.
+#[test]
+fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
+    let server = EmptyServer::new("login-race");
+    let status = std::process::Command::new("tmux")
+        .args(["-S", &server.socket, "new-session", "-d", "-s", "0"])
+        .status()
+        .expect("failed to start the login terminal's session");
+    assert!(status.success());
+    wait_until_bootstrap_only(&server.socket);
+
+    let data_dir = TestDataDir::new("login-race");
+    let store = Store::new(&data_dir.0);
+    store
+        .save(
+            &single_pane_snapshot("0"),
+            std::num::NonZeroUsize::new(5).unwrap(),
+            Duration::ZERO,
+        )
+        .expect("failed to seed a snapshot to restore");
+
+    let mut log = Vec::new();
+    let mut client = phoenix_daemon::connect_and_boot(
+        Some(server.socket.clone()),
+        &store,
+        |line| log.push(line.to_string()),
+        drop,
+    )
+    .expect("connect_and_boot failed")
+    .expect("a bootstrap-only server with a snapshot yields a client");
+
+    assert!(
+        log.iter().any(|l| l.contains("restored 1 session")),
+        "{log:?}"
+    );
+    assert_eq!(
+        server.session_names(),
+        vec!["0".to_string()],
+        "the login session should be replaced, with no scaffolding left"
+    );
+    let windows = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "list-windows",
+            "-t",
+            "=0",
+            "-F",
+            "#{window_name}",
+        ])
+        .output()
+        .expect("failed to list the restored session's windows");
+    assert_eq!(
+        String::from_utf8_lossy(&windows.stdout).trim(),
+        "shell",
+        "session 0 should be the snapshot's, not the login terminal's"
+    );
+
+    client.close();
+}
+
 #[test]
 fn boots_with_no_sessions_and_no_snapshot_waits_without_starting_a_server() {
     let server = EmptyServer::new("nothing-to-restore");
@@ -209,6 +286,18 @@ fn boots_with_an_existing_session_never_touches_it() {
         .status()
         .expect("failed to pre-create a session");
     assert!(status.success());
+    // Built out, so this is a session the user made, not a bootstrap one.
+    let status = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "split-window",
+            "-t",
+            &existing_session,
+        ])
+        .status()
+        .expect("failed to split the pre-existing session");
+    assert!(status.success());
 
     let data_dir = TestDataDir::new("stay-live");
     let store = Store::new(&data_dir.0);
@@ -232,7 +321,11 @@ fn boots_with_an_existing_session_never_touches_it() {
     .expect("connect_and_boot failed")
     .expect("a server with sessions, or a snapshot to restore, yields a client");
 
-    assert!(log.iter().any(|l| l.contains("staying in save mode")));
+    assert!(
+        log.iter()
+            .any(|l| l.contains("staying in save mode") && l.contains(&existing_session)),
+        "the daemon should say which session kept it from restoring: {log:?}"
+    );
     assert_eq!(
         server.session_names(),
         vec![existing_session],

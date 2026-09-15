@@ -17,7 +17,7 @@ use crate::content::PaneContent;
 use crate::ids::{Layout, PaneId, PaneIndex, SessionName, WindowIndex, WindowName};
 use crate::nonempty::NonEmpty;
 use crate::path::Utf8PathBuf;
-use crate::program::CapturedProgram;
+use crate::program::{CapturedProgram, Foreground};
 use crate::time::OffsetDateTime;
 use crate::version::{FormatVersion, TmuxVersion};
 
@@ -216,6 +216,17 @@ impl Session {
             .find(|w| w.index() == self.active)
             .expect("Session::new validated that `active` resolves to a member")
     }
+
+    /// A session nobody has built anything in yet: one window holding one
+    /// pane idle at its shell — what a terminal that starts `tmux` at login
+    /// creates. Restore replaces a server made only of these, and the store
+    /// refuses to let a capture made only of these become `latest`.
+    pub fn is_bootstrap(&self) -> bool {
+        let panes = self.windows.first().panes();
+        self.windows.len() == 1
+            && panes.len() == 1
+            && panes.first().program.foreground() == Foreground::IdleShell
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +235,13 @@ pub struct Snapshot {
     pub tmux_version: TmuxVersion,
     pub captured_at: OffsetDateTime,
     pub sessions: NonEmpty<Session>,
+}
+
+impl Snapshot {
+    /// Every session is a bootstrap session ([`Session::is_bootstrap`]).
+    pub fn is_bootstrap_only(&self) -> bool {
+        self.sessions.iter().all(Session::is_bootstrap)
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +270,95 @@ mod tests {
             panes,
             PaneIndex(active),
         )
+    }
+
+    fn running(command: &str, argv: &[&str]) -> Pane {
+        Pane {
+            program: CapturedProgram {
+                command: ProgramName::parse(command).unwrap(),
+                argv: NonEmpty::from_vec(argv.iter().map(|a| a.to_string()).collect()),
+            },
+            ..pane(0)
+        }
+    }
+
+    fn session_of(name: &str, windows: NonEmpty<Window>) -> Session {
+        let active = windows.first().index();
+        Session::new(SessionName::parse(name).unwrap(), windows, active).unwrap()
+    }
+
+    fn one_window(panes: NonEmpty<Pane>) -> NonEmpty<Window> {
+        NonEmpty::singleton(window(0, panes, 0).unwrap())
+    }
+
+    fn idle_shell() -> Pane {
+        running("zsh", &["-zsh"])
+    }
+
+    #[test]
+    fn one_window_with_one_pane_idle_at_its_shell_is_a_bootstrap_session() {
+        let session = session_of("0", one_window(NonEmpty::singleton(idle_shell())));
+        assert!(session.is_bootstrap());
+    }
+
+    #[test]
+    fn a_session_with_anything_built_or_unknown_in_it_is_not_bootstrap() {
+        let second_pane = Pane {
+            id: PaneId(1),
+            index: PaneIndex(1),
+            ..idle_shell()
+        };
+        let second_window = window(1, NonEmpty::singleton(idle_shell()), 0).unwrap();
+        for (what, session) in [
+            (
+                "two panes",
+                session_of(
+                    "0",
+                    one_window(NonEmpty::new(idle_shell(), vec![second_pane])),
+                ),
+            ),
+            (
+                "two windows",
+                session_of(
+                    "0",
+                    NonEmpty::new(
+                        window(0, NonEmpty::singleton(idle_shell()), 0).unwrap(),
+                        vec![second_window],
+                    ),
+                ),
+            ),
+            (
+                "a running program",
+                session_of(
+                    "0",
+                    one_window(NonEmpty::singleton(running("vim", &["vim", "notes.md"]))),
+                ),
+            ),
+            (
+                "an unrecovered argv",
+                session_of("0", one_window(NonEmpty::singleton(pane(0)))),
+            ),
+        ] {
+            assert!(!session.is_bootstrap(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_is_bootstrap_only_exactly_when_every_session_is() {
+        let snapshot = |sessions: NonEmpty<Session>| Snapshot {
+            format_version: FormatVersion::CURRENT,
+            tmux_version: TmuxVersion { major: 3, minor: 6 },
+            captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
+            sessions,
+        };
+        let idle = |name: &str| session_of(name, one_window(NonEmpty::singleton(idle_shell())));
+        let built = session_of(
+            "work",
+            one_window(NonEmpty::singleton(running("vim", &["vim"]))),
+        );
+
+        assert!(snapshot(NonEmpty::new(idle("0"), vec![idle("1")])).is_bootstrap_only());
+        assert!(!snapshot(NonEmpty::new(idle("0"), vec![built])).is_bootstrap_only());
     }
 
     #[test]

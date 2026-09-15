@@ -9,5 +9,5 @@ mod plan;
 
 pub use apply::{apply, ApplyError, ApplyErrorSource, ApplyOutcome};
 pub use command::{PlanStep, TmuxCommand};
-pub use connect::{connect_and_apply, count_sessions, ConnectApplyError, BOOTSTRAP_SESSION};
+pub use connect::{connect_and_apply, count_sessions, probe, ConnectApplyError, ServerState};
 pub use plan::{plan, RestorePlan};

@@ -41,6 +41,7 @@ dependencies = [
 name = "phoenix-restore"
 version = "0.1.0"
 dependencies = [
+ "phoenix-capture",
  "phoenix-core",
  "tmux-control",
 ]

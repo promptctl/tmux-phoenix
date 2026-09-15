@@ -1,13 +1,14 @@
-//! Boot restore (DESIGN.md §8): "On start, if the server has only the
-//! default empty session, apply `latest`; if sessions already exist, log and
-//! stay in save mode — never clobber a live server."
+//! Boot restore (DESIGN.md §8): on start, restore `latest` into a server that
+//! holds nothing the user built — no sessions at all, or only the bootstrap
+//! sessions a login terminal creates by starting `tmux` before the daemon
+//! connects — and never into a server holding a session the user built.
 //!
-//! The empty-server mechanics (counting sessions out of band, bootstrapping
-//! something to attach to, tearing it down from a connection parked
-//! elsewhere) belong to `phoenix_restore::connect_and_apply`, which the CLI's
-//! `restore` shares. This module only decides whether to call it.
+//! How to restore into either kind of server (counting sessions out of band,
+//! setting scaffolding aside, reattaching, moving terminals over) belongs to
+//! `phoenix_restore::connect_and_apply`, which the CLI's `restore` shares.
+//! This module only decides whether to call it.
 
-use phoenix_restore::{connect_and_apply, count_sessions, plan, ConnectApplyError};
+use phoenix_restore::{connect_and_apply, plan, probe, ConnectApplyError, ServerState};
 use phoenix_store::{Store, StoreError};
 use tmux_control::{Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 
@@ -20,7 +21,7 @@ pub enum BootError {
     /// `latest` exists but could not be read. Refused rather than treated as
     /// "nothing saved": waiting forever on an empty server would hide it.
     Store(StoreError),
-    /// Counting sessions, or restoring onto the empty server, failed; carries
+    /// Probing the server, or restoring into it, failed; carries
     /// `phoenix-restore`'s own located message.
     Restore(ConnectApplyError),
 }
@@ -39,56 +40,62 @@ impl std::fmt::Display for BootError {
 impl std::error::Error for BootError {}
 
 /// Connects for the daemon's run, restoring `latest` first when the server
-/// has no sessions. Returns `Ok(None)` when the server has no sessions and
-/// nothing is saved: there is nothing to attach to and nothing to put there,
-/// and starting a server the user never asked for is not the daemon's call,
-/// so the caller waits and asks again (DESIGN.md §8: "if tmux isn't running
-/// … the daemon idles").
+/// holds nothing the user built. Returns `Ok(None)` when the server has no
+/// sessions and nothing is saved: there is nothing to attach to and nothing
+/// to put there, and starting a server the user never asked for is not the
+/// daemon's call, so the caller waits and asks again (DESIGN.md §8: "if tmux
+/// isn't running … the daemon idles").
 ///
 /// `on_notification` becomes the returned client's notification sink.
-/// `on_log` receives one line saying which branch was taken.
+/// `on_log` receives one line saying which branch was taken, naming the
+/// user's sessions when those are why nothing was restored.
 ///
-/// The session count is a snapshot of a server nothing locks: a session the
-/// user starts after it is taken can still be on the server when the restore
-/// runs. No number of re-checks closes that window, and none is needed to
-/// keep the promise that matters: restore only ever adds sessions, never
-/// kills or rewrites one it did not create, and a snapshot session whose name
-/// is already taken fails the restore loudly rather than touching the live
-/// one.
+/// This probe only decides; `connect_and_apply` probes again right before it
+/// acts, so a session the user builds in between turns the server into one
+/// that restore only adds beside, never one it replaces.
 pub fn connect_and_boot(
     socket: Option<String>,
     store: &Store,
     mut on_log: impl FnMut(&str),
     on_notification: impl FnMut(ServerMessage) + 'static,
 ) -> Result<Option<Client<SpawnTransport>>, BootError> {
-    let existing = count_sessions(socket.as_deref()).map_err(BootError::Restore)?;
-    if existing > 0 {
+    let server = probe(socket.as_deref()).map_err(BootError::Restore)?;
+    if let ServerState::Built(built) = &server {
+        let names: Vec<&str> = built.iter().map(|name| name.as_str()).collect();
         on_log(&format!(
-            "server already has {existing} session(s); staying in save mode"
+            "server has session(s) the user built ({}); not restoring into it, staying in save mode",
+            names.join(", ")
         ));
         return attach(socket, on_notification).map(Some);
     }
 
-    let snapshot = match store.load_latest() {
-        Ok(snapshot) => snapshot,
-        Err(StoreError::NoLatest) => {
-            on_log("no sessions and no saved snapshot; waiting for a tmux session");
-            return Ok(None);
+    match (server, store.load_latest()) {
+        (_, Ok(snapshot)) => {
+            let (client, _outcome) =
+                connect_and_apply(socket, &snapshot, &plan(&snapshot), on_notification)
+                    .map_err(BootError::Restore)?;
+            on_log(&format!(
+                "restored {} session(s) from the latest snapshot",
+                snapshot.sessions.len()
+            ));
+            Ok(Some(client))
         }
-        Err(e) => return Err(BootError::Store(e)),
-    };
-    let (client, _outcome) =
-        connect_and_apply(socket, &snapshot, &plan(&snapshot), on_notification)
-            .map_err(BootError::Restore)?;
-    on_log(&format!(
-        "restored {} session(s) from the latest snapshot",
-        snapshot.sessions.len()
-    ));
-    Ok(Some(client))
+        (ServerState::Empty, Err(StoreError::NoLatest)) => {
+            on_log("no sessions and no saved snapshot; waiting for a tmux session");
+            Ok(None)
+        }
+        (_, Err(StoreError::NoLatest)) => {
+            on_log(
+                "server holds only bootstrap sessions and nothing is saved yet; staying in save mode",
+            );
+            attach(socket, on_notification).map(Some)
+        }
+        (_, Err(e)) => Err(BootError::Store(e)),
+    }
 }
 
 /// Bare `attach-session` attaches to the server's most recently used
-/// session, which exists: the caller just counted it.
+/// session, which exists: the caller just probed it.
 fn attach(
     socket: Option<String>,
     on_notification: impl FnMut(ServerMessage) + 'static,

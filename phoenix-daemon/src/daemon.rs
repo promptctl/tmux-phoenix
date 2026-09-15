@@ -157,7 +157,11 @@ fn is_connection_dead(e: &TmuxError) -> bool {
 /// A single capture-or-save failure is reported (via `on_error`) and the
 /// loop continues — a transient hiccup must not kill a long-running daemon.
 /// Only a failure setting up `no-output`/the subscription is fatal, since
-/// without those the daemon can't do its job at all.
+/// without those the daemon can't do its job at all. The store declining to
+/// save a server that holds only bootstrap sessions ends the run instead,
+/// returning that error: whether to restore into such a server is boot
+/// restore's question, and the boot probe may have read a login shell's
+/// prompt mid-`git` as a program the user was running.
 pub fn run<T: Transport>(
     client: &mut Client<T>,
     activity: &StructureActivity,
@@ -218,6 +222,13 @@ pub fn run<T: Transport>(
                     previous_content = previous_content_from_snapshot(&snapshot);
                     state.record_save(Instant::now());
                 }
+                // The store declining a server that holds only bootstrap
+                // sessions means boot restore is due, whatever the boot probe
+                // saw: end the run so `run_resilient` boots again, where that
+                // decision lives.
+                Err(declined @ DaemonError::Store(StoreError::BootstrapOnly)) => {
+                    return Err(declined)
+                }
                 Err(e) => on_error(&e),
             }
         }
@@ -267,8 +278,12 @@ pub fn run_resilient(
                     &mut should_continue,
                 );
                 client.close();
-                if let Err(e) = result {
-                    on_log(&format!("connection lost ({e}); will retry"));
+                match result {
+                    Ok(()) => {}
+                    Err(DaemonError::Store(StoreError::BootstrapOnly)) => on_log(
+                        "server holds only bootstrap sessions; booting again to restore into it",
+                    ),
+                    Err(e) => on_log(&format!("connection lost ({e}); will retry")),
                 }
             }
             Ok(None) => {}

@@ -20,6 +20,17 @@ impl IsolatedTmux {
         assert!(status.success(), "tmux new-session failed");
         Self { socket, session }
     }
+
+    /// Splits the session's window so the server holds a session the user
+    /// built. A lone window with one idle shell is a bootstrap session, which
+    /// the store refuses to publish as `latest`.
+    pub fn build(&self) {
+        let status = std::process::Command::new("tmux")
+            .args(["-S", &self.socket, "split-window", "-t", &self.session])
+            .status()
+            .expect("failed to run tmux split-window");
+        assert!(status.success(), "tmux split-window failed");
+    }
 }
 
 impl Drop for IsolatedTmux {

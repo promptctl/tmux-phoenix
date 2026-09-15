@@ -17,12 +17,15 @@ USAGE:
 
 save: exit 0 on a clean save, 3 if some pane's foreground program or working
 directory couldn't be fully recovered (the snapshot is still saved), 1 on
-failure. Prints the saved generation's path on stdout.
+failure, including a server holding only untouched bootstrap sessions (one
+window, one idle shell each), which is never saved. Prints the saved
+generation's path on stdout.
 --keep N (save, daemon, install): how many generations to keep, at least 1
 (default 10); older ones are pruned after each save.
 list: one saved generation per line on stdout, tab-separated
 (captured_at_unix, format_version, path), newest first.
 restore: rebuilds the latest (or --file) snapshot into new tmux sessions,
+replacing the server's sessions only when every one is a bootstrap session,
 each pane back at its captured working directory and running the program it
 was running. A pane that was idle at its shell comes back as an idle shell.
 --dry-run prints the tmux commands that would run without running them. A pane's
@@ -31,8 +34,10 @@ that only exists once restore actually runs.
 daemon: runs in the foreground until killed. Saves pane structure and
 scrollback once activity has been quiet for --debounce seconds (default 10),
 with a --max-interval backstop (default 300) so idle sessions still
-checkpoint. On a server with no sessions it restores the latest snapshot; on
-one with sessions it never restores. Keeps retrying while tmux is not running.
+checkpoint. On a server with no sessions, or only bootstrap sessions (what a
+terminal starting tmux creates), it restores the latest snapshot in their
+place; on one holding a session you built it never restores. Keeps retrying
+while tmux is not running.
 install: writes a launchd user agent (macOS) or systemd --user unit (Linux)
 that runs \"phoenix daemon\" with these settings, and prints the command to
 activate it. Never activates the service itself.";

@@ -2,7 +2,7 @@
 //! unit-testable with no tmux running. `tmux-restore-qll.2` executes the
 //! resulting ordered [`TmuxCommand`]s.
 
-use phoenix_core::{CapturedProgram, NonEmpty, Pane, Session, Snapshot, Window, WindowIndex};
+use phoenix_core::{Foreground, Pane, Session, Snapshot, Window, WindowIndex};
 
 use crate::command::{PlanStep, TmuxCommand};
 
@@ -156,41 +156,19 @@ fn maybe_replay_content(
     }
 }
 
-/// Basenames (tmux's own `pane_current_command`) of interactive shells —
-/// see [`foreground_argv`].
-const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "elvish", "nu", "xonsh",
-];
-
-/// The command line to relaunch in `program`'s pane, or `None` when the
-/// pane had no foreground program of its own to resume. Two shapes mean
-/// "none":
-///
-/// - Absent `argv`: best-effort `ps` recovery failed for this pane
-///   (`CapturedProgram`'s doc comment) — there is no command line to run.
-/// - A bare interactive shell: tmux reports the pane's own shell as its
-///   foreground whenever the pane is idle at a prompt, and restore already
-///   creates each pane as a fresh shell at the captured cwd, so running it
-///   again would only nest a second shell inside the first. Only a shell
-///   invoked with no non-flag argument counts as idle — `bash deploy.sh`
-///   is a script the user was running, not an idle prompt.
-fn foreground_argv(program: &CapturedProgram) -> Option<&NonEmpty<String>> {
-    let argv = program.argv.as_ref()?;
-    let idle_shell = SHELLS.contains(&program.command.as_str())
-        && argv.iter().skip(1).all(|arg| arg.starts_with('-'));
-    (!idle_shell).then_some(argv)
-}
-
 /// Emits `RelaunchProgram` for whatever `pane` had in its foreground when
-/// the snapshot was taken (see [`foreground_argv`]), so a restored pane
-/// comes back running what it was running.
+/// the snapshot was taken, so a restored pane comes back running what it was
+/// running. An idle shell or an unrecovered argv gets nothing: restore
+/// already creates every pane as a fresh shell at its cwd, so relaunching an
+/// idle shell would only nest a second one, and an unknown program has no
+/// command line to run.
 fn maybe_relaunch_program(
     session: &Session,
     window: WindowIndex,
     pane: &Pane,
     commands: &mut Vec<PlanStep>,
 ) {
-    if let Some(argv) = foreground_argv(&pane.program) {
+    if let Foreground::Program(argv) = pane.program.foreground() {
         commands.push(PlanStep::Command(TmuxCommand::RelaunchProgram {
             session: session.name().clone(),
             window,
@@ -203,8 +181,8 @@ fn maybe_relaunch_program(
 mod tests {
     use super::*;
     use phoenix_core::{
-        FormatVersion, Layout, OffsetDateTime, PaneContent, PaneId, PaneIndex, ProgramName,
-        SessionName, TmuxVersion, Utf8PathBuf, WindowIndex, WindowName,
+        CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, PaneContent, PaneId,
+        PaneIndex, ProgramName, SessionName, TmuxVersion, Utf8PathBuf, WindowIndex, WindowName,
     };
 
     fn program(command: &str, argv: &[&str]) -> CapturedProgram {
