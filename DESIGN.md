@@ -363,8 +363,15 @@ bootstrap whether or not the restore succeeded. A snapshot holding a session nam
 ## 7. Persistence
 
 `phoenix-store` owns the save dir (`${XDG_DATA_HOME}/tmux-phoenix/`) and is its single
-writer, enforced by an exclusive lock on the dir held from temp write through prune
-(`[LAW:single-enforcer]`).
+writer (`[LAW:single-enforcer]`): `Store::save` takes an exclusive `flock` on
+`${store_dir}/.lock` before choosing a generation id and holds it through prune, so a
+manual `phoenix save` and the daemon's save run one at a time. How long a save waits
+for the lock is a value its caller passes, not a mode: `phoenix save` waits up to 10 s,
+then fails naming the contention; the daemon does not wait, so a contended cycle fails
+without counting as a save and its next poll tries again. A generation's id is its
+capture's Unix timestamp, raised above the newest existing id when it isn't already, so
+ids rise in save order: `latest` always names the highest id, so any retention of at
+least one keeps it.
 Serialize to a temp file, `fsync`, `rename(2)` onto the final name, then atomically
 repoint `latest` — which therefore only ever names a fully-written snapshot; a crash
 mid-save leaves the last good one untouched (`[LAW:one-source-of-truth]`). Keep the

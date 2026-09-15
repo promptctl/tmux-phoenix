@@ -1,5 +1,7 @@
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use phoenix_core::SnapshotError;
 
@@ -39,6 +41,12 @@ pub enum StoreError {
     /// generation file referencing it didn't, or vice versa) or the blob
     /// store was pruned/damaged independently of the generation files.
     BlobNotFound,
+    /// Another save held this store's lock for the whole of the caller's
+    /// `wait`; this save wrote nothing.
+    Contended {
+        lock: PathBuf,
+        waited: Duration,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -66,6 +74,12 @@ impl fmt::Display for StoreError {
             StoreError::Snapshot(e) => write!(f, "{e}"),
             StoreError::NoLatest => write!(f, "no snapshot has been saved yet"),
             StoreError::BlobNotFound => write!(f, "referenced content blob is missing"),
+            StoreError::Contended { lock, waited } => write!(
+                f,
+                "another save holds the store lock {} (gave up after {:.1}s)",
+                lock.display(),
+                waited.as_secs_f64()
+            ),
         }
     }
 }

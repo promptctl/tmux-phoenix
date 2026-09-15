@@ -101,6 +101,10 @@ fn previous_content_from_snapshot(snapshot: &Snapshot) -> HashMap<u32, PreviousP
         .collect()
 }
 
+/// The daemon never waits on another save: a contended save fails this
+/// cycle without recording a save, so [`run`]'s next poll tries again.
+const SAVE_WAIT: Duration = Duration::ZERO;
+
 fn capture_and_save<T: Transport>(
     client: &mut Client<T>,
     store: &Store,
@@ -115,7 +119,7 @@ fn capture_and_save<T: Transport>(
     )
     .map_err(DaemonError::Capture)?;
     store
-        .save(&snapshot, keep_generations)
+        .save(&snapshot, keep_generations, SAVE_WAIT)
         .map_err(DaemonError::Store)?;
     Ok(snapshot)
 }
