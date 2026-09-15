@@ -481,11 +481,14 @@ a login terminal someone typed into before the daemon connected (§6). The same 
 shell redraws its prompt reads as built and is saved, but the generations before it are
 kept and restorable with `restore --file`. `run_resilient` wraps all of this in a reconnect loop, so a
 reconnect after tmux comes back is itself a boot restore. A reconnect to the same server is
-not: the loop remembers the server its last run was on (`ServerId`, tmux's
-`#{pid}:#{start_time}`, which changes when the server restarts on the same socket), and boot
-leaves bootstrap sessions on that server to the user, since they are what the user kept
-after closing the session the daemon's connection was on. Only a run that shows boot
-misread the server makes the loop forget it; `TmuxError::{Send, Read,
+not: the loop remembers the decision boot made for the server its last run was on
+(`Decided`: that server's `ServerId`, tmux's `#{pid}:#{start_time}`, which changes when the
+server restarts on the same socket, and its `Boot`, which `run` advances in place), and a
+reconnect to that server resumes the decision instead of probing for a new one. So a server
+the daemon has saved is never restored over after the user closes the session the daemon's
+connection was on, whatever the sessions they kept look like then, and a decision still
+declined stays provisional on the same terms as before. Only a run that shows boot misread
+the server makes the loop forget it; `TmuxError::{Send, Read,
 TransportClosed, NotReady}` mark the connection dead, and every other error is one
 command failing. `phoenix install` writes the launchd plist or systemd unit with the
 binary's absolute path (from `current_exe`, since `$PATH` is minimal under both

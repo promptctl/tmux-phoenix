@@ -15,9 +15,8 @@ use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
 };
 
-use crate::boot::{connect_and_boot, Boot, Booted};
+use crate::boot::{connect_and_boot, Boot, Booted, Decided};
 use crate::debounce::{DebouncePolicy, DebounceState};
-use phoenix_restore::ServerId;
 
 /// The structure-change indicator subscribed to (DESIGN.md §8's "structure
 /// subscriptions"): `#{window_layout}` for every window, which changes on
@@ -172,11 +171,12 @@ fn is_connection_dead(e: &TmuxError) -> bool {
 /// misread the server ([`Boot::misread`]): the boot probe may have read a
 /// login shell's prompt mid-`git` as a program the user was running, and
 /// whether to restore is boot restore's question. Otherwise the refusal is
-/// reported, and settles `boot` for good.
+/// reported, and settles `boot` for good. `boot` is the caller's, advanced in
+/// place, so a reconnect to the same server resumes from what this run settled.
 pub fn run<T: Transport>(
     client: &mut Client<T>,
     activity: &StructureActivity,
-    mut boot: Boot,
+    boot: &mut Boot,
     store: &Store,
     config: &RunConfig,
     mut on_error: impl FnMut(&DaemonError),
@@ -233,7 +233,7 @@ pub fn run<T: Transport>(
                 Ok(Cycle::Saved(snapshot)) => {
                     previous_content = previous_content_from_snapshot(&snapshot);
                     state.record_save(Instant::now());
-                    boot = Boot::Settled;
+                    *boot = Boot::Settled;
                 }
                 Ok(Cycle::Refused(snapshot)) => {
                     // [LAW:dataflow-not-control-flow] a refusal ends the cycle
@@ -246,7 +246,7 @@ pub fn run<T: Transport>(
                     if boot.misread(&snapshot) {
                         return Err(refused);
                     }
-                    boot = Boot::Settled;
+                    *boot = Boot::Settled;
                     on_error(&refused);
                 }
                 Err(e) => on_error(&e),
@@ -284,47 +284,49 @@ pub fn run_resilient(
     mut on_log: impl FnMut(&str),
     mut should_continue: impl FnMut() -> bool,
 ) {
-    // The server the last run was on: reconnecting to it is not a boot. Only a
-    // run that shows boot misread the server forgets it, so the next boot
-    // decides afresh (`[LAW:one-source-of-truth]` — this loop is the one owner
-    // of what the daemon has already run beside).
-    let mut ran_on: Option<ServerId> = None;
+    // The boot decision for the server the last run was on: reconnecting to it
+    // keeps that decision rather than booting again. Only a run that shows boot
+    // misread the server forgets it, so the next boot decides afresh
+    // (`[LAW:one-source-of-truth]` — this loop is the one owner of what the
+    // daemon has already decided about the server it runs beside).
+    let mut last: Option<Decided> = None;
     while should_continue() {
         let activity = StructureActivity::new();
         match connect_and_boot(
             socket.clone(),
             store,
-            ran_on.as_ref(),
+            last.as_ref(),
             &mut on_log,
             activity.sink(),
         ) {
             Ok(Some(Booted {
                 mut client,
-                boot,
-                server,
+                mut decided,
             })) => {
-                ran_on = Some(server);
                 on_log("connected");
                 let result = run(
                     &mut client,
                     &activity,
-                    boot,
+                    &mut decided.boot,
                     store,
                     config,
                     |e| on_log(&format!("save cycle error: {e}")),
                     &mut should_continue,
                 );
                 client.close();
-                match result {
-                    Ok(()) => {}
+                last = match result {
+                    Ok(()) => Some(decided),
                     Err(DaemonError::Store(StoreError::BootstrapOnly)) => {
-                        ran_on = None;
                         on_log(
                             "the server boot stayed out of holds only bootstrap sessions; booting again",
-                        )
+                        );
+                        None
                     }
-                    Err(e) => on_log(&format!("connection lost ({e}); will retry")),
-                }
+                    Err(e) => {
+                        on_log(&format!("connection lost ({e}); will retry"));
+                        Some(decided)
+                    }
+                };
             }
             Ok(None) => {}
             Err(e) => on_log(&format!("could not connect ({e}); will retry")),
@@ -405,7 +407,7 @@ mod tests {
         let result = run(
             &mut client,
             &activity,
-            Boot::Settled,
+            &mut Boot::Settled,
             &store,
             &config,
             |_e| *error_count.borrow_mut() += 1,

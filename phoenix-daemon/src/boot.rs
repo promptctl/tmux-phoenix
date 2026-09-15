@@ -51,10 +51,9 @@ impl std::error::Error for BootError {}
 /// What boot decided, which is what a later refused save means to the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Boot {
-    /// Restored `latest`, found nothing saved to restore, or reconnected to
-    /// the server this daemon was already running on. Final for this server:
-    /// bootstrap sessions on it later on, this run or any reconnect to it, are
-    /// the user's to keep.
+    /// Restored `latest`, found nothing saved to restore, or saved since.
+    /// Final for this server: bootstrap sessions on it later on, this run or
+    /// any reconnect to it, are the user's to keep.
     Settled,
     /// Stayed out because the probe took these sessions for ones the user
     /// built. Provisional until the run's first save succeeds: the probe
@@ -82,20 +81,26 @@ impl Boot {
     }
 }
 
-/// A connection boot handed back, with what the daemon needs to know about how
-/// it was made.
+/// The boot decision made for one server. A reconnect to that server keeps it
+/// rather than booting again, and the run advances it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decided {
+    /// So a later reconnect can tell this server from one restarted on the
+    /// same socket.
+    pub server: ServerId,
+    pub boot: Boot,
+}
+
+/// A connection boot handed back, with the decision it was made under.
 pub struct Booted {
     pub client: Client<SpawnTransport>,
-    pub boot: Boot,
-    /// The server connected to, so a later reconnect can tell it from one
-    /// restarted on the same socket.
-    pub server: ServerId,
+    pub decided: Decided,
 }
 
 /// Connects for the daemon's run, restoring `latest` first when the server
-/// holds nothing the user built and is not `ran_on`, the server this daemon's
-/// last run was on: reconnecting to that server is not a boot, and bootstrap
-/// sessions on it are what the user kept. Returns `Ok(None)` when the server has no
+/// holds nothing the user built. A reconnect to `last`'s server is not a boot:
+/// it keeps `last`'s decision, so a server the daemon has already run beside is
+/// never restored over by a second look at it. Returns `Ok(None)` when the server has no
 /// sessions and nothing is saved: there is nothing to attach to and nothing
 /// to put there, and starting a server the user never asked for is not the
 /// daemon's call, so the caller waits and asks again (DESIGN.md §8: "if tmux
@@ -113,7 +118,7 @@ pub struct Booted {
 pub fn connect_and_boot(
     socket: Option<String>,
     store: &Store,
-    ran_on: Option<&ServerId>,
+    last: Option<&Decided>,
     mut on_log: impl FnMut(&str),
     on_notification: impl FnMut(ServerMessage) + 'static,
 ) -> Result<Option<Booted>, BootError> {
@@ -122,25 +127,24 @@ pub fn connect_and_boot(
     let server = probe(identify).map_err(BootError::Restore)?;
     let returning = server_id(identify)
         .map_err(BootError::Restore)?
-        .is_some_and(|id| ran_on == Some(&id));
+        .and_then(|id| last.filter(|last| last.server == id));
 
     let connected = match (server, returning, store.load_latest()) {
-        (ServerState::Built(built), _, _) => {
+        (_, Some(last), _) => {
+            on_log(
+                "reconnected to the server this daemon was running on; keeping its boot decision, \
+                 not restoring into it",
+            );
+            Some((attach(socket, on_notification)?, last.boot.clone()))
+        }
+        (ServerState::Built(built), None, _) => {
             on_log(&format!(
                 "server has session(s) the user built ({}); not restoring into it, staying in save mode",
                 joined(&built)
             ));
             Some((attach(socket, on_notification)?, Boot::Declined(built)))
         }
-        (ServerState::BootstrapOnly(kept), true, _) => {
-            on_log(&format!(
-                "reconnected to the server this daemon was running on; its bootstrap session(s) \
-                 ({}) are the user's, not restoring into it",
-                joined(&kept)
-            ));
-            Some((attach(socket, on_notification)?, Boot::Settled))
-        }
-        (_, _, Ok(snapshot)) => {
+        (_, None, Ok(snapshot)) => {
             let (client, _outcome) =
                 connect_and_apply(socket, &snapshot, &plan(&snapshot), on_notification)
                     .map_err(BootError::Restore)?;
@@ -150,17 +154,17 @@ pub fn connect_and_boot(
             ));
             Some((client, Boot::Settled))
         }
-        (ServerState::Empty, _, Err(StoreError::NoLatest)) => {
+        (ServerState::Empty, None, Err(StoreError::NoLatest)) => {
             on_log("no sessions and no saved snapshot; waiting for a tmux session");
             None
         }
-        (_, _, Err(StoreError::NoLatest)) => {
+        (_, None, Err(StoreError::NoLatest)) => {
             on_log(
                 "server holds only bootstrap sessions and nothing is saved yet; staying in save mode",
             );
             Some((attach(socket, on_notification)?, Boot::Settled))
         }
-        (_, _, Err(e)) => return Err(BootError::Store(e)),
+        (_, None, Err(e)) => return Err(BootError::Store(e)),
     };
 
     connected
@@ -170,8 +174,7 @@ pub fn connect_and_boot(
                 .ok_or(BootError::Vanished)?;
             Ok(Booted {
                 client,
-                boot,
-                server,
+                decided: Decided { server, boot },
             })
         })
         .transpose()

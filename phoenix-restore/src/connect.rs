@@ -406,11 +406,10 @@ impl Scaffold {
         }
     }
 
-    /// Removes this scaffolding once the snapshot is restored, first moving any
-    /// terminal still on it — a login terminal — onto `restored`, since a
-    /// client whose session is killed is detached. Control-mode clients stay:
-    /// the restore's own connection just left this session and may still be
-    /// listed while tmux notices, and a control client has no screen to keep.
+    /// Removes this scaffolding once the snapshot is restored, first moving
+    /// every client still on it onto `restored`, since a client whose session
+    /// is killed is detached. That includes control-mode clients: iTerm2's
+    /// `tmux -CC` is the user's terminal, and closes its windows on detach.
     fn remove(&self, socket: Option<&str>, restored: &str) -> Result<(), ConnectApplyError> {
         let clients = run_plain(
             socket,
@@ -419,16 +418,11 @@ impl Scaffold {
                 "-t",
                 &exact(self.name()),
                 "-F",
-                "#{client_control_mode}\t#{client_name}",
+                "#{client_name}",
             ],
             "list the clients on a bootstrap session",
         )?;
-        let terminals = clients
-            .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .filter(|(control_mode, _)| *control_mode == "0")
-            .map(|(_, name)| name);
-        for client in terminals {
+        for client in clients.lines() {
             match run_plain(
                 socket,
                 &["switch-client", "-c", client, "-t", &exact(restored)],

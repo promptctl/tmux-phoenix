@@ -123,16 +123,28 @@ fn snapshot(sessions: Vec<Session>) -> Snapshot {
     }
 }
 
-/// Criterion 1 with a real terminal attached: the login session shares the
-/// snapshot's session name, and a terminal client (hosted in a pane of a
-/// second server, so it has a real pty) is attached to it. Restore replaces
-/// the session and moves the terminal onto the restored one instead of
-/// detaching it.
-#[test]
-fn restoring_over_a_login_session_replaces_it_and_keeps_its_terminal() {
-    let inner = Server::new("login");
-    let host = Server::new("login-host");
-    inner.tmux(&["new-session", "-d", "-s", "0", "-x", "80", "-y", "24"]);
+/// Criterion 1 with a real client attached: the login session shares the
+/// snapshot's session name, and a client started as `tmux <attach> -t =0`
+/// (hosted in a pane of a second server, so it has a real pty) is attached to
+/// it. Restore replaces the session and moves the client onto the restored
+/// one instead of detaching it. Returns each client's
+/// `#{client_control_mode} #{session_name}` afterwards.
+fn restore_over_a_login_session_attached_by(name: &str, attach: &str) -> Vec<String> {
+    let inner = Server::new(name);
+    let host = Server::new(&format!("{name}-host"));
+    // A shell that reads no startup files: a developer's zsh prompt runs `git`,
+    // which the probe rightly reads as a program.
+    inner.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "0",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sh -i",
+    ]);
     // The pane's command runs through the user's shell, where zsh would read
     // an unquoted `=0` as "the path of a command named 0", so it is quoted.
     host.tmux(&[
@@ -140,7 +152,7 @@ fn restoring_over_a_login_session_replaces_it_and_keeps_its_terminal() {
         "-d",
         "-s",
         "terminal",
-        &format!("tmux -S {} attach -t '=0'", inner.0),
+        &format!("tmux -S {} {attach} -t '=0'", inner.0),
     ]);
     let mut attached = false;
     for _ in 0..50 {
@@ -169,15 +181,35 @@ fn restoring_over_a_login_session_replaces_it_and_keeps_its_terminal() {
         "session 0 should be the snapshot's"
     );
     assert_eq!(
-        inner.lines(&["list-clients", "-F", "#{session_name}"]),
-        ["0"],
-        "the terminal should now show the restored session"
-    );
-    assert_eq!(
         host.tmux(&["list-panes", "-t", "=terminal", "-F", "#{pane_dead}"])
             .trim(),
         "0",
         "the terminal's tmux client should still be running"
+    );
+    inner.lines(&[
+        "list-clients",
+        "-F",
+        "#{client_control_mode} #{session_name}",
+    ])
+}
+
+#[test]
+fn restoring_over_a_login_session_replaces_it_and_keeps_its_terminal() {
+    assert_eq!(
+        restore_over_a_login_session_attached_by("login", "attach"),
+        ["0 0"],
+        "the terminal should now show the restored session"
+    );
+}
+
+/// iTerm2's tmux integration is a control-mode client, and it is the user's
+/// terminal: killing its session under it closes their windows.
+#[test]
+fn restoring_over_a_login_session_keeps_a_control_mode_terminal() {
+    assert_eq!(
+        restore_over_a_login_session_attached_by("login-cc", "-CC attach"),
+        ["1 0"],
+        "the control-mode terminal should now show the restored session"
     );
 }
 

@@ -172,8 +172,18 @@ fn a_declined_boot_misread_the_server_only_while_its_built_sessions_remain() {
 #[test]
 fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
     let server = EmptyServer::new("login-race");
+    // A shell that reads no startup files: a developer's zsh prompt runs `git`,
+    // which the probe rightly reads as a program.
     let status = std::process::Command::new("tmux")
-        .args(["-S", &server.socket, "new-session", "-d", "-s", "0"])
+        .args([
+            "-S",
+            &server.socket,
+            "new-session",
+            "-d",
+            "-s",
+            "0",
+            "sh -i",
+        ])
         .status()
         .expect("failed to start the login terminal's session");
     assert!(status.success());
@@ -191,7 +201,8 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
 
     let mut log = Vec::new();
     let phoenix_daemon::Booted {
-        mut client, boot, ..
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
     } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
@@ -274,7 +285,8 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
 
     let mut log = Vec::new();
     let phoenix_daemon::Booted {
-        mut client, boot, ..
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
     } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
@@ -354,7 +366,8 @@ fn boots_with_an_existing_session_never_touches_it() {
 
     let mut log = Vec::new();
     let phoenix_daemon::Booted {
-        mut client, boot, ..
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
     } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,

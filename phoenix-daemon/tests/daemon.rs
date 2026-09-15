@@ -93,7 +93,7 @@ fn daemon_saves_after_a_structural_change_settles() {
     phoenix_daemon::run(
         &mut client,
         &activity,
-        Boot::Settled,
+        &mut Boot::Settled,
         &store,
         &config,
         move |e| errors_clone.borrow_mut().push(e.to_string()),
@@ -144,7 +144,7 @@ fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
     phoenix_daemon::run(
         &mut client,
         &activity,
-        Boot::Settled,
+        &mut Boot::Settled,
         &store,
         &config,
         move |e| errors_clone.borrow_mut().push(e.to_string()),
@@ -227,7 +227,7 @@ fn run_over_a_login_server(
     let result = phoenix_daemon::run(
         &mut client,
         &activity,
-        boot(&login.session),
+        &mut boot(&login.session),
         &store,
         &config,
         move |e| errors_clone.borrow_mut().push(e.to_string()),
