@@ -58,6 +58,10 @@ impl Boot {
     /// this boot misread the server: every session it took for built is still
     /// there, and now holds nothing built. A server whose built sessions the
     /// user closed is a different server, not a misreading, and stays theirs.
+    /// A session whose program the user quit before the first save, leaving
+    /// one idle shell, reads the same as a misreading and is restored over,
+    /// on the same terms as a login terminal someone typed into before boot
+    /// (DESIGN.md §8).
     pub fn misread(&self, refused: &Snapshot) -> bool {
         match self {
             Boot::Settled => false,
@@ -81,7 +85,9 @@ impl Boot {
 ///
 /// This probe only decides; `connect_and_apply` probes again right before it
 /// acts, so a session the user builds in between turns the server into one
-/// that restore only adds beside, never one it replaces.
+/// that restore only adds beside, never one it replaces, and reads the server
+/// once more before retiring scaffolding, so a login session the user builds
+/// in while the plan applies is kept.
 pub fn connect_and_boot(
     socket: Option<String>,
     store: &Store,

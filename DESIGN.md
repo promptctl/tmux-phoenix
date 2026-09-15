@@ -474,7 +474,10 @@ so `run` returns and `run_resilient` boots again and restores `latest`. Anything
 settles the decision and is only reported: the first successful save, a server whose built
 sessions the user closed, and any run after a restore. So a restore whose result reads as
 bootstrap-only (a lone pane whose program was not recovered, or whose program exits) is
-never restored again, and a user who closes down to one idle pane is never replaced. The same instant-reading applies to a save: a capture that lands while a lone idle
+never restored again, and a user who closes their built sessions is never replaced. Idleness
+carries no history, though: a lone session whose program the user quits before the first
+save reads exactly like the misread login prompt, and is restored over on the same terms as
+a login terminal someone typed into before the daemon connected (§6). The same instant-reading applies to a save: a capture that lands while a lone idle
 shell redraws its prompt reads as built and is saved, but the generations before it are
 kept and restorable with `restore --file`. `run_resilient` wraps all of this in a reconnect loop, so a
 reconnect after tmux comes back is itself a boot restore; `TmuxError::{Send, Read,

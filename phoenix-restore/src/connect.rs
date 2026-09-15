@@ -16,8 +16,10 @@
 //! only that list differs (`[LAW:dataflow-not-control-flow]`): set the
 //! scaffolding aside (a session created on an empty server, bootstrap
 //! sessions renamed out of the snapshot's way, nothing on a built server),
-//! apply over it, reattach onto a restored session, then move every client
-//! still on scaffolding onto that session and remove the scaffolding. A
+//! apply over it, reattach onto a restored session, then read the server
+//! again and retire the scaffolding by what it holds now: move every terminal
+//! still on it onto that session and remove it, except a renamed session the
+//! user built something in while the plan applied, which stays theirs. A
 //! restore whose plan did not apply in full tries to put the scaffolding back
 //! instead, so a renamed login session gets its name back rather than being
 //! killed with a terminal still attached; when a partly applied plan already
@@ -100,8 +102,9 @@ pub enum ConnectApplyError {
     /// The control-mode handshake — probe, initial, or the post-restore
     /// reconnect — failed.
     Connect(TmuxError),
-    /// Capturing the live server, to learn what restoring into it means,
-    /// failed.
+    /// Capturing the live server failed: before restoring, to learn what
+    /// restoring into it means, or after the plan applied, to learn what its
+    /// scaffolding holds now.
     Probe(CaptureError),
     /// A restore command failed while applying the plan; the server is left
     /// partially restored (see [`ApplyError`]).
@@ -139,10 +142,7 @@ impl std::fmt::Display for ConnectApplyError {
             ConnectApplyError::Spawn(e) => write!(f, "failed to spawn tmux: {e}"),
             ConnectApplyError::Connect(e) => write!(f, "failed to connect to tmux: {e}"),
             ConnectApplyError::Probe(e) => {
-                write!(
-                    f,
-                    "failed to read what the server holds before restoring: {e}"
-                )
+                write!(f, "failed to read what the server holds: {e}")
             }
             ConnectApplyError::Apply(e) => write!(f, "{e}"),
             ConnectApplyError::Tmux { action, detail } => {
@@ -205,10 +205,16 @@ pub fn probe(socket: Option<&str>) -> Result<ServerState, ConnectApplyError> {
     if count_sessions(socket)? == 0 {
         return Ok(ServerState::Empty);
     }
+    Ok(ServerState::of(&capture_server(socket)?))
+}
+
+/// Every session on a populated server, structure and foreground programs
+/// only, over a short-lived control connection.
+fn capture_server(socket: Option<&str>) -> Result<Snapshot, ConnectApplyError> {
     let mut client = attach(socket.map(str::to_string), None, drop)?;
     let live = capture(&mut client, ContentCapture::Off);
     client.close();
-    Ok(ServerState::of(&live.map_err(ConnectApplyError::Probe)?))
+    live.map_err(ConnectApplyError::Probe)
 }
 
 /// tmux's own stderr for a failed plain invocation, or the exit status when
@@ -336,6 +342,40 @@ impl Scaffold {
         }
     }
 
+    /// Takes this scaffolding off the server once the snapshot is restored,
+    /// going by `now`, a reading taken after the plan applied: applying can
+    /// take seconds, and a renamed login session's terminal stays usable the
+    /// whole time. Gone already (its terminal exited) is done. A renamed
+    /// session now holding something built is the user's again, so it keeps
+    /// its terminal and gets its name back unless the snapshot took it.
+    /// Anything else is removed.
+    fn retire(
+        &self,
+        socket: Option<&str>,
+        now: &Snapshot,
+        snapshot: &Snapshot,
+        restored: &str,
+    ) -> Result<(), ConnectApplyError> {
+        let live = now
+            .sessions
+            .iter()
+            .find(|session| session.name().as_str() == self.name());
+        match (self, live) {
+            (_, None) => Ok(()),
+            (Scaffold::Renamed { from, .. }, Some(session)) if !session.is_bootstrap() => {
+                let taken = snapshot
+                    .sessions
+                    .iter()
+                    .any(|restored| restored.name().as_str() == from);
+                match taken {
+                    true => Ok(()),
+                    false => self.put_back(socket),
+                }
+            }
+            (_, Some(_)) => self.remove(socket, restored),
+        }
+    }
+
     /// Removes this scaffolding once the snapshot is restored, first moving any
     /// terminal still on it — a login terminal — onto `restored`, since a
     /// client whose session is killed is detached. Control-mode clients stay:
@@ -422,6 +462,18 @@ fn each(
     scaffolding.iter().map(step).fold(Ok(()), Result::and)
 }
 
+/// Retires every scaffold ([`Scaffold::retire`]) against one fresh reading of
+/// the server.
+fn retire_all(
+    socket: Option<&str>,
+    scaffolding: &[Scaffold],
+    snapshot: &Snapshot,
+    restored: &str,
+) -> Result<(), ConnectApplyError> {
+    let now = capture_server(socket)?;
+    each(scaffolding, |s| s.retire(socket, &now, snapshot, restored))
+}
+
 /// `primary` with whatever cleanup ran after it folded in.
 fn with_cleanup(
     primary: ConnectApplyError,
@@ -479,10 +531,10 @@ pub fn connect_and_apply(
     // reattach after it failed, so only a plan that did not apply puts the
     // scaffolding back.
     match restored {
-        Ok(restored) => each(&scaffolding, |s| s.remove(sock, restored_name)).map(|()| restored),
+        Ok(restored) => retire_all(sock, &scaffolding, snapshot, restored_name).map(|()| restored),
         Err(reattach @ ConnectApplyError::Reattach { .. }) => Err(with_cleanup(
             reattach,
-            each(&scaffolding, |s| s.remove(sock, restored_name)),
+            retire_all(sock, &scaffolding, snapshot, restored_name),
         )),
         Err(primary) => Err(with_cleanup(
             primary,
@@ -610,6 +662,48 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A socket path every tmux command fails against, so a retire that
+    /// returns `Ok` there provably touched nothing.
+    fn unreachable_socket() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("phoenix-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn retiring_scaffolding_that_is_already_gone_touches_nothing() {
+        let socket = unreachable_socket();
+        let login = Scaffold::Renamed {
+            from: "0".to_string(),
+            to: "phoenix-boot-0".to_string(),
+        };
+        let result = login.retire(
+            socket.to_str(),
+            &snapshot_of(&["0", "work"]),
+            &snapshot_of(&["0", "work"]),
+            "0",
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_renamed_session_built_in_during_the_restore_is_kept_not_killed() {
+        let socket = unreachable_socket();
+        let login = Scaffold::Renamed {
+            from: "0".to_string(),
+            to: "phoenix-boot-0".to_string(),
+        };
+        // `snapshot_of` panes have no recovered argv, so the live
+        // `phoenix-boot-0` reads as built; its old name `0` is the snapshot's.
+        let result = login.retire(
+            socket.to_str(),
+            &snapshot_of(&["0", "phoenix-boot-0"]),
+            &snapshot_of(&["0"]),
+            "0",
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
