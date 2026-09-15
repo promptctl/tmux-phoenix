@@ -190,9 +190,12 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
-    let (mut client, boot) = phoenix_daemon::connect_and_boot(
+    let phoenix_daemon::Booted {
+        mut client, boot, ..
+    } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -240,6 +243,7 @@ fn boots_with_no_sessions_and_no_snapshot_waits_without_starting_a_server() {
     let booted = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -269,9 +273,12 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
-    let (mut client, boot) = phoenix_daemon::connect_and_boot(
+    let phoenix_daemon::Booted {
+        mut client, boot, ..
+    } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -346,9 +353,12 @@ fn boots_with_an_existing_session_never_touches_it() {
         .unwrap();
 
     let mut log = Vec::new();
-    let (mut client, boot) = phoenix_daemon::connect_and_boot(
+    let phoenix_daemon::Booted {
+        mut client, boot, ..
+    } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -400,8 +410,8 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
         )
         .expect("failed to seed a snapshot to restore");
 
-    let (mut client, _) =
-        phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, |_| {}, drop)
+    let phoenix_daemon::Booted { mut client, .. } =
+        phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, None, |_| {}, drop)
             .expect("connect_and_boot failed")
             .expect("a snapshot to restore yields a client");
 

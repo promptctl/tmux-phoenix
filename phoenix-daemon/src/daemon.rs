@@ -15,8 +15,9 @@ use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
 };
 
-use crate::boot::{connect_and_boot, Boot};
+use crate::boot::{connect_and_boot, Boot, Booted};
 use crate::debounce::{DebouncePolicy, DebounceState};
+use phoenix_restore::ServerId;
 
 /// The structure-change indicator subscribed to (DESIGN.md §8's "structure
 /// subscriptions"): `#{window_layout}` for every window, which changes on
@@ -283,10 +284,26 @@ pub fn run_resilient(
     mut on_log: impl FnMut(&str),
     mut should_continue: impl FnMut() -> bool,
 ) {
+    // The server the last run was on: reconnecting to it is not a boot. Only a
+    // run that shows boot misread the server forgets it, so the next boot
+    // decides afresh (`[LAW:one-source-of-truth]` — this loop is the one owner
+    // of what the daemon has already run beside).
+    let mut ran_on: Option<ServerId> = None;
     while should_continue() {
         let activity = StructureActivity::new();
-        match connect_and_boot(socket.clone(), store, &mut on_log, activity.sink()) {
-            Ok(Some((mut client, boot))) => {
+        match connect_and_boot(
+            socket.clone(),
+            store,
+            ran_on.as_ref(),
+            &mut on_log,
+            activity.sink(),
+        ) {
+            Ok(Some(Booted {
+                mut client,
+                boot,
+                server,
+            })) => {
+                ran_on = Some(server);
                 on_log("connected");
                 let result = run(
                     &mut client,
@@ -300,9 +317,12 @@ pub fn run_resilient(
                 client.close();
                 match result {
                     Ok(()) => {}
-                    Err(DaemonError::Store(StoreError::BootstrapOnly)) => on_log(
-                        "the server boot stayed out of holds only bootstrap sessions; booting again",
-                    ),
+                    Err(DaemonError::Store(StoreError::BootstrapOnly)) => {
+                        ran_on = None;
+                        on_log(
+                            "the server boot stayed out of holds only bootstrap sessions; booting again",
+                        )
+                    }
                     Err(e) => on_log(&format!("connection lost ({e}); will retry")),
                 }
             }

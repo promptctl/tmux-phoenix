@@ -42,8 +42,12 @@ impl CapturedProgram {
     pub fn foreground(&self) -> Foreground<'_> {
         match &self.argv {
             None => Foreground::Unknown,
+            // tmux's `command` and the `ps` argv are read at different
+            // instants, so both must name a shell: a `vim` started between the
+            // two reads still shows `zsh` as its command.
             Some(argv)
                 if SHELLS.contains(&self.command.as_str())
+                    && SHELLS.contains(&shell_basename(argv.first()))
                     && argv.iter().skip(1).all(|arg| arg.starts_with('-')) =>
             {
                 Foreground::IdleShell
@@ -51,6 +55,13 @@ impl CapturedProgram {
             Some(argv) => Foreground::Program(argv),
         }
     }
+}
+
+/// The program name an `argv[0]` spells: a login shell's leading `-` and any
+/// directory dropped, so `-zsh` and `/bin/zsh` both read as `zsh`.
+fn shell_basename(arg0: &str) -> &str {
+    let name = arg0.trim_start_matches('-');
+    name.rsplit('/').next().unwrap_or(name)
 }
 
 #[cfg(test)]
@@ -98,6 +109,9 @@ mod tests {
             ("bash", vec!["bash", "deploy.sh"]),
             ("vim", vec!["vim", "notes.md"]),
             ("htop", vec!["htop"]),
+            // tmux still read the shell when `ps` already saw the program.
+            ("zsh", vec!["vim"]),
+            ("zsh", vec!["(bash)"]),
         ] {
             let p = program(command, &argv);
             assert!(

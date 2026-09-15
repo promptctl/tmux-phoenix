@@ -181,15 +181,45 @@ fn spawn_options(socket: Option<String>) -> SpawnOptions {
 /// send restore down the empty-server path (`[LAW:no-silent-failure]`). The
 /// one implementation of this query (`[LAW:one-source-of-truth]`).
 pub fn count_sessions(socket: Option<&str>) -> Result<usize, ConnectApplyError> {
-    let listing = match run_plain(
-        socket,
-        &["list-sessions", "-F", "#{session_name}"],
-        "count the server's sessions",
-    ) {
-        Err(ConnectApplyError::Tmux { detail, .. }) if reports_no_server(&detail) => return Ok(0),
+    session_lines(socket, "#{session_name}", "count the server's sessions").map(|l| l.len())
+}
+
+/// Which tmux server process listens on `socket`, so a server restarted on
+/// the same socket reads as a different one. Verified live against tmux 3.6a:
+/// `#{pid}:#{start_time}` is the same on every session of one server and
+/// changes when the server restarts. `None` where no server runs, or one runs
+/// with no sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerId(String);
+
+pub fn server_id(socket: Option<&str>) -> Result<Option<ServerId>, ConnectApplyError> {
+    Ok(
+        session_lines(socket, "#{pid}:#{start_time}", "identify the tmux server")?
+            .into_iter()
+            .next()
+            .map(ServerId),
+    )
+}
+
+/// One line per session on `socket`, in `format`, and none where no server
+/// runs — the one place a failed `list-sessions` is read as "no server" rather
+/// than an error.
+fn session_lines(
+    socket: Option<&str>,
+    format: &str,
+    action: &'static str,
+) -> Result<Vec<String>, ConnectApplyError> {
+    let listing = match run_plain(socket, &["list-sessions", "-F", format], action) {
+        Err(ConnectApplyError::Tmux { detail, .. }) if reports_no_server(&detail) => {
+            return Ok(Vec::new())
+        }
         other => other?,
     };
-    Ok(listing.lines().filter(|l| !l.is_empty()).count())
+    Ok(listing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// What the server on `socket` holds. An empty server is answered out of band
@@ -399,11 +429,18 @@ impl Scaffold {
             .filter(|(control_mode, _)| *control_mode == "0")
             .map(|(_, name)| name);
         for client in terminals {
-            run_plain(
+            match run_plain(
                 socket,
                 &["switch-client", "-c", client, "-t", &exact(restored)],
                 "move a terminal onto the restored session",
-            )?;
+            ) {
+                // Verified live against tmux 3.6a: a client that detached
+                // between the listing and the move is reported this way, and
+                // there is nothing left to move.
+                Err(ConnectApplyError::Tmux { detail, .. })
+                    if detail.starts_with("can't find client: ") => {}
+                other => other.map(drop)?,
+            }
         }
         kill_session(socket, self.name())
     }
@@ -470,6 +507,11 @@ fn retire_all(
     snapshot: &Snapshot,
     restored: &str,
 ) -> Result<(), ConnectApplyError> {
+    // A restore into a built server set nothing aside, so it has nothing to
+    // read the server for, and no reading of it may fail a restore that applied.
+    let Some(_) = scaffolding.first() else {
+        return Ok(());
+    };
     let now = capture_server(socket)?;
     each(scaffolding, |s| s.retire(socket, &now, snapshot, restored))
 }
