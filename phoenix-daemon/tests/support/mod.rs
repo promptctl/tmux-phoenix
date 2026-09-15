@@ -11,10 +11,22 @@ pub struct IsolatedTmux {
 
 impl IsolatedTmux {
     pub fn new(name: &str) -> Self {
+        Self::spawn(name, &[])
+    }
+
+    /// A session whose one pane runs `command` instead of the developer's
+    /// login shell, whose startup hooks run programs of their own at times no
+    /// test controls.
+    pub fn with_command(name: &str, command: &str) -> Self {
+        Self::spawn(name, &[command])
+    }
+
+    fn spawn(name: &str, command: &[&str]) -> Self {
         let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
         let session = format!("phoenix-test-{name}");
         let status = std::process::Command::new("tmux")
             .args(["-S", &socket, "new-session", "-d", "-s", &session])
+            .args(command)
             .status()
             .expect("failed to run tmux new-session");
         assert!(status.success(), "tmux new-session failed");

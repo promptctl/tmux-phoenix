@@ -18,9 +18,11 @@
 //! sessions renamed out of the snapshot's way, nothing on a built server),
 //! apply over it, reattach onto a restored session, then move every client
 //! still on scaffolding onto that session and remove the scaffolding. A
-//! restore that fails before its plan applied puts the scaffolding back
+//! restore whose plan did not apply in full tries to put the scaffolding back
 //! instead, so a renamed login session gets its name back rather than being
-//! killed with a terminal still attached.
+//! killed with a terminal still attached; when a partly applied plan already
+//! took that name, the failed put-back is reported with the restore's error
+//! and the terminal stays on its renamed session.
 //!
 //! Every restore entry point calls this, so the dance has exactly one
 //! implementation (`[LAW:single-enforcer]`) instead of one per caller that
@@ -320,7 +322,8 @@ impl Scaffold {
         .map(drop)
     }
 
-    /// Undoes [`Scaffold::set_aside`] after a restore whose plan did not apply.
+    /// Undoes [`Scaffold::set_aside`] after a restore whose plan did not apply
+    /// in full. Fails, loudly, when a partly applied plan took the name back.
     fn put_back(&self, socket: Option<&str>) -> Result<(), ConnectApplyError> {
         match self {
             Scaffold::Created { name } => kill_session(socket, name),
@@ -334,8 +337,10 @@ impl Scaffold {
     }
 
     /// Removes this scaffolding once the snapshot is restored, first moving any
-    /// client still on it — a login terminal — onto `restored`, since a
-    /// client whose session is killed is detached.
+    /// terminal still on it — a login terminal — onto `restored`, since a
+    /// client whose session is killed is detached. Control-mode clients stay:
+    /// the restore's own connection just left this session and may still be
+    /// listed while tmux notices, and a control client has no screen to keep.
     fn remove(&self, socket: Option<&str>, restored: &str) -> Result<(), ConnectApplyError> {
         let clients = run_plain(
             socket,
@@ -344,11 +349,16 @@ impl Scaffold {
                 "-t",
                 &exact(self.name()),
                 "-F",
-                "#{client_name}",
+                "#{client_control_mode}\t#{client_name}",
             ],
             "list the clients on a bootstrap session",
         )?;
-        for client in clients.lines().filter(|l| !l.is_empty()) {
+        let terminals = clients
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(control_mode, _)| *control_mode == "0")
+            .map(|(_, name)| name);
+        for client in terminals {
             run_plain(
                 socket,
                 &["switch-client", "-c", client, "-t", &exact(restored)],

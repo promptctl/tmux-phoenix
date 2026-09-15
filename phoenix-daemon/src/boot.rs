@@ -39,6 +39,19 @@ impl std::fmt::Display for BootError {
 
 impl std::error::Error for BootError {}
 
+/// What boot decided, which is what a later refused save means to the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boot {
+    /// Restored `latest`, or found nothing saved to restore. Final: a server
+    /// that holds only bootstrap sessions later on is the user's to keep.
+    Settled,
+    /// Stayed out because the probe saw a session the user built. Provisional
+    /// until the run's first save succeeds: the probe reads foreground
+    /// programs at one instant, and a login shell's prompt briefly runs
+    /// programs of its own (DESIGN.md §8).
+    Declined,
+}
+
 /// Connects for the daemon's run, restoring `latest` first when the server
 /// holds nothing the user built. Returns `Ok(None)` when the server has no
 /// sessions and nothing is saved: there is nothing to attach to and nothing
@@ -58,7 +71,7 @@ pub fn connect_and_boot(
     store: &Store,
     mut on_log: impl FnMut(&str),
     on_notification: impl FnMut(ServerMessage) + 'static,
-) -> Result<Option<Client<SpawnTransport>>, BootError> {
+) -> Result<Option<(Client<SpawnTransport>, Boot)>, BootError> {
     let server = probe(socket.as_deref()).map_err(BootError::Restore)?;
     if let ServerState::Built(built) = &server {
         let names: Vec<&str> = built.iter().map(|name| name.as_str()).collect();
@@ -66,7 +79,7 @@ pub fn connect_and_boot(
             "server has session(s) the user built ({}); not restoring into it, staying in save mode",
             names.join(", ")
         ));
-        return attach(socket, on_notification).map(Some);
+        return attach(socket, on_notification).map(|client| Some((client, Boot::Declined)));
     }
 
     match (server, store.load_latest()) {
@@ -78,7 +91,7 @@ pub fn connect_and_boot(
                 "restored {} session(s) from the latest snapshot",
                 snapshot.sessions.len()
             ));
-            Ok(Some(client))
+            Ok(Some((client, Boot::Settled)))
         }
         (ServerState::Empty, Err(StoreError::NoLatest)) => {
             on_log("no sessions and no saved snapshot; waiting for a tmux session");
@@ -88,7 +101,7 @@ pub fn connect_and_boot(
             on_log(
                 "server holds only bootstrap sessions and nothing is saved yet; staying in save mode",
             );
-            attach(socket, on_notification).map(Some)
+            attach(socket, on_notification).map(|client| Some((client, Boot::Settled)))
         }
         (_, Err(e)) => Err(BootError::Store(e)),
     }

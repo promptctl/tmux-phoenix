@@ -15,7 +15,7 @@ use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
 };
 
-use crate::boot::connect_and_boot;
+use crate::boot::{connect_and_boot, Boot};
 use crate::debounce::{DebouncePolicy, DebounceState};
 
 /// The structure-change indicator subscribed to (DESIGN.md §8's "structure
@@ -159,12 +159,14 @@ fn is_connection_dead(e: &TmuxError) -> bool {
 /// Only a failure setting up `no-output`/the subscription is fatal, since
 /// without those the daemon can't do its job at all. The store declining to
 /// save a server that holds only bootstrap sessions ends the run instead,
-/// returning that error: whether to restore into such a server is boot
-/// restore's question, and the boot probe may have read a login shell's
-/// prompt mid-`git` as a program the user was running.
+/// returning that error, while `boot` is still [`Boot::Declined`]: the boot
+/// probe may have read a login shell's prompt mid-`git` as a program the user
+/// was running, and whether to restore is boot restore's question. Once a save
+/// succeeds, or when boot settled, the refusal is reported like any other.
 pub fn run<T: Transport>(
     client: &mut Client<T>,
     activity: &StructureActivity,
+    mut boot: Boot,
     store: &Store,
     config: &RunConfig,
     mut on_error: impl FnMut(&DaemonError),
@@ -221,12 +223,15 @@ pub fn run<T: Transport>(
                 Ok(snapshot) => {
                     previous_content = previous_content_from_snapshot(&snapshot);
                     state.record_save(Instant::now());
+                    boot = Boot::Settled;
                 }
-                // The store declining a server that holds only bootstrap
-                // sessions means boot restore is due, whatever the boot probe
-                // saw: end the run so `run_resilient` boots again, where that
-                // decision lives.
-                Err(declined @ DaemonError::Store(StoreError::BootstrapOnly)) => {
+                // A declining boot met by a server that holds only bootstrap
+                // sessions was wrong about it: end the run so `run_resilient`
+                // boots again, where that decision lives. Only a declined boot
+                // is reopened, so a restore can never repeat itself.
+                Err(declined @ DaemonError::Store(StoreError::BootstrapOnly))
+                    if boot == Boot::Declined =>
+                {
                     return Err(declined)
                 }
                 Err(e) => on_error(&e),
@@ -267,11 +272,12 @@ pub fn run_resilient(
     while should_continue() {
         let activity = StructureActivity::new();
         match connect_and_boot(socket.clone(), store, &mut on_log, activity.sink()) {
-            Ok(Some(mut client)) => {
+            Ok(Some((mut client, boot))) => {
                 on_log("connected");
                 let result = run(
                     &mut client,
                     &activity,
+                    boot,
                     store,
                     config,
                     |e| on_log(&format!("save cycle error: {e}")),
@@ -281,7 +287,7 @@ pub fn run_resilient(
                 match result {
                     Ok(()) => {}
                     Err(DaemonError::Store(StoreError::BootstrapOnly)) => on_log(
-                        "server holds only bootstrap sessions; booting again to restore into it",
+                        "the server boot stayed out of holds only bootstrap sessions; booting again",
                     ),
                     Err(e) => on_log(&format!("connection lost ({e}); will retry")),
                 }
@@ -365,6 +371,7 @@ mod tests {
         let result = run(
             &mut client,
             &activity,
+            Boot::Declined,
             &store,
             &config,
             |_e| *error_count.borrow_mut() += 1,

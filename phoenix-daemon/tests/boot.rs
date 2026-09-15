@@ -158,7 +158,7 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
-    let mut client = phoenix_daemon::connect_and_boot(
+    let (mut client, boot) = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
         |line| log.push(line.to_string()),
@@ -166,6 +166,7 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
     )
     .expect("connect_and_boot failed")
     .expect("a bootstrap-only server with a snapshot yields a client");
+    assert_eq!(boot, phoenix_daemon::Boot::Settled);
 
     assert!(
         log.iter().any(|l| l.contains("restored 1 session")),
@@ -236,7 +237,7 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
-    let mut client = phoenix_daemon::connect_and_boot(
+    let (mut client, boot) = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
         |line| log.push(line.to_string()),
@@ -246,6 +247,7 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
     .expect("a server with sessions, or a snapshot to restore, yields a client");
 
     assert!(log.iter().any(|l| l.contains("restored 1 session")));
+    assert_eq!(boot, phoenix_daemon::Boot::Settled);
 
     let sessions = server.session_names();
     assert_eq!(
@@ -312,7 +314,7 @@ fn boots_with_an_existing_session_never_touches_it() {
         .unwrap();
 
     let mut log = Vec::new();
-    let mut client = phoenix_daemon::connect_and_boot(
+    let (mut client, boot) = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
         |line| log.push(line.to_string()),
@@ -325,6 +327,11 @@ fn boots_with_an_existing_session_never_touches_it() {
         log.iter()
             .any(|l| l.contains("staying in save mode") && l.contains(&existing_session)),
         "the daemon should say which session kept it from restoring: {log:?}"
+    );
+    assert_eq!(
+        boot,
+        phoenix_daemon::Boot::Declined,
+        "staying out of a built server is provisional"
     );
     assert_eq!(
         server.session_names(),
@@ -361,7 +368,7 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
         )
         .expect("failed to seed a snapshot to restore");
 
-    let mut client =
+    let (mut client, _) =
         phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, |_| {}, drop)
             .expect("connect_and_boot failed")
             .expect("a snapshot to restore yields a client");

@@ -449,7 +449,7 @@ no sleeping. The loop has no wait-with-timeout primitive: once per short poll in
 cheap heartbeat (`display-message -p ""`) makes `execute` read and dispatch whatever
 notifications arrived, then the loop reads the flag and decides. One capture-or-save
 failure is logged and the loop continues, except the store declining a bootstrap-only
-capture, which ends the run so the daemon boots again; only failing to set `no-output` or
+capture after a boot that stayed out, which ends the run so the daemon boots again; only failing to set `no-output` or
 subscribe is fatal to a connection. The daemon carries each save's per-pane content forward
 (seeded from `latest` on start), which is why it is the one path with content capture
 on.
@@ -465,9 +465,14 @@ The probe reads idleness from the process table at one instant, and a login shel
 prompt briefly runs programs of its own: measured live, `git` held the foreground about
 160 ms into startup, in its own process group, indistinguishable from a program the user
 started. So a boot probe can take a bootstrap session for a built one. The daemon doesn't
-leave that to timing: the store refuses every bootstrap-only capture, and `run` returns on
-that refusal, so `run_resilient` boots again and restores `latest` at the next save
-cycle. The same instant-reading applies to a save: a capture that lands while a lone idle
+leave that to timing: boot hands `run` its decision (`Boot::Declined` when it stayed out,
+`Boot::Settled` when it restored or had nothing to restore), the store refuses every
+bootstrap-only capture, and while boot is still `Declined` `run` returns on that refusal,
+so `run_resilient` boots again and restores `latest` at the next save cycle. The first
+successful save settles the decision, and a settled run only reports the refusal: a
+restore whose result reads as bootstrap-only (a lone pane whose program was not recovered,
+or whose program exits) is never restored again, and a user who later closes down to one
+idle pane is never replaced. The same instant-reading applies to a save: a capture that lands while a lone idle
 shell redraws its prompt reads as built and is saved, but the generations before it are
 kept and restorable with `restore --file`. `run_resilient` wraps all of this in a reconnect loop, so a
 reconnect after tmux comes back is itself a boot restore; `TmuxError::{Send, Read,
