@@ -66,6 +66,7 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(300),
         keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+        socket: Some(socket.clone()),
     };
 
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -75,12 +76,10 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
     let log_clone = log.clone();
     let stop_clone = stop.clone();
     let iterations_clone = iterations.clone();
-    let socket_clone = socket.clone();
     let store_for_thread = Store::new(&data_dir);
 
     let handle = std::thread::spawn(move || {
         phoenix_daemon::run_resilient(
-            Some(socket_clone),
             &store_for_thread,
             &config,
             move |line| log_clone.lock().unwrap().push(line.to_string()),
@@ -243,16 +242,15 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(300),
         keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+        socket: Some(socket.clone()),
     };
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let log_clone = log.clone();
     let stop_clone = stop.clone();
-    let socket_clone = socket.clone();
     let store_for_thread = Store::new(&data_dir);
     let handle = std::thread::spawn(move || {
         phoenix_daemon::run_resilient(
-            Some(socket_clone),
             &store_for_thread,
             &config,
             move |line| log_clone.lock().unwrap().push(line.to_string()),
@@ -343,17 +341,16 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
         // well before the daemon tries again.
         reconnect_interval: Duration::from_secs(2),
         keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+        socket: Some(socket.clone()),
     };
 
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let log_clone = log.clone();
     let stop_clone = stop.clone();
-    let socket_clone = socket.clone();
     let store_for_thread = Store::new(&data_dir);
     let handle = std::thread::spawn(move || {
         phoenix_daemon::run_resilient(
-            Some(socket_clone),
             &store_for_thread,
             &config,
             move |line| log_clone.lock().unwrap().push(line.to_string()),
@@ -491,16 +488,15 @@ fn run_resilient_never_restores_over_the_server_it_reconnects_to() {
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(300),
         keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+        socket: Some(socket.clone()),
     };
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let log_clone = log.clone();
     let stop_clone = stop.clone();
-    let socket_clone = socket.clone();
     let store_for_thread = Store::new(&data_dir);
     let handle = std::thread::spawn(move || {
         phoenix_daemon::run_resilient(
-            Some(socket_clone),
             &store_for_thread,
             &config,
             move |line| log_clone.lock().unwrap().push(line.to_string()),
@@ -590,16 +586,15 @@ fn run_resilient_keeps_the_boot_decision_of_the_server_it_reconnects_to() {
         poll_interval: Duration::from_millis(100),
         reconnect_interval: Duration::from_millis(300),
         keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+        socket: Some(socket.clone()),
     };
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let log_clone = log.clone();
     let stop_clone = stop.clone();
-    let socket_clone = socket.clone();
     let store_for_thread = Store::new(&data_dir);
     let handle = std::thread::spawn(move || {
         phoenix_daemon::run_resilient(
-            Some(socket_clone),
             &store_for_thread,
             &config,
             move |line| log_clone.lock().unwrap().push(line.to_string()),

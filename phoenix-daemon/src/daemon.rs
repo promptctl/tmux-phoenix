@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use phoenix_capture::{ContentCapture, PreviousPaneContent};
 use phoenix_core::Snapshot;
+use phoenix_hooks::{Hook, HookError};
 use phoenix_store::{Store, StoreError};
 use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
@@ -64,6 +65,7 @@ pub enum DaemonError {
     Tmux(TmuxError),
     Capture(phoenix_capture::CaptureError),
     Store(StoreError),
+    Hook(HookError),
 }
 
 impl std::fmt::Display for DaemonError {
@@ -72,6 +74,7 @@ impl std::fmt::Display for DaemonError {
             DaemonError::Tmux(e) => write!(f, "{e}"),
             DaemonError::Capture(e) => write!(f, "{e}"),
             DaemonError::Store(e) => write!(f, "{e}"),
+            DaemonError::Hook(e) => write!(f, "{e}"),
         }
     }
 }
@@ -107,18 +110,29 @@ fn previous_content_from_snapshot(snapshot: &Snapshot) -> HashMap<u32, PreviousP
 const SAVE_WAIT: Duration = Duration::ZERO;
 
 /// What one save cycle came to. The store refusing a bootstrap-only capture
-/// is an answer about the server, not a failed save, so it is a value here.
+/// is an answer about the server, not a failed save, so it is a value here,
+/// and so is the user's pre-save hook calling the save off.
 enum Cycle {
-    Saved(Snapshot),
+    /// Saved, with how the post-save hook went: the save stands either way.
+    Saved {
+        snapshot: Snapshot,
+        post_save: Result<(), HookError>,
+    },
     Refused(Snapshot),
+    /// The pre-save hook failed, so nothing was captured.
+    Aborted(HookError),
 }
 
 fn capture_and_save<T: Transport>(
     client: &mut Client<T>,
+    socket: Option<&str>,
     store: &Store,
     previous: &HashMap<u32, PreviousPaneContent>,
     keep_generations: NonZeroUsize,
 ) -> Result<Cycle, DaemonError> {
+    if let Err(aborted) = phoenix_hooks::run(socket, Hook::PreSave) {
+        return Ok(Cycle::Aborted(aborted));
+    }
     let snapshot = phoenix_capture::capture(
         client,
         ContentCapture::On {
@@ -127,7 +141,10 @@ fn capture_and_save<T: Transport>(
     )
     .map_err(DaemonError::Capture)?;
     match store.save(&snapshot, keep_generations, SAVE_WAIT) {
-        Ok(_) => Ok(Cycle::Saved(snapshot)),
+        Ok(saved) => Ok(Cycle::Saved {
+            post_save: phoenix_hooks::run(socket, Hook::PostSave { saved: &saved.path }),
+            snapshot,
+        }),
         Err(StoreError::BootstrapOnly) => Ok(Cycle::Refused(snapshot)),
         Err(e) => Err(DaemonError::Store(e)),
     }
@@ -173,6 +190,10 @@ fn is_connection_dead(e: &TmuxError) -> bool {
 /// whether to restore is boot restore's question. Otherwise the refusal is
 /// reported, and settles `boot` for good. `boot` is the caller's, advanced in
 /// place, so a reconnect to the same server resumes from what this run settled.
+///
+/// Each save runs the user's save hooks, read from the server `config.socket`
+/// names: a failing pre-save hook calls that cycle's save off and a failing
+/// post-save hook leaves it standing; both are reported.
 pub fn run<T: Transport>(
     client: &mut Client<T>,
     activity: &StructureActivity,
@@ -229,11 +250,30 @@ pub fn run<T: Transport>(
         }
 
         if state.should_save(&config.policy, Instant::now()) {
-            match capture_and_save(client, store, &previous_content, config.keep_generations) {
-                Ok(Cycle::Saved(snapshot)) => {
+            match capture_and_save(
+                client,
+                config.socket.as_deref(),
+                store,
+                &previous_content,
+                config.keep_generations,
+            ) {
+                Ok(Cycle::Saved {
+                    snapshot,
+                    post_save,
+                }) => {
                     previous_content = previous_content_from_snapshot(&snapshot);
                     state.record_save(Instant::now());
                     *boot = Boot::Settled;
+                    if let Err(e) = post_save {
+                        on_error(&DaemonError::Hook(e));
+                    }
+                }
+                Ok(Cycle::Aborted(e)) => {
+                    // [LAW:dataflow-not-control-flow] a save the pre-save hook
+                    // called off ends the cycle like a save does, so a hook
+                    // that keeps failing runs once per cycle, not on every poll.
+                    state.record_save(Instant::now());
+                    on_error(&DaemonError::Hook(e));
                 }
                 Ok(Cycle::Refused(snapshot)) => {
                     // [LAW:dataflow-not-control-flow] a refusal ends the cycle
@@ -259,8 +299,11 @@ pub fn run<T: Transport>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RunConfig {
+    /// The server the daemon runs beside, as `--socket` names it; `None` is
+    /// tmux's default server. Its options hold the save hooks [`run`] runs.
+    pub socket: Option<String>,
     /// When [`run`] saves.
     pub policy: DebouncePolicy,
     /// How often [`run`] wakes to drain notifications and decide.
@@ -278,7 +321,6 @@ pub struct RunConfig {
 /// tmux, or keep running across a tmux server restart; it must not exit and
 /// leave recovery to launchd/systemd respawning the whole process.
 pub fn run_resilient(
-    socket: Option<String>,
     store: &Store,
     config: &RunConfig,
     mut on_log: impl FnMut(&str),
@@ -293,7 +335,7 @@ pub fn run_resilient(
     while should_continue() {
         let activity = StructureActivity::new();
         match connect_and_boot(
-            socket.clone(),
+            config.socket.clone(),
             store,
             last.as_ref(),
             &mut on_log,
@@ -390,6 +432,7 @@ mod tests {
         let activity = StructureActivity::new();
         let mut client = Client::new(DeadTransport, activity.sink(), |_, _| {});
         let config = RunConfig {
+            socket: None,
             policy: DebouncePolicy {
                 debounce: Duration::from_secs(3600),
                 max_interval: Duration::from_secs(3600),

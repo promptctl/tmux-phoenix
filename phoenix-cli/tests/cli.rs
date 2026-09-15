@@ -484,3 +484,311 @@ fn daemon_saves_after_a_structural_change_through_the_real_binary() {
         "the save should reflect the split that triggered it"
     );
 }
+
+/// Runs `tmux -S socket args…`, which must succeed, and returns its stdout.
+fn tmux(socket: &str, args: &[&str]) -> String {
+    let out = Command::new("tmux")
+        .args(["-S", socket])
+        .args(args)
+        .output()
+        .expect("failed to run tmux");
+    assert!(
+        out.status.success(),
+        "tmux {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Configures the `name` hook (`pre-save`, `post-restore`, …) on a server.
+fn set_hook(socket: &str, name: &str, command: &str) {
+    tmux(
+        socket,
+        &[
+            "set-option",
+            "-g",
+            &format!("@phoenix-hook-{name}"),
+            command,
+        ],
+    );
+}
+
+/// A directory the hooks under test append their observations to.
+fn hook_log_dir(name: &str) -> TestDataDir {
+    let dir = TestDataDir::new(name);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    dir
+}
+
+fn save(socket: &str, data_dir: &TestDataDir) -> std::process::Output {
+    Command::new(phoenix_bin())
+        .args(["save", "--socket", socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save")
+}
+
+fn restore(socket: &str, data_dir: &TestDataDir) -> std::process::Output {
+    Command::new(phoenix_bin())
+        .args(["restore", "--socket", socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix restore")
+}
+
+/// A server a terminal reached first: one session, `0`, idle at `sh -i` (a
+/// developer's zsh prompt runs `git`, which reads as a program). Torn down one
+/// session at a time — never a server-wide kill.
+struct LoginServer {
+    socket: String,
+}
+
+impl LoginServer {
+    fn new(name: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let server = Self {
+            socket: format!(
+                "/tmp/phoenix-cli-test-{name}-{}-{nanos}",
+                std::process::id()
+            ),
+        };
+        tmux(&server.socket, &["new-session", "-d", "-s", "0", "sh -i"]);
+        for _ in 0..50 {
+            if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
+                phoenix_restore::probe(Some(&server.socket))
+            {
+                return server;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "{} never settled into a bootstrap-only server",
+            server.socket
+        );
+    }
+
+    fn session_names(&self) -> Vec<String> {
+        let out = Command::new("tmux")
+            .args(["-S", &self.socket, "list-sessions", "-F", "#{session_name}"])
+            .output()
+            .expect("failed to list sessions");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl Drop for LoginServer {
+    fn drop(&mut self) {
+        for name in self.session_names() {
+            let _ = Command::new("tmux")
+                .args(["-S", &self.socket, "kill-session", "-t", &name])
+                .status();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// tmux-parity-ure.9 criterion 1, save: pre-save runs before anything is
+/// written, and post-save after, handed the generation it wrote.
+#[test]
+fn save_runs_its_pre_and_post_save_hooks_at_their_points() {
+    let harness = IsolatedTmux::new("cli-save-hooks");
+    harness.build();
+    let data_dir = TestDataDir::new("save-hooks");
+    let logs = hook_log_dir("save-hooks-log");
+    let log = logs.0.join("hooks.log").display().to_string();
+    let latest = data_dir.0.join("tmux-phoenix/latest").display().to_string();
+    set_hook(
+        &harness.socket,
+        "pre-save",
+        &format!(
+            "if [ -e '{latest}' ]; then echo 'pre-save after the save'; \
+             else echo 'pre-save before the save'; fi >> '{log}'"
+        ),
+    );
+    set_hook(
+        &harness.socket,
+        "post-save",
+        &format!("printf 'post-save %s\\n' \"$1\" >> '{log}'"),
+    );
+
+    harness.wait_until_settled();
+    let save = save(&harness.socket, &data_dir);
+
+    assert_eq!(
+        save.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    let saved_path = String::from_utf8(save.stdout).unwrap().trim().to_string();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        format!("pre-save before the save\npost-save {saved_path}\n")
+    );
+}
+
+/// tmux-parity-ure.9 criterion 2: a failing pre-save hook aborts the save with
+/// a message naming the hook, and nothing is saved.
+#[test]
+fn a_failing_pre_save_hook_aborts_the_save_naming_the_hook() {
+    let harness = IsolatedTmux::new("cli-pre-save-fails");
+    harness.build();
+    let data_dir = TestDataDir::new("pre-save-fails");
+    set_hook(&harness.socket, "pre-save", "echo not now >&2; exit 5");
+
+    let save = save(&harness.socket, &data_dir);
+
+    let stderr = String::from_utf8_lossy(&save.stderr);
+    assert_eq!(save.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("@phoenix-hook-pre-save") && stderr.contains("not now"),
+        "the message should name the hook and carry its output: {stderr}"
+    );
+    assert!(
+        save.stdout.is_empty(),
+        "no generation path: nothing was saved"
+    );
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    assert!(store.list().unwrap().is_empty(), "nothing may be saved");
+}
+
+/// tmux-parity-ure.9 criterion 3: a failing post-save hook leaves the completed
+/// save intact, and still reports the failure, as a degraded exit.
+#[test]
+fn a_failing_post_save_hook_leaves_the_save_intact_and_reports_it() {
+    let harness = IsolatedTmux::new("cli-post-save-fails");
+    harness.build();
+    let data_dir = TestDataDir::new("post-save-fails");
+    set_hook(&harness.socket, "post-save", "exit 9");
+
+    harness.wait_until_settled();
+    let save = save(&harness.socket, &data_dir);
+
+    let stderr = String::from_utf8_lossy(&save.stderr);
+    assert_eq!(save.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains("@phoenix-hook-post-save") && stderr.contains("returned 9"),
+        "{stderr}"
+    );
+    let saved_path = String::from_utf8(save.stdout).unwrap().trim().to_string();
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    let generations = store.list().unwrap();
+    assert_eq!(generations.len(), 1);
+    assert_eq!(generations[0].path.display().to_string(), saved_path);
+    store
+        .load_latest()
+        .expect("the save the post-save hook followed should load");
+}
+
+/// tmux-parity-ure.9 criteria 1 and 4, CLI restore: pre-restore runs before any
+/// restored session exists, post-restore once they do, and only after it does
+/// the restore mark itself finished where tmux can see it.
+#[test]
+fn restore_runs_its_hooks_at_their_points_then_marks_itself_finished() {
+    let harness = IsolatedTmux::new("cli-restore-hooks");
+    harness.build();
+    let data_dir = TestDataDir::new("restore-hooks");
+    let logs = hook_log_dir("restore-hooks-log");
+    let log = logs.0.join("hooks.log").display().to_string();
+
+    harness.wait_until_settled();
+    let saved = save(&harness.socket, &data_dir);
+    assert!(
+        saved.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    // A built session keeps the server up once the captured one is gone.
+    tmux(&harness.socket, &["new-session", "-d", "-s", "keepalive"]);
+    tmux(&harness.socket, &["split-window", "-t", "keepalive"]);
+    tmux(&harness.socket, &["kill-session", "-t", &harness.session]);
+
+    let session = &harness.session;
+    let observe = |point: &str| {
+        format!(
+            "if tmux has-session -t '={session}'; then echo '{point} with the session'; \
+             else echo '{point} without the session'; fi >> '{log}'; \
+             printf '{point} marker=%s\\n' \"$(tmux show-options -gqv @phoenix-restored)\" >> '{log}'"
+        )
+    };
+    set_hook(&harness.socket, "pre-restore", &observe("pre-restore"));
+    set_hook(&harness.socket, "post-restore", &observe("post-restore"));
+
+    let restore = restore(&harness.socket, &data_dir);
+
+    assert_eq!(
+        restore.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "pre-restore without the session\npre-restore marker=\n\
+         post-restore with the session\npost-restore marker=\n"
+    );
+    let captured_at = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"))
+        .load_latest()
+        .unwrap()
+        .captured_at
+        .unix_timestamp();
+    assert_eq!(
+        tmux(
+            &harness.socket,
+            &["show-options", "-gqv", "@phoenix-restored"]
+        ),
+        format!("{captured_at}\n")
+    );
+
+    let _ = Command::new("tmux")
+        .args(["-S", &harness.socket, "kill-session", "-t", "keepalive"])
+        .status();
+}
+
+/// tmux-parity-ure.9 criterion 2, restore: a failing pre-restore hook aborts
+/// the restore naming the hook. The login session restore had set aside gets
+/// its name back, nothing is restored, and the restore is never marked finished.
+#[test]
+fn a_failing_pre_restore_hook_aborts_the_restore_and_puts_the_login_session_back() {
+    let source = IsolatedTmux::new("cli-pre-restore-fails");
+    source.build();
+    let data_dir = TestDataDir::new("pre-restore-fails");
+    source.wait_until_settled();
+    let saved = save(&source.socket, &data_dir);
+    assert!(
+        saved.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    let login = LoginServer::new("pre-restore-fails-login");
+    set_hook(
+        &login.socket,
+        "pre-restore",
+        "echo not over my session >&2; exit 4",
+    );
+
+    let restore = restore(&login.socket, &data_dir);
+
+    let stderr = String::from_utf8_lossy(&restore.stderr);
+    assert_eq!(restore.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("@phoenix-hook-pre-restore") && stderr.contains("not over my session"),
+        "{stderr}"
+    );
+    assert_eq!(login.session_names(), vec!["0".to_string()]);
+    assert_eq!(
+        tmux(
+            &login.socket,
+            &["show-options", "-gqv", "@phoenix-restored"]
+        ),
+        ""
+    );
+}

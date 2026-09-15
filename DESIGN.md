@@ -41,6 +41,7 @@ Dependencies flow strictly downhill: a crate depends only on crates in rows belo
 phoenix-cli
 phoenix-daemon
 phoenix-capture   phoenix-restore   phoenix-store
+phoenix-hooks
 tmux-control      phoenix-core
 ```
 
@@ -51,6 +52,8 @@ tmux-control      phoenix-core
 - **`phoenix-capture`** — drives `tmux-control` to interrogate the server into a
   `Snapshot`.
 - **`phoenix-store`** — atomic, versioned, generational persistence.
+- **`phoenix-hooks`** — runs the shell command a user configured for a point in a save
+  or restore (§6).
 - **`phoenix-restore`** — pure `Snapshot -> RestorePlan`; the plan is executed by
   `tmux-control`.
 - **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
@@ -369,6 +372,29 @@ doesn't apply, the scaffolding is put back instead: a created session is killed 
 renamed one gets its name back, so a failed restore never kills a login terminal's
 session out from under it.
 
+**Hooks (`phoenix-hooks`):** four tmux global user options hold shell commands, the way
+tmux-resurrect's `@resurrect-hook-*` options do: `@phoenix-hook-pre-save`,
+`@phoenix-hook-post-save` (given the saved generation's path as `$1`),
+`@phoenix-hook-pre-restore` and `@phoenix-hook-post-restore`. Each point reads its option
+from the server when it is reached, so the CLI and a daemon started by launchd share one
+configuration, `.tmux.conf`, and an unset option runs nothing. The command runs through
+the server's own `run-shell`, so it gets `/bin/sh`, the server's global environment, and a
+`TMUX` naming that server. Verified live against tmux 3.6a, `run-shell` drops the
+command's stderr and expands `#` formats in its argument, so phoenix folds stderr into
+stdout and doubles every `#`: the hook runs as written, and a failure's message carries
+its output. A pre-hook that exits non-zero aborts the save or restore it precedes, with a
+message naming the hook. A post-hook that exits non-zero is reported and the save or
+restore it follows stands: the CLI exits 3, the daemon logs it.
+
+A restore runs the pre-restore hook once its scaffolding is set aside — on an empty server,
+setting it aside is what starts a server to read the option from — and a failing hook puts
+the scaffolding back, as a plan that didn't apply does. Once the scaffolding is retired it
+runs the post-restore hook and then, whatever the hook did, sets `@phoenix-restored` to the
+restored snapshot's capture time in Unix seconds. That option is the sign, visible from
+inside tmux, that a whole-snapshot restore is finished, for `phoenix restore` and the
+daemon's boot restore alike, so a tmux-side integration (iTerm2's tab restore, say) can wait
+on it without a timeout and without racing the restore.
+
 ---
 
 ## 7. Persistence
@@ -452,7 +478,10 @@ failure is logged and the loop continues, except the store declining a bootstrap
 capture after a boot that stayed out, which ends the run so the daemon boots again; only failing to set `no-output` or
 subscribe is fatal to a connection. The daemon carries each save's per-pane content forward
 (seeded from `latest` on start), which is why it is the one path with content capture
-on.
+on. Every save cycle runs the save hooks (§6) on the server `RunConfig::socket` names:
+a failing pre-save hook calls that cycle's save off and, like a refusal, counts as the
+cycle's save, so a hook that keeps failing runs once per cycle rather than on every poll;
+a failing post-save hook is logged.
 
 Boot restore probes the server first (§6). With a session the user built, it names that
 session in its log, attaches, and never restores. Holding nothing the user built and with
@@ -499,8 +528,9 @@ supervisors) and prints the activation command, but never runs it.
 ## 9. CLI, failure philosophy, milestones
 
 **CLI** (exit codes are a contract; stdout parseable, stderr human):
-`save` (0 ok / 3 degraded / 1 fail), `restore [--dry-run|--file]`, `list`, `daemon`,
-`status`, `install`.
+`save` (0 ok / 3 degraded / 1 fail), `restore [--dry-run|--file]` (0 ok / 3 degraded /
+1 fail), `list`, `daemon`, `status`, `install`. Degraded means done, but something short
+of it failed: a pane's argv or cwd recovery, or a post-save or post-restore hook.
 
 **Failure philosophy.** Every external call — each `execute`, each `ps`, each file op —
 is checked (exit zero? output non-empty? parses? sane?) and aborts the current

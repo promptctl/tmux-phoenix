@@ -22,7 +22,7 @@ These are documented tmux-resurrect/continuum behaviors that tmux-phoenix does n
 - **Restore is not idempotent.** tmux-resurrect skips a session that already exists on the target server; tmux-phoenix's plan emits a bare `new-session` and the restore fails outright instead.
 - **No per-program resume strategies.** Restore replays a pane's captured command line and nothing more — there is no equivalent of tmux-resurrect restoring `vim` through its session file, or of its Mosh strategy.
 - **One-shot `phoenix save` captures structure only, not scrollback.** Only the daemon's save path currently delivers content capture.
-- **No tmux-side integration.** It is not a TPM-installable plugin, there are no default keybindings, there is no `#{continuum_status}`-style format string for your status line, and there are no pre/post save and restore hooks.
+- **No tmux-side integration.** It is not a TPM-installable plugin, there are no default keybindings, and there is no `#{continuum_status}`-style format string for your status line.
 
 ## Design
 
@@ -32,12 +32,13 @@ The three stated priorities, in order, are stability, speed, and the efficiency 
 
 ## Crate layout
 
-Seven crates, with dependencies flowing strictly downhill — a crate depends only on crates in rows below it (DESIGN.md §2):
+Eight crates, with dependencies flowing strictly downhill — a crate depends only on crates in rows below it (DESIGN.md §2):
 
 ```
 phoenix-cli
 phoenix-daemon
 phoenix-capture   phoenix-restore   phoenix-store
+phoenix-hooks
 tmux-control      phoenix-core
 ```
 
@@ -45,6 +46,7 @@ tmux-control      phoenix-core
 - **`phoenix-core`** — the domain model: the `Snapshot` tree, pure types, no I/O.
 - **`phoenix-capture`** — drives `tmux-control` to interrogate a live server into a `Snapshot`.
 - **`phoenix-store`** — atomic, versioned, generational persistence.
+- **`phoenix-hooks`** — runs the shell command you configured for a point in a save or restore.
 - **`phoenix-restore`** — the pure `Snapshot -> RestorePlan` planner; `tmux-control` executes the plan.
 - **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
 - **`phoenix-cli`** — maps command lines onto the crates beneath it; builds the `phoenix` binary.
@@ -56,6 +58,7 @@ tmux-control      phoenix-core
 - `phoenix save` captures the current server's structure and prints where it saved it; `phoenix list` shows saved generations. A server holding only the untouched session a terminal creates by starting `tmux` is never saved over your latest snapshot.
 - `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it: onto a running server, one with no sessions, or one holding only a terminal's untouched session, which it replaces while keeping that terminal attached.
 - `phoenix daemon` saves on structural change and restores the latest snapshot into a server holding nothing you built — no sessions, or only a terminal's untouched session, even when the terminal reached tmux first. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
+- Hooks work like tmux-resurrect's: set `@phoenix-hook-pre-save`, `@phoenix-hook-post-save`, `@phoenix-hook-pre-restore` or `@phoenix-hook-post-restore` to a shell command in `.tmux.conf`, and it runs at that point of every save and restore, the daemon's included (post-save gets the saved file as `$1`). A failing pre-hook stops the save or restore it precedes. Once a restore finishes it sets `@phoenix-restored`, so a tmux-side integration can wait for it.
 
 `phoenix --help` lists every flag.
 

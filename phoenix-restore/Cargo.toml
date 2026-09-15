@@ -7,4 +7,5 @@ description = "Pure Snapshot -> RestorePlan planning for tmux-phoenix"
 [dependencies]
 phoenix-capture = { path = "../phoenix-capture" }
 phoenix-core = { path = "../phoenix-core" }
+phoenix-hooks = { path = "../phoenix-hooks" }
 tmux-control = { path = "../tmux-control" }

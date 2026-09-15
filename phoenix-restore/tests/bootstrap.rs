@@ -169,10 +169,11 @@ fn restore_over_a_login_session_attached_by(name: &str, attach: &str) -> Vec<Str
         session("0", &["editor", "logs"]),
         session("work", &["shell"]),
     ]);
-    let (mut client, _outcome) =
+    let mut restored_to =
         connect_and_apply(Some(inner.0.clone()), &restored, &plan(&restored), drop)
             .expect("restore over the login session failed");
-    client.close();
+    restored_to.client.close();
+    assert!(restored_to.unfinished.is_empty());
 
     assert_eq!(inner.session_names(), ["0", "work"], "no scaffolding left");
     assert_eq!(
@@ -221,10 +222,11 @@ fn restoring_into_a_built_server_adds_beside_its_sessions() {
     server.tmux(&["split-window", "-t", "=mine:"]);
 
     let restored = snapshot(vec![session("work", &["shell"])]);
-    let (mut client, _outcome) =
+    let mut restored_to =
         connect_and_apply(Some(server.0.clone()), &restored, &plan(&restored), drop)
             .expect("restore into a built server failed");
-    client.close();
+    restored_to.client.close();
+    assert!(restored_to.unfinished.is_empty());
 
     assert_eq!(server.session_names(), ["mine", "work"]);
     assert_eq!(
