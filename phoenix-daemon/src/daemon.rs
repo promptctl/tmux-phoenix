@@ -106,12 +106,19 @@ fn previous_content_from_snapshot(snapshot: &Snapshot) -> HashMap<u32, PreviousP
 /// cycle without recording a save, so [`run`]'s next poll tries again.
 const SAVE_WAIT: Duration = Duration::ZERO;
 
+/// What one save cycle came to. The store refusing a bootstrap-only capture
+/// is an answer about the server, not a failed save, so it is a value here.
+enum Cycle {
+    Saved(Snapshot),
+    Refused(Snapshot),
+}
+
 fn capture_and_save<T: Transport>(
     client: &mut Client<T>,
     store: &Store,
     previous: &HashMap<u32, PreviousPaneContent>,
     keep_generations: NonZeroUsize,
-) -> Result<Snapshot, DaemonError> {
+) -> Result<Cycle, DaemonError> {
     let snapshot = phoenix_capture::capture(
         client,
         ContentCapture::On {
@@ -119,10 +126,11 @@ fn capture_and_save<T: Transport>(
         },
     )
     .map_err(DaemonError::Capture)?;
-    store
-        .save(&snapshot, keep_generations, SAVE_WAIT)
-        .map_err(DaemonError::Store)?;
-    Ok(snapshot)
+    match store.save(&snapshot, keep_generations, SAVE_WAIT) {
+        Ok(_) => Ok(Cycle::Saved(snapshot)),
+        Err(StoreError::BootstrapOnly) => Ok(Cycle::Refused(snapshot)),
+        Err(e) => Err(DaemonError::Store(e)),
+    }
 }
 
 /// Whether `e` means the connection itself is gone (tmux exited, the pipe
@@ -158,11 +166,12 @@ fn is_connection_dead(e: &TmuxError) -> bool {
 /// loop continues — a transient hiccup must not kill a long-running daemon.
 /// Only a failure setting up `no-output`/the subscription is fatal, since
 /// without those the daemon can't do its job at all. The store declining to
-/// save a server that holds only bootstrap sessions ends the run instead,
-/// returning that error, while `boot` is still [`Boot::Declined`]: the boot
-/// probe may have read a login shell's prompt mid-`git` as a program the user
-/// was running, and whether to restore is boot restore's question. Once a save
-/// succeeds, or when boot settled, the refusal is reported like any other.
+/// save a server that holds only bootstrap sessions counts as that cycle's
+/// save, and ends the run instead, returning that error, when it shows `boot`
+/// misread the server ([`Boot::misread`]): the boot probe may have read a
+/// login shell's prompt mid-`git` as a program the user was running, and
+/// whether to restore is boot restore's question. Otherwise the refusal is
+/// reported, and settles `boot` for good.
 pub fn run<T: Transport>(
     client: &mut Client<T>,
     activity: &StructureActivity,
@@ -220,19 +229,24 @@ pub fn run<T: Transport>(
 
         if state.should_save(&config.policy, Instant::now()) {
             match capture_and_save(client, store, &previous_content, config.keep_generations) {
-                Ok(snapshot) => {
+                Ok(Cycle::Saved(snapshot)) => {
                     previous_content = previous_content_from_snapshot(&snapshot);
                     state.record_save(Instant::now());
                     boot = Boot::Settled;
                 }
-                // A declining boot met by a server that holds only bootstrap
-                // sessions was wrong about it: end the run so `run_resilient`
-                // boots again, where that decision lives. Only a declined boot
-                // is reopened, so a restore can never repeat itself.
-                Err(declined @ DaemonError::Store(StoreError::BootstrapOnly))
-                    if boot == Boot::Declined =>
-                {
-                    return Err(declined)
+                Ok(Cycle::Refused(snapshot)) => {
+                    // [LAW:dataflow-not-control-flow] a refusal ends the cycle
+                    // like a save does, so an idle bootstrap-only server is
+                    // captured once per cycle rather than on every poll.
+                    state.record_save(Instant::now());
+                    let refused = DaemonError::Store(StoreError::BootstrapOnly);
+                    // A boot that misread this server gets its decision back:
+                    // `run_resilient` boots again, where that decision lives.
+                    if boot.misread(&snapshot) {
+                        return Err(refused);
+                    }
+                    boot = Boot::Settled;
+                    on_error(&refused);
                 }
                 Err(e) => on_error(&e),
             }
@@ -371,7 +385,7 @@ mod tests {
         let result = run(
             &mut client,
             &activity,
-            Boot::Declined,
+            Boot::Settled,
             &store,
             &config,
             |_e| *error_count.borrow_mut() += 1,

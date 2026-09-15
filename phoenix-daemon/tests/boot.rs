@@ -134,6 +134,38 @@ fn wait_until_bootstrap_only(socket: &str) {
     panic!("{socket} never settled into a bootstrap-only server within 5s");
 }
 
+/// A declined boot misread the server exactly when a refused capture still
+/// holds every session it took for built; closing one of those is the user's
+/// doing, not a misreading.
+#[test]
+fn a_declined_boot_misread_the_server_only_while_its_built_sessions_remain() {
+    let idle = |name: &str| {
+        snapshot_with_program(
+            name,
+            CapturedProgram {
+                command: ProgramName::parse("zsh").unwrap(),
+                argv: Some(NonEmpty::singleton("-zsh".to_string())),
+            },
+        )
+    };
+    let declined = |names: &[&str]| {
+        phoenix_daemon::Boot::Declined(
+            NonEmpty::from_vec(
+                names
+                    .iter()
+                    .map(|n| SessionName::parse(*n).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    };
+
+    assert!(declined(&["0"]).misread(&idle("0")));
+    assert!(!declined(&["work"]).misread(&idle("0")));
+    assert!(!declined(&["0", "work"]).misread(&idle("0")));
+    assert!(!phoenix_daemon::Boot::Settled.misread(&idle("0")));
+}
+
 /// tmux-parity-ure.j0f criterion 1: a terminal that reaches tmux before the
 /// daemon leaves a lone bootstrap session, named `0` exactly like the
 /// snapshot's own session. Boot restore puts the snapshot in its place.
@@ -328,10 +360,10 @@ fn boots_with_an_existing_session_never_touches_it() {
             .any(|l| l.contains("staying in save mode") && l.contains(&existing_session)),
         "the daemon should say which session kept it from restoring: {log:?}"
     );
-    assert_eq!(
-        boot,
-        phoenix_daemon::Boot::Declined,
-        "staying out of a built server is provisional"
+    assert!(
+        matches!(&boot, phoenix_daemon::Boot::Declined(built)
+            if built.iter().any(|name| name.as_str() == existing_session)),
+        "staying out of a built server is provisional, naming what it saw: {boot:?}"
     );
     assert_eq!(
         server.session_names(),

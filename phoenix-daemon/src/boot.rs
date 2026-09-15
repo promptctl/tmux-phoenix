@@ -8,6 +8,7 @@
 //! `phoenix_restore::connect_and_apply`, which the CLI's `restore` shares.
 //! This module only decides whether to call it.
 
+use phoenix_core::{NonEmpty, SessionName, Snapshot};
 use phoenix_restore::{connect_and_apply, plan, probe, ConnectApplyError, ServerState};
 use phoenix_store::{Store, StoreError};
 use tmux_control::{Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
@@ -40,16 +41,31 @@ impl std::fmt::Display for BootError {
 impl std::error::Error for BootError {}
 
 /// What boot decided, which is what a later refused save means to the run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Boot {
     /// Restored `latest`, or found nothing saved to restore. Final: a server
     /// that holds only bootstrap sessions later on is the user's to keep.
     Settled,
-    /// Stayed out because the probe saw a session the user built. Provisional
-    /// until the run's first save succeeds: the probe reads foreground
-    /// programs at one instant, and a login shell's prompt briefly runs
-    /// programs of its own (DESIGN.md §8).
-    Declined,
+    /// Stayed out because the probe took these sessions for ones the user
+    /// built. Provisional until the run's first save succeeds: the probe
+    /// reads foreground programs at one instant, and a login shell's prompt
+    /// briefly runs programs of its own (DESIGN.md §8).
+    Declined(NonEmpty<SessionName>),
+}
+
+impl Boot {
+    /// Whether `refused`, a capture the store refused as bootstrap-only, shows
+    /// this boot misread the server: every session it took for built is still
+    /// there, and now holds nothing built. A server whose built sessions the
+    /// user closed is a different server, not a misreading, and stays theirs.
+    pub fn misread(&self, refused: &Snapshot) -> bool {
+        match self {
+            Boot::Settled => false,
+            Boot::Declined(built) => built
+                .iter()
+                .all(|name| refused.sessions.iter().any(|s| s.name() == name)),
+        }
+    }
 }
 
 /// Connects for the daemon's run, restoring `latest` first when the server
@@ -79,7 +95,8 @@ pub fn connect_and_boot(
             "server has session(s) the user built ({}); not restoring into it, staying in save mode",
             names.join(", ")
         ));
-        return attach(socket, on_notification).map(|client| Some((client, Boot::Declined)));
+        return attach(socket, on_notification)
+            .map(|client| Some((client, Boot::Declined(built.clone()))));
     }
 
     match (server, store.load_latest()) {

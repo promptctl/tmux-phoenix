@@ -181,11 +181,12 @@ fn wait_until_bootstrap_only(socket: &str) {
 
 /// Runs `run` for 1.2s — well past the first max-interval cycle — against a
 /// login terminal's bootstrap-only server, with a built prior state already
-/// saved as `latest`. Returns the run's result, the errors it reported, and
-/// asserts `latest` still names the prior state.
+/// saved as `latest`, and `boot` made from the login session's name. Returns
+/// the run's result and the errors it reported, and asserts `latest` still
+/// names the prior state.
 fn run_over_a_login_server(
     name: &str,
-    boot: Boot,
+    boot: impl FnOnce(&str) -> Boot,
 ) -> (Result<(), phoenix_daemon::DaemonError>, Vec<String>) {
     let data_dir = TestDataDir::new(name);
     let store = Store::new(&data_dir.0);
@@ -226,7 +227,7 @@ fn run_over_a_login_server(
     let result = phoenix_daemon::run(
         &mut client,
         &activity,
-        boot,
+        boot(&login.session),
         &store,
         &config,
         move |e| errors_clone.borrow_mut().push(e.to_string()),
@@ -246,7 +247,8 @@ fn run_over_a_login_server(
 /// `run_resilient` boots again.
 #[test]
 fn a_bootstrap_only_server_never_replaces_latest_and_reopens_a_declined_boot() {
-    let (result, errors) = run_over_a_login_server("bootstrap-declined", Boot::Declined);
+    let (result, errors) =
+        run_over_a_login_server("bootstrap-declined", |login| declined(&[login]));
 
     assert!(errors.is_empty(), "unexpected daemon errors: {errors:?}");
     assert!(
@@ -260,12 +262,41 @@ fn a_bootstrap_only_server_never_replaces_latest_and_reopens_a_declined_boot() {
     );
 }
 
+fn declined(names: &[&str]) -> Boot {
+    Boot::Declined(
+        phoenix_core::NonEmpty::from_vec(
+            names
+                .iter()
+                .map(|n| phoenix_core::SessionName::parse(*n).unwrap())
+                .collect(),
+        )
+        .unwrap(),
+    )
+}
+
 /// After a boot that restored (or had nothing to restore), a server that
-/// reads as bootstrap-only is the user's: the refusal is reported and the run
-/// keeps going, so a restore never repeats itself.
+/// reads as bootstrap-only is the user's: the refusal is reported once per
+/// save cycle, never on every poll, and the run keeps going, so a restore
+/// never repeats itself.
 #[test]
-fn a_settled_boot_reports_the_refusal_and_keeps_running() {
-    let (result, errors) = run_over_a_login_server("bootstrap-settled", Boot::Settled);
+fn a_settled_boot_reports_the_refusal_once_per_cycle_and_keeps_running() {
+    let (result, errors) = run_over_a_login_server("bootstrap-settled", |_| Boot::Settled);
+
+    assert!(result.is_ok(), "the run should not end: {result:?}");
+    // 1.2s of 100ms polls against a 400ms max-interval: three cycles at most,
+    // where retrying on every poll would report eight or more.
+    assert!(
+        (1..=3).contains(&errors.len()) && errors.iter().all(|e| e.contains("bootstrap session")),
+        "the refusal should be reported once per cycle: {errors:?}"
+    );
+}
+
+/// A boot that stayed out of sessions the user then closed did not misread
+/// the server: a lone idle session left behind is theirs, never restored over.
+#[test]
+fn a_declined_boot_whose_built_sessions_were_closed_keeps_running() {
+    let (result, errors) =
+        run_over_a_login_server("bootstrap-closed", |_| declined(&["work", "notes"]));
 
     assert!(result.is_ok(), "the run should not end: {result:?}");
     assert!(
