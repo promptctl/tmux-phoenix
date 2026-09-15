@@ -6,10 +6,13 @@
 use std::path::Path;
 
 use phoenix_core::Snapshot;
+use phoenix_hooks::Hook;
 use phoenix_store::Store;
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
-/// DESIGN.md §9's contract: `0` ok, `3` degraded, `1` fail.
+/// DESIGN.md §9's contract: `0` ok, `3` degraded — done, but something short
+/// of it failed (a pane's argv or cwd recovery, a post-save or post-restore
+/// hook) — `1` fail.
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_DEGRADED: i32 = 3;
 pub const EXIT_FAIL: i32 = 1;
@@ -55,7 +58,12 @@ fn is_degraded(snapshot: &Snapshot) -> bool {
 }
 
 pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
-    let mut client = match connect(socket) {
+    if let Err(e) = phoenix_hooks::run(socket.as_deref(), Hook::PreSave) {
+        eprintln!("phoenix save: {e}; nothing was saved");
+        return EXIT_FAIL;
+    }
+
+    let mut client = match connect(socket.clone()) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("phoenix save: {msg}");
@@ -101,11 +109,36 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
         );
     }
 
-    if is_degraded(&snapshot) {
+    let post_save = phoenix_hooks::run(
+        socket.as_deref(),
+        Hook::PostSave {
+            saved: &outcome.path,
+        },
+    );
+    if let Err(e) = &post_save {
+        eprintln!("phoenix save: warning: {e} (the save itself stands)");
+    }
+    let degraded = is_degraded(&snapshot);
+    if degraded {
         eprintln!("phoenix save: warning: argv or cwd recovery degraded for one or more panes");
+    }
+    if degraded || post_save.is_err() {
         EXIT_DEGRADED
     } else {
         EXIT_OK
+    }
+}
+
+/// Reports what failed once a restore was in place, which leaves the restore
+/// standing but degraded.
+fn report_unfinished(unfinished: &[phoenix_restore::ConnectApplyError]) -> i32 {
+    for failed in unfinished {
+        eprintln!("phoenix restore: warning: {failed} (the restore itself stands)");
+    }
+    if unfinished.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_DEGRADED
     }
 }
 
@@ -195,18 +228,26 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
         )
     };
     match phoenix_restore::connect_and_apply(socket, &snapshot, &restore_plan, drop) {
-        Ok((mut client, outcome)) => {
+        Ok(phoenix_restore::Restored {
+            mut client,
+            outcome,
+            unfinished,
+        }) => {
             client.close();
             report(&outcome);
-            EXIT_OK
+            report_unfinished(&unfinished)
         }
         // The sessions exist; restore holds no client past this point, so a
         // failed reattach costs nothing the command needed. Say so, but don't
         // report a restore that happened as one that didn't.
-        Err(phoenix_restore::ConnectApplyError::Reattach { outcome, source }) => {
+        Err(phoenix_restore::ConnectApplyError::Reattach {
+            outcome,
+            source,
+            unfinished,
+        }) => {
             report(&outcome);
             eprintln!("phoenix restore: warning: could not reattach after restoring: {source}");
-            EXIT_OK
+            report_unfinished(&unfinished)
         }
         Err(e) => {
             eprintln!("phoenix restore: {e}");
@@ -230,6 +271,7 @@ pub fn run_daemon(settings: crate::cli::DaemonSettings, socket: Option<String>) 
     };
 
     let config = phoenix_daemon::RunConfig {
+        socket,
         policy: phoenix_daemon::DebouncePolicy {
             debounce: std::time::Duration::from_secs(settings.debounce_secs),
             max_interval: std::time::Duration::from_secs(settings.max_interval_secs),
@@ -240,7 +282,6 @@ pub fn run_daemon(settings: crate::cli::DaemonSettings, socket: Option<String>) 
     };
 
     phoenix_daemon::run_resilient(
-        socket,
         &store,
         &config,
         |line| eprintln!("phoenix daemon: {line}"),

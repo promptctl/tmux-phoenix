@@ -68,6 +68,7 @@ fn daemon_saves_after_a_structural_change_settles() {
     let store = Store::new(&data_dir.0);
 
     let config = RunConfig {
+        socket: Some(harness.socket.clone()),
         policy: DebouncePolicy {
             debounce: Duration::from_millis(300),
             max_interval: Duration::from_secs(60),
@@ -129,6 +130,7 @@ fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
     let store = Store::new(&data_dir.0);
 
     let config = RunConfig {
+        socket: Some(harness.socket.clone()),
         policy: DebouncePolicy {
             debounce: Duration::from_secs(60), // never fires on its own here
             max_interval: Duration::from_millis(300),
@@ -213,6 +215,7 @@ fn run_over_a_login_server(
     let activity = StructureActivity::new();
     let mut client = connect(&login, &activity);
     let config = RunConfig {
+        socket: Some(login.socket.clone()),
         policy: DebouncePolicy {
             debounce: Duration::from_secs(60),
             max_interval: Duration::from_millis(400),
@@ -302,5 +305,117 @@ fn a_declined_boot_whose_built_sessions_were_closed_keeps_running() {
     assert!(
         errors.iter().any(|e| e.contains("bootstrap session")),
         "the refusal should be reported: {errors:?}"
+    );
+}
+
+fn set_hook(harness: &IsolatedTmux, name: &str, command: &str) {
+    let status = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &harness.socket,
+            "set-option",
+            "-g",
+            &format!("@phoenix-hook-{name}"),
+            command,
+        ])
+        .status()
+        .expect("failed to set a hook");
+    assert!(status.success());
+}
+
+/// Runs `run` for `iterations` 100ms polls against `harness` with a
+/// `max_interval` backstop and no debounce saves, returning what it reported.
+fn run_backstop_saves(
+    harness: &IsolatedTmux,
+    store: &Store,
+    max_interval: Duration,
+    iterations: u32,
+) -> Vec<String> {
+    let activity = StructureActivity::new();
+    let mut client = connect(harness, &activity);
+    let config = RunConfig {
+        socket: Some(harness.socket.clone()),
+        policy: DebouncePolicy {
+            debounce: Duration::from_secs(60),
+            max_interval,
+        },
+        poll_interval: Duration::from_millis(100),
+        reconnect_interval: Duration::from_millis(100),
+        keep_generations: std::num::NonZeroUsize::new(5).unwrap(),
+    };
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let errors_clone = errors.clone();
+    phoenix_daemon::run(
+        &mut client,
+        &activity,
+        &mut Boot::Settled,
+        store,
+        &config,
+        move |e| errors_clone.borrow_mut().push(e.to_string()),
+        bounded_continue(iterations),
+    )
+    .expect("run() itself failed");
+    client.close();
+    let errors = errors.borrow().clone();
+    errors
+}
+
+/// tmux-parity-ure.9 criterion 1, daemon: every save cycle runs pre-save before
+/// it captures and post-save after, handed the generation it wrote.
+#[test]
+fn each_daemon_save_runs_its_save_hooks_around_it() {
+    let harness = IsolatedTmux::new("daemon-save-hooks");
+    harness.build();
+    let data_dir = TestDataDir::new("save-hooks");
+    let store = Store::new(&data_dir.0);
+    let logs = TestDataDir::new("save-hooks-log");
+    std::fs::create_dir_all(&logs.0).unwrap();
+    let log = logs.0.join("hooks.log").display().to_string();
+    set_hook(&harness, "pre-save", &format!("echo pre-save >> '{log}'"));
+    set_hook(
+        &harness,
+        "post-save",
+        &format!("printf 'post-save %s\\n' \"$1\" >> '{log}'"),
+    );
+
+    let errors = run_backstop_saves(&harness, &store, Duration::from_millis(300), 10);
+
+    assert!(errors.is_empty(), "unexpected daemon errors: {errors:?}");
+    let generations = store.list().unwrap();
+    assert!(!generations.is_empty(), "the backstop should have saved");
+    let expected: String = generations
+        .iter()
+        .rev()
+        .map(|g| format!("pre-save\npost-save {}\n", g.path.display()))
+        .collect();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), expected);
+}
+
+/// tmux-parity-ure.9 criterion 2, daemon: a failing pre-save hook calls the
+/// cycle's save off with an error naming the hook — once per cycle, not on
+/// every poll.
+#[test]
+fn a_failing_pre_save_hook_calls_each_daemon_save_off_once_per_cycle() {
+    let harness = IsolatedTmux::new("daemon-pre-save-fails");
+    harness.build();
+    let data_dir = TestDataDir::new("pre-save-fails");
+    let store = Store::new(&data_dir.0);
+    set_hook(&harness, "pre-save", "exit 3");
+
+    // 1.2s of 100ms polls against a 400ms max-interval: three cycles at most,
+    // where retrying on every poll would report eight or more.
+    let errors = run_backstop_saves(&harness, &store, Duration::from_millis(400), 12);
+
+    assert!(
+        matches!(
+            store.load_latest(),
+            Err(phoenix_store::StoreError::NoLatest)
+        ),
+        "nothing may be saved"
+    );
+    assert!(
+        (1..=3).contains(&errors.len())
+            && errors.iter().all(|e| e.contains("@phoenix-hook-pre-save")),
+        "each cycle's abort should be reported once: {errors:?}"
     );
 }

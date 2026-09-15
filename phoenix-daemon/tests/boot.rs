@@ -471,3 +471,75 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
 
     client.close();
 }
+
+/// tmux-parity-ure.9 criteria 1 and 4, boot restore: the daemon's restore runs
+/// the user's restore hooks and marks itself finished, so a tmux-side
+/// integration can wait on `@phoenix-restored` for a boot restore too.
+#[test]
+fn boot_restore_runs_the_restore_hooks_and_marks_itself_finished() {
+    let server = EmptyServer::new("hooks");
+    let tmux = |args: &[&str]| {
+        let status = std::process::Command::new("tmux")
+            .args(["-S", &server.socket])
+            .args(args)
+            .status()
+            .expect("failed to run tmux");
+        assert!(status.success(), "tmux {args:?} failed");
+    };
+    tmux(&["new-session", "-d", "-s", "0", "sh -i"]);
+    wait_until_bootstrap_only(&server.socket);
+
+    let logs = TestDataDir::new("hooks-log");
+    std::fs::create_dir_all(&logs.0).unwrap();
+    let log = logs.0.join("hooks.log").display().to_string();
+    for point in ["pre-restore", "post-restore"] {
+        tmux(&[
+            "set-option",
+            "-g",
+            &format!("@phoenix-hook-{point}"),
+            &format!("echo {point} >> '{log}'"),
+        ]);
+    }
+
+    let data_dir = TestDataDir::new("hooks");
+    let store = Store::new(&data_dir.0);
+    store
+        .save(
+            &single_pane_snapshot("0"),
+            std::num::NonZeroUsize::new(5).unwrap(),
+            Duration::ZERO,
+        )
+        .expect("failed to seed a snapshot to restore");
+
+    let mut lines = Vec::new();
+    let phoenix_daemon::Booted { mut client, .. } = phoenix_daemon::connect_and_boot(
+        Some(server.socket.clone()),
+        &store,
+        None,
+        |line| lines.push(line.to_string()),
+        drop,
+    )
+    .expect("connect_and_boot failed")
+    .expect("a bootstrap-only server with a snapshot yields a client");
+    client.close();
+
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "pre-restore\npost-restore\n"
+    );
+    let marker = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "show-options",
+            "-gqv",
+            "@phoenix-restored",
+        ])
+        .output()
+        .expect("failed to read the restore marker");
+    assert_eq!(String::from_utf8_lossy(&marker.stdout), "1700000000\n");
+    assert!(
+        !lines.iter().any(|l| l.contains("after restoring")),
+        "nothing should have failed after the restore: {lines:?}"
+    );
+}

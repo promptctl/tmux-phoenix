@@ -145,14 +145,16 @@ pub fn connect_and_boot(
             Some((attach(socket, on_notification)?, Boot::Declined(built)))
         }
         (_, None, Ok(snapshot)) => {
-            let (client, _outcome) =
-                connect_and_apply(socket, &snapshot, &plan(&snapshot), on_notification)
-                    .map_err(BootError::Restore)?;
+            let restored = connect_and_apply(socket, &snapshot, &plan(&snapshot), on_notification)
+                .map_err(BootError::Restore)?;
             on_log(&format!(
                 "restored {} session(s) from the latest snapshot",
                 snapshot.sessions.len()
             ));
-            Some((client, Boot::Settled))
+            for failed in &restored.unfinished {
+                on_log(&format!("after restoring: {failed}"));
+            }
+            Some((restored.client, Boot::Settled))
         }
         (ServerState::Empty, None, Err(StoreError::NoLatest)) => {
             on_log("no sessions and no saved snapshot; waiting for a tmux session");

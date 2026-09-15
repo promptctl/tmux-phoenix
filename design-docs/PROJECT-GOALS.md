@@ -130,6 +130,7 @@ GitHub), not memory of what they do.
 | Boot-time service integration | macOS: opens a real terminal window and runs `tmux` in it. Linux: starts only the bare tmux server, docs call this "incomplete," help wanted | Generates a real `launchd`/`systemd --user` unit that runs the daemon headless on both platforms |
 | Restoring onto an empty or not-yet-running server | Boot integration starts a server first, then restores into it | `phoenix restore` and the daemon's boot restore share one connection strategy that bootstraps an empty server itself |
 | Multi-server disambiguation | Only the first-started server gets autosave/autorestore; later servers get neither | `--socket` explicitly targets any server by name or path; each daemon instance is scoped to the socket it's given |
+| Pre/post save and restore hooks | `@resurrect-hook-*` options run at points in its save and restore scripts | `@phoenix-hook-{pre,post}-{save,restore}` options run through the server's `run-shell` at every save and restore, the daemon's included; a failing pre-hook aborts with a message naming it, and a finished restore sets `@phoenix-restored` for tmux-side integrations to wait on |
 
 ### Real gaps — not yet at parity
 
@@ -168,9 +169,6 @@ implement. None are architecture blockers; they're scoped work.
   bare binary invoked from a shell or a background service — there's no tmux-side
   integration a user drops into `.tmux.conf` to get keybindings or status-line output for
   free.
-- **No hooks.** tmux-resurrect exposes pre/post save and restore hooks (shell commands run
-  at defined points, e.g. to capture/restore X11 window geometry alongside the tmux state).
-  tmux-phoenix has no extensibility point like this.
 
 ---
 
@@ -197,7 +195,6 @@ explaining why something is out of scope.
 - Ship a real tmux plugin wrapper (TPM-installable) with default keybindings for save/restore
   and a `#{phoenix_status}`-style format string for the status line, so tmux-phoenix doesn't
   require leaving tmux to use.
-- Add a pre/post save and restore hook mechanism.
 
 ### 4.2 Beyond parity — a modern toolbox
 

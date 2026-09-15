@@ -17,6 +17,7 @@ dependencies = [
  "phoenix-capture",
  "phoenix-core",
  "phoenix-daemon",
+ "phoenix-hooks",
  "phoenix-restore",
  "phoenix-store",
  "tmux-control",
@@ -32,8 +33,16 @@ version = "0.1.0"
 dependencies = [
  "phoenix-capture",
  "phoenix-core",
+ "phoenix-hooks",
  "phoenix-restore",
  "phoenix-store",
+ "tmux-control",
+]
+
+[[package]]
+name = "phoenix-hooks"
+version = "0.1.0"
+dependencies = [
  "tmux-control",
 ]
 
@@ -43,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "phoenix-capture",
  "phoenix-core",
+ "phoenix-hooks",
  "tmux-control",
 ]
 

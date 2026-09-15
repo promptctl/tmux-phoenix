@@ -1,0 +1,8 @@
+[package]
+name = "phoenix-hooks"
+version = "0.1.0"
+edition.workspace = true
+description = "Runs the command a user configured for a point in a tmux-phoenix save or restore"
+
+[dependencies]
+tmux-control = { path = "../tmux-control" }

@@ -26,6 +26,14 @@
 //! took that name, the failed put-back is reported with the restore's error
 //! and the terminal stays on its renamed session.
 //!
+//! The user's hooks (`phoenix_hooks`) bracket the same steps. The pre-restore
+//! hook runs once the scaffolding is set aside — on an empty server, setting
+//! it aside is what starts the server whose options hold the hook — and its
+//! failure takes the way out a plan that did not apply takes. Once the
+//! scaffolding is retired the post-restore hook runs, and then, whatever the
+//! hook did, the restore marks itself finished on the server
+//! ([`RESTORED_OPTION`]).
+//!
 //! Every restore entry point calls this, so the dance has exactly one
 //! implementation (`[LAW:single-enforcer]`) instead of one per caller that
 //! would drift.
@@ -52,6 +60,7 @@ use std::process::Command;
 
 use phoenix_capture::{capture, CaptureError, ContentCapture};
 use phoenix_core::{NonEmpty, SessionName, Snapshot};
+use phoenix_hooks::{Hook, HookError};
 use tmux_control::{socket_args, Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 
 use crate::apply::{apply, ApplyError, ApplyOutcome};
@@ -61,6 +70,13 @@ use crate::plan::RestorePlan;
 /// name on the server and in the snapshot, so no snapshot can collide with
 /// the scaffolding its own restore needs.
 const SCAFFOLD_PREFIX: &str = "phoenix-boot-";
+
+/// The global user option a finished restore sets on the server, to the
+/// restored snapshot's capture time in Unix seconds: the sign, visible from
+/// inside tmux, that a whole-snapshot restore is done. It is set after the
+/// post-restore hook, whether or not that hook failed, so a tmux-side
+/// integration waiting on it neither races the restore nor waits forever.
+pub const RESTORED_OPTION: &str = "@phoenix-restored";
 
 /// What the target server holds, as far as restoring into it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +125,9 @@ pub enum ConnectApplyError {
     /// A restore command failed while applying the plan; the server is left
     /// partially restored (see [`ApplyError`]).
     Apply(ApplyError),
+    /// The pre-restore hook failed, so the plan never applied, or the
+    /// post-restore hook failed after a restore that stands.
+    Hook(HookError),
     /// A plain (non-control-mode) `tmux` helper — setting scaffolding aside,
     /// moving a client, or removing scaffolding — failed. `action` names what
     /// was being attempted so the message points at the actual problem rather
@@ -133,7 +152,20 @@ pub enum ConnectApplyError {
     Reattach {
         outcome: ApplyOutcome,
         source: Box<ConnectApplyError>,
+        /// As [`Restored::unfinished`].
+        unfinished: Vec<ConnectApplyError>,
     },
+}
+
+/// A restore whose plan applied in full and whose scaffolding is retired.
+pub struct Restored {
+    /// Attached to a restored session.
+    pub client: Client<SpawnTransport>,
+    pub outcome: ApplyOutcome,
+    /// What failed once the restore was in place: the post-restore hook, or
+    /// marking the restore finished ([`RESTORED_OPTION`]). Reported, never
+    /// undone — the restored sessions stand.
+    pub unfinished: Vec<ConnectApplyError>,
 }
 
 impl std::fmt::Display for ConnectApplyError {
@@ -145,6 +177,7 @@ impl std::fmt::Display for ConnectApplyError {
                 write!(f, "failed to read what the server holds: {e}")
             }
             ConnectApplyError::Apply(e) => write!(f, "{e}"),
+            ConnectApplyError::Hook(e) => write!(f, "{e}"),
             ConnectApplyError::Tmux { action, detail } => {
                 write!(f, "failed to {action}: {detail}")
             }
@@ -153,12 +186,19 @@ impl std::fmt::Display for ConnectApplyError {
                 "{primary}; and putting the {SCAFFOLD_PREFIX}* sessions it set aside back \
                  also failed, so they are still on the server: {teardown}"
             ),
-            ConnectApplyError::Reattach { outcome, source } => write!(
-                f,
-                "restored the snapshot ({} commands applied) but could not reattach \
-                 to it afterwards: {source}",
-                outcome.executed
-            ),
+            ConnectApplyError::Reattach {
+                outcome,
+                source,
+                unfinished,
+            } => {
+                write!(
+                    f,
+                    "restored the snapshot ({} commands applied) but could not reattach \
+                     to it afterwards: {source}",
+                    outcome.executed
+                )?;
+                unfinished.iter().try_for_each(|e| write!(f, "; and {e}"))
+            }
         }
     }
 }
@@ -524,11 +564,32 @@ fn with_cleanup(
     }
 }
 
+/// Runs the post-restore hook, then marks the restore finished whatever the
+/// hook did: a failed post-restore hook undoes nothing, and an integration
+/// waiting on [`RESTORED_OPTION`] must not wait forever because of it.
+/// Returns what failed.
+fn finish(socket: Option<&str>, snapshot: &Snapshot) -> Vec<ConnectApplyError> {
+    let hook = phoenix_hooks::run(socket, Hook::PostRestore).map_err(ConnectApplyError::Hook);
+    let marked = run_plain(
+        socket,
+        &[
+            "set-option",
+            "-g",
+            RESTORED_OPTION,
+            &snapshot.captured_at.unix_timestamp().to_string(),
+        ],
+        "mark the restore finished",
+    )
+    .map(drop);
+    [hook, marked].into_iter().filter_map(Result::err).collect()
+}
+
 /// Connect to the server on `socket` and apply `plan`, replacing the
 /// server's sessions only when every one is a bootstrap session, so restore
 /// works the same whether the server is empty, holds a login terminal's fresh
 /// session, or holds sessions the user built. On success the returned client
-/// is attached to a restored session and no scaffolding remains.
+/// is attached to a restored session and no scaffolding remains. The user's
+/// pre- and post-restore hooks run around it (see the module docs).
 ///
 /// `snapshot` is the same one `plan` was built from: its first session names
 /// the reconnect target, so a caller can't hand over a target that the plan
@@ -542,7 +603,7 @@ pub fn connect_and_apply(
     snapshot: &Snapshot,
     plan: &RestorePlan,
     on_notification: impl FnMut(ServerMessage) + 'static,
-) -> Result<(Client<SpawnTransport>, ApplyOutcome), ConnectApplyError> {
+) -> Result<Restored, ConnectApplyError> {
     let sock = socket.as_deref();
     let scaffolding = scaffolding(&probe(sock)?, snapshot);
 
@@ -555,23 +616,48 @@ pub fn connect_and_apply(
 
     let restored_name = snapshot.sessions.first().name().as_str();
     let attach_to = scaffolding.first().map(|s| exact(s.name()));
-    let restored = restore_over(
-        socket.clone(),
-        attach_to.as_deref(),
-        plan,
-        restored_name,
-        on_notification,
-    );
+    let restored = phoenix_hooks::run(sock, Hook::PreRestore)
+        .map_err(ConnectApplyError::Hook)
+        .and_then(|()| {
+            restore_over(
+                socket.clone(),
+                attach_to.as_deref(),
+                plan,
+                restored_name,
+                on_notification,
+            )
+        });
 
     // A plan that applied in full has replaced the scaffolding even when the
     // reattach after it failed, so only a plan that did not apply puts the
-    // scaffolding back.
+    // scaffolding back. A restore is finished once its scaffolding is retired,
+    // reattached or not.
+    let reattach_failed = |outcome, source, unfinished| ConnectApplyError::Reattach {
+        outcome,
+        source: Box::new(source),
+        unfinished,
+    };
     match restored {
-        Ok(restored) => retire_all(sock, &scaffolding, snapshot, restored_name).map(|()| restored),
-        Err(reattach @ ConnectApplyError::Reattach { .. }) => Err(with_cleanup(
-            reattach,
-            retire_all(sock, &scaffolding, snapshot, restored_name),
-        )),
+        Ok((reattached, outcome)) => {
+            match (
+                reattached,
+                retire_all(sock, &scaffolding, snapshot, restored_name),
+            ) {
+                (Ok(client), Ok(())) => Ok(Restored {
+                    client,
+                    outcome,
+                    unfinished: finish(sock, snapshot),
+                }),
+                (Err(source), Ok(())) => {
+                    Err(reattach_failed(outcome, source, finish(sock, snapshot)))
+                }
+                (Ok(_), Err(retire)) => Err(retire),
+                (Err(source), Err(retire)) => Err(with_cleanup(
+                    reattach_failed(outcome, source, Vec::new()),
+                    Err(retire),
+                )),
+            }
+        }
         Err(primary) => Err(with_cleanup(
             primary,
             each(&scaffolding, |s| s.put_back(sock)),
@@ -582,16 +668,23 @@ pub fn connect_and_apply(
 /// Attach (onto the first scaffold when there is one), apply, then reconnect
 /// onto a real restored session: killing the session you are attached to ends
 /// your own connection, so scaffolding has to be removed from a connection
-/// parked somewhere else. On failure the returned client (if any) is dropped
-/// with the error, so removing scaffolding ends nothing the caller still
-/// holds.
+/// parked somewhere else. `Ok` once the plan applied in full, holding the
+/// reattached client or why reattaching failed; on any failure the client is
+/// dropped with the error, so removing scaffolding ends nothing the caller
+/// still holds.
 fn restore_over(
     socket: Option<String>,
     attach_to: Option<&str>,
     plan: &RestorePlan,
     restored_name: &str,
     on_notification: impl FnMut(ServerMessage) + 'static,
-) -> Result<(Client<SpawnTransport>, ApplyOutcome), ConnectApplyError> {
+) -> Result<
+    (
+        Result<Client<SpawnTransport>, ConnectApplyError>,
+        ApplyOutcome,
+    ),
+    ConnectApplyError,
+> {
     let mut client = attach(socket.clone(), attach_to, on_notification)?;
     let outcome = apply(&mut client, plan).map_err(ConnectApplyError::Apply)?;
 
@@ -605,13 +698,7 @@ fn restore_over(
             .reconnect(fresh, 0)
             .map_err(ConnectApplyError::Connect)
     });
-    match reattached {
-        Ok(_) => Ok((client, outcome)),
-        Err(source) => Err(ConnectApplyError::Reattach {
-            outcome,
-            source: Box::new(source),
-        }),
-    }
+    Ok((reattached.map(|_| client), outcome))
 }
 
 #[cfg(test)]
