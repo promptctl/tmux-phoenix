@@ -348,15 +348,26 @@ restore already creates every pane as a fresh shell, so re-running it would nest
 second shell, whereas `bash deploy.sh` is a real program and does come back.
 
 **Connecting (`phoenix_restore::connect_and_apply`):** a control-mode client attaches to
-a session, so a server with none has nothing to attach to. Every restore path goes
-through one function that counts sessions with a plain `list-sessions` first (bare
-`tmux -C` always creates a session, so it can't be the check). Only tmux's own
-no-server replies count as zero; any other failure stops the restore rather than
-guessing. With sessions, it attaches and applies. With none, it creates a throwaway
-`phoenix-boot` session, applies over it, reattaches to a real restored session (killing
-the session a client is attached to ends that client's connection), and removes the
-bootstrap whether or not the restore succeeded. A snapshot holding a session named
-`phoenix-boot` is refused on that path before the server is touched.
+a session, and restore creates sessions whose names the server may already use. Every
+restore path goes through one function that first probes what the server holds. It
+counts sessions with a plain `list-sessions` (bare `tmux -C` always creates a session, so
+it can't be the check); only tmux's own no-server replies count as zero, and any other
+failure stops the restore rather than guessing. A populated server is captured over a
+short-lived connection and read as *bootstrap-only* when every session is one window
+holding one pane idle at its shell — what a terminal starting `tmux` creates — and as
+*built* otherwise. Idleness is `phoenix_core::Foreground`, the same reading restore's
+program relaunch uses, and a pane whose argv wasn't recovered is `Unknown`, never idle.
+
+The steps are the same for every server; only the scaffolding differs. An empty server
+gets a created `phoenix-boot-N` session, a bootstrap-only server has every session renamed
+to a free `phoenix-boot-N`, and a built server gets none. Each name is free of the
+server's and the snapshot's names, so no snapshot collides with its own scaffolding. The
+plan applies over the scaffolding, the client reattaches to a restored session (killing
+the session a client is attached to ends that client's connection), every terminal still
+on scaffolding is switched onto that session, and the scaffolding is killed. If the plan
+doesn't apply, the scaffolding is put back instead: a created session is killed and a
+renamed one gets its name back, so a failed restore never kills a login terminal's
+session out from under it.
 
 ---
 
@@ -372,7 +383,10 @@ without counting as a save and its next poll tries again. A generation's id is i
 capture's Unix timestamp, raised above the newest existing id when it isn't already, so
 ids rise in save order: `latest` always names the highest id. Retention is a count of
 at least one from the `--keep` flag down (`--keep 0` is refused where it is parsed), so
-pruning always keeps the generation the save just wrote.
+pruning always keeps the generation the save just wrote. A snapshot in which every session
+is a bootstrap session (§6) is refused with `StoreError::BootstrapOnly` before anything is
+written: saving a server a login terminal just started would make `latest` name it in
+place of the real state.
 Serialize to a temp file, `fsync`, `rename(2)` onto the final name, then atomically
 repoint `latest` — which therefore only ever names a fully-written snapshot; a crash
 mid-save leaves the last good one untouched (`[LAW:one-source-of-truth]`). Keep the
@@ -415,9 +429,9 @@ subscriptions, and owns *when to save* as explicit state
   real change, idle otherwise.
 - **Interval ceiling (backstop).** A max-interval save so long steady sessions still
   checkpoint.
-- **Boot restore.** On start, if the server has only the default empty session, apply
-  `latest`; if sessions already exist, log and stay in save mode — never clobber a live
-  server.
+- **Boot restore.** On start, if the server holds nothing the user built — no sessions, or
+  only bootstrap sessions (§6) — apply `latest` in their place; if it holds a session the
+  user built, log which one and stay in save mode — never clobber a live server.
 - **Supervision.** `launchd` user agent (macOS) / `systemd --user` unit (Linux);
   `phoenix daemon` runs it foreground for debugging. Independent of the tmux server —
   if tmux isn't running the connection sits in `Closed`/`Reconnecting` and the daemon
@@ -434,16 +448,47 @@ around its sink, including the client boot restore hands back. The debounce deci
 no sleeping. The loop has no wait-with-timeout primitive: once per short poll interval a
 cheap heartbeat (`display-message -p ""`) makes `execute` read and dispatch whatever
 notifications arrived, then the loop reads the flag and decides. One capture-or-save
-failure is logged and the loop continues; only failing to set `no-output` or subscribe
-is fatal to a connection. The daemon carries each save's per-pane content forward
+failure is logged and the loop continues, except the store declining a bootstrap-only
+capture after a boot that stayed out, which ends the run so the daemon boots again; only failing to set `no-output` or
+subscribe is fatal to a connection. The daemon carries each save's per-pane content forward
 (seeded from `latest` on start), which is why it is the one path with content capture
 on.
 
-Boot restore counts sessions first. With sessions, it attaches and never restores. With
-none and a saved `latest`, it restores through `connect_and_apply` (§6). With none and
-nothing saved, it attaches to nothing and waits: starting a server nobody asked for is
-not the daemon's call. `run_resilient` wraps all of this in a reconnect loop, so a
-reconnect after tmux comes back is itself a boot restore; `TmuxError::{Send, Read,
+Boot restore probes the server first (§6). With a session the user built, it names that
+session in its log, attaches, and never restores. Holding nothing the user built and with
+a saved `latest`, it restores through `connect_and_apply`. With no sessions and nothing
+saved, it attaches to nothing and waits: starting a server nobody asked for is not the
+daemon's call. With only bootstrap sessions and nothing saved, it attaches and stays in
+save mode.
+
+The probe reads idleness from the process table at one instant, and a login shell's
+prompt briefly runs programs of its own: measured live, `git` held the foreground about
+160 ms into startup, in its own process group, indistinguishable from a program the user
+started. So a boot probe can take a bootstrap session for a built one. The daemon doesn't
+leave that to timing: boot hands `run` its decision (`Boot::Declined` naming the sessions
+it took for built, `Boot::Settled` when it restored or had nothing to restore), and the
+store refuses every bootstrap-only capture. A refusal counts as that cycle's save, so an
+idle bootstrap-only server is captured once per cycle, not on every poll. When the refused
+capture still holds every session a declined boot took for built, boot misread the server,
+so `run` returns and `run_resilient` boots again and restores `latest`. Anything else
+settles the decision and is only reported: the first successful save, a server whose built
+sessions the user closed, and any run after a restore. So a restore whose result reads as
+bootstrap-only (a lone pane whose program was not recovered, or whose program exits) is
+never restored again, and a user who closes their built sessions is never replaced. Idleness
+carries no history, though: a lone session whose program the user quits before the first
+save reads exactly like the misread login prompt, and is restored over on the same terms as
+a login terminal someone typed into before the daemon connected (§6). The same instant-reading applies to a save: a capture that lands while a lone idle
+shell redraws its prompt reads as built and is saved, but the generations before it are
+kept and restorable with `restore --file`. `run_resilient` wraps all of this in a reconnect loop, so a
+reconnect after tmux comes back is itself a boot restore. A reconnect to the same server is
+not: the loop remembers the decision boot made for the server its last run was on
+(`Decided`: that server's `ServerId`, tmux's `#{pid}:#{start_time}`, which changes when the
+server restarts on the same socket, and its `Boot`, which `run` advances in place), and a
+reconnect to that server resumes the decision instead of probing for a new one. So a server
+the daemon has saved is never restored over after the user closes the session the daemon's
+connection was on, whatever the sessions they kept look like then, and a decision still
+declined stays provisional on the same terms as before. Only a run that shows boot misread
+the server makes the loop forget it; `TmuxError::{Send, Read,
 TransportClosed, NotReady}` mark the connection dead, and every other error is one
 command failing. `phoenix install` writes the launchd plist or systemd unit with the
 binary's absolute path (from `current_exe`, since `$PATH` is minimal under both

@@ -5,5 +5,6 @@ edition.workspace = true
 description = "Pure Snapshot -> RestorePlan planning for tmux-phoenix"
 
 [dependencies]
+phoenix-capture = { path = "../phoenix-capture" }
 phoenix-core = { path = "../phoenix-core" }
 tmux-control = { path = "../tmux-control" }

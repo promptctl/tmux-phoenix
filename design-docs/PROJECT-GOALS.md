@@ -88,9 +88,12 @@ structural change notifications; it saves once activity has been quiet for a deb
 (default 10s) with a max-interval backstop (default 300s) so long-idle sessions still
 checkpoint. This is event-driven, not a poll loop, and — unlike tmux-continuum — it does not
 depend on the tmux status line being on or on no other plugin having clobbered
-`status-right`. On start, if the target server has no sessions at all, it restores the latest
-snapshot automatically ("boot restore"), or waits for a session if nothing is saved yet; if
-sessions already exist, it logs and stays in save mode, never overwriting a live server. The daemon reconnects automatically if tmux isn't
+`status-right`. On start, if the target server holds nothing the user built — no sessions, or
+only the bootstrap session a terminal created by starting `tmux` first — it restores the
+latest snapshot in its place ("boot restore"), or waits for a session if nothing is saved yet;
+if a session the user built exists, it logs which one and stays in save mode, never
+overwriting a live server. It never saves a server holding only bootstrap sessions over the
+latest snapshot. The daemon reconnects automatically if tmux isn't
 running yet or goes away mid-run — it never just exits.
 
 **Installation.** `phoenix install` writes a real `launchd` user-agent plist (macOS) or

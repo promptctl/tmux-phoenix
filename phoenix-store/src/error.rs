@@ -47,6 +47,11 @@ pub enum StoreError {
         lock: PathBuf,
         waited: Duration,
     },
+    /// Every session in the snapshot is a bootstrap session (one window, one
+    /// pane idle at its shell). Publishing it would make `latest` name a
+    /// server a login terminal just started, in place of the real state.
+    /// Nothing was written.
+    BootstrapOnly,
 }
 
 impl fmt::Display for StoreError {
@@ -79,6 +84,11 @@ impl fmt::Display for StoreError {
                 "another save holds the store lock {} (gave up after {:.1}s)",
                 lock.display(),
                 waited.as_secs_f64()
+            ),
+            StoreError::BootstrapOnly => write!(
+                f,
+                "not saved: every session on the server is an untouched bootstrap session \
+                 (one window, one idle shell), and saving it would replace the latest snapshot"
             ),
         }
     }

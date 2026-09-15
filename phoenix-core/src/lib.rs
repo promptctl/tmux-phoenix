@@ -16,7 +16,7 @@ pub use content::PaneContent;
 pub use ids::{Layout, PaneId, PaneIndex, ProgramName, SessionName, WindowIndex, WindowName};
 pub use nonempty::NonEmpty;
 pub use path::Utf8PathBuf;
-pub use program::CapturedProgram;
+pub use program::{CapturedProgram, Foreground};
 pub use snapshot::{Pane, Session, Snapshot, SnapshotError, Window};
 pub use time::OffsetDateTime;
 pub use version::{FormatVersion, TmuxVersion};

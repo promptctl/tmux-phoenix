@@ -110,6 +110,11 @@ impl Store {
         keep_generations: NonZeroUsize,
         wait: Duration,
     ) -> Result<SaveOutcome, StoreError> {
+        // [LAW:single-enforcer] the one writer of `latest` is the one place a
+        // capture holding nothing the user built is kept from replacing it.
+        if snapshot.is_bootstrap_only() {
+            return Err(StoreError::BootstrapOnly);
+        }
         fs::create_dir_all(&self.dir)?;
         // [LAW:single-enforcer] the one place saves are serialized; held until
         // this function returns, so id choice, publish and prune are atomic
@@ -323,13 +328,17 @@ mod tests {
     }
 
     fn snapshot_at(captured_at: i64) -> Snapshot {
+        snapshot_with_argv(captured_at, None)
+    }
+
+    fn snapshot_with_argv(captured_at: i64, argv: Option<NonEmpty<String>>) -> Snapshot {
         let pane = Pane {
             id: PaneId(0),
             index: PaneIndex(0),
             cwd: Utf8PathBuf::parse("/home/user"),
             program: CapturedProgram {
                 command: ProgramName::parse("zsh").unwrap(),
-                argv: None,
+                argv,
             },
             content: None,
         };
@@ -353,6 +362,26 @@ mod tests {
             captured_at: OffsetDateTime::from_unix_timestamp(captured_at),
             sessions: NonEmpty::singleton(session),
         }
+    }
+
+    #[test]
+    fn a_capture_of_only_bootstrap_sessions_is_refused_and_writes_nothing() {
+        let dir = TestDir::new("bootstrap-only");
+        let store = Store::new(&dir.0);
+        store
+            .save(&snapshot_at(1_700_000_000), keep(5), Duration::ZERO)
+            .unwrap();
+
+        let login = snapshot_with_argv(1_700_000_100, Some(NonEmpty::singleton("-zsh".into())));
+        assert!(matches!(
+            store.save(&login, keep(5), Duration::ZERO),
+            Err(StoreError::BootstrapOnly)
+        ));
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(
+            store.load_latest().unwrap().captured_at.unix_timestamp(),
+            1_700_000_000
+        );
     }
 
     #[test]

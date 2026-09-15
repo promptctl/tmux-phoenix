@@ -53,9 +53,9 @@ tmux-control      phoenix-core
 
 `cargo build --release` at the repository root builds the `phoenix` binary into `target/release/`. Every crate depends only on its siblings by path, so there is nothing to fetch from crates.io. `cargo test --workspace` runs the tests; many of them start their own isolated tmux servers, so tmux must be installed, and they never touch your running sessions.
 
-- `phoenix save` captures the current server's structure and prints where it saved it; `phoenix list` shows saved generations.
-- `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it, onto a running server or one with no sessions.
-- `phoenix daemon` saves on structural change and restores the latest snapshot when it starts against a server with no sessions. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
+- `phoenix save` captures the current server's structure and prints where it saved it; `phoenix list` shows saved generations. A server holding only the untouched session a terminal creates by starting `tmux` is never saved over your latest snapshot.
+- `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it: onto a running server, one with no sessions, or one holding only a terminal's untouched session, which it replaces while keeping that terminal attached.
+- `phoenix daemon` saves on structural change and restores the latest snapshot into a server holding nothing you built — no sessions, or only a terminal's untouched session, even when the terminal reached tmux first. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
 
 `phoenix --help` lists every flag.
 

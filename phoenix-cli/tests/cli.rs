@@ -42,6 +42,7 @@ fn phoenix_bin() -> &'static str {
 #[test]
 fn save_then_list_round_trips_through_the_real_binary() {
     let harness = IsolatedTmux::new("cli-save-list");
+    harness.build();
     let data_dir = TestDataDir::new("save-list");
 
     harness.wait_until_settled();
@@ -95,6 +96,7 @@ fn save_then_list_round_trips_through_the_real_binary() {
 #[test]
 fn save_exit_code_is_zero_when_a_pane_is_idle() {
     let harness = IsolatedTmux::new("cli-exit-code");
+    harness.build();
     let data_dir = TestDataDir::new("exit-code");
 
     harness.wait_until_settled();
@@ -129,6 +131,7 @@ fn list_before_any_save_succeeds_with_empty_output() {
 #[test]
 fn save_respects_the_keep_flag() {
     let harness = IsolatedTmux::new("cli-keep");
+    harness.build();
     let data_dir = TestDataDir::new("keep");
 
     for _ in 0..3 {
@@ -177,6 +180,7 @@ fn unknown_subcommand_exits_nonzero() {
 #[test]
 fn restore_dry_run_prints_commands_and_touches_nothing() {
     let harness = IsolatedTmux::new("cli-restore-dry-run");
+    harness.build();
     let data_dir = TestDataDir::new("restore-dry-run");
 
     harness.wait_until_settled();
@@ -259,6 +263,13 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         ])
         .status()
         .expect("failed to create the keepalive session");
+    assert!(status.success());
+    // Built out too: a lone idle session is a bootstrap session, which
+    // restore replaces instead of keeping alongside.
+    let status = Command::new("tmux")
+        .args(["-S", &harness.socket, "split-window", "-t", "keepalive"])
+        .status()
+        .expect("failed to split the keepalive session");
     assert!(status.success());
     let status = Command::new("tmux")
         .args([

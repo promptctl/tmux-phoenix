@@ -120,6 +120,130 @@ fn single_pane_snapshot(session_name: &str) -> Snapshot {
     )
 }
 
+/// Blocks until the server holds only bootstrap sessions as `probe` sees
+/// them: a session just created is still starting its shell.
+fn wait_until_bootstrap_only(socket: &str) {
+    for _ in 0..50 {
+        if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
+            phoenix_restore::probe(Some(socket))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{socket} never settled into a bootstrap-only server within 5s");
+}
+
+/// A declined boot misread the server exactly when a refused capture still
+/// holds every session it took for built; closing one of those is the user's
+/// doing, not a misreading.
+#[test]
+fn a_declined_boot_misread_the_server_only_while_its_built_sessions_remain() {
+    let idle = |name: &str| {
+        snapshot_with_program(
+            name,
+            CapturedProgram {
+                command: ProgramName::parse("zsh").unwrap(),
+                argv: Some(NonEmpty::singleton("-zsh".to_string())),
+            },
+        )
+    };
+    let declined = |names: &[&str]| {
+        phoenix_daemon::Boot::Declined(
+            NonEmpty::from_vec(
+                names
+                    .iter()
+                    .map(|n| SessionName::parse(*n).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    };
+
+    assert!(declined(&["0"]).misread(&idle("0")));
+    assert!(!declined(&["work"]).misread(&idle("0")));
+    assert!(!declined(&["0", "work"]).misread(&idle("0")));
+    assert!(!phoenix_daemon::Boot::Settled.misread(&idle("0")));
+}
+
+/// tmux-parity-ure.j0f criterion 1: a terminal that reaches tmux before the
+/// daemon leaves a lone bootstrap session, named `0` exactly like the
+/// snapshot's own session. Boot restore puts the snapshot in its place.
+#[test]
+fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
+    let server = EmptyServer::new("login-race");
+    // A shell that reads no startup files: a developer's zsh prompt runs `git`,
+    // which the probe rightly reads as a program.
+    let status = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "new-session",
+            "-d",
+            "-s",
+            "0",
+            "sh -i",
+        ])
+        .status()
+        .expect("failed to start the login terminal's session");
+    assert!(status.success());
+    wait_until_bootstrap_only(&server.socket);
+
+    let data_dir = TestDataDir::new("login-race");
+    let store = Store::new(&data_dir.0);
+    store
+        .save(
+            &single_pane_snapshot("0"),
+            std::num::NonZeroUsize::new(5).unwrap(),
+            Duration::ZERO,
+        )
+        .expect("failed to seed a snapshot to restore");
+
+    let mut log = Vec::new();
+    let phoenix_daemon::Booted {
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
+    } = phoenix_daemon::connect_and_boot(
+        Some(server.socket.clone()),
+        &store,
+        None,
+        |line| log.push(line.to_string()),
+        drop,
+    )
+    .expect("connect_and_boot failed")
+    .expect("a bootstrap-only server with a snapshot yields a client");
+    assert_eq!(boot, phoenix_daemon::Boot::Settled);
+
+    assert!(
+        log.iter().any(|l| l.contains("restored 1 session")),
+        "{log:?}"
+    );
+    assert_eq!(
+        server.session_names(),
+        vec!["0".to_string()],
+        "the login session should be replaced, with no scaffolding left"
+    );
+    let windows = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "list-windows",
+            "-t",
+            "=0",
+            "-F",
+            "#{window_name}",
+        ])
+        .output()
+        .expect("failed to list the restored session's windows");
+    assert_eq!(
+        String::from_utf8_lossy(&windows.stdout).trim(),
+        "shell",
+        "session 0 should be the snapshot's, not the login terminal's"
+    );
+
+    client.close();
+}
+
 #[test]
 fn boots_with_no_sessions_and_no_snapshot_waits_without_starting_a_server() {
     let server = EmptyServer::new("nothing-to-restore");
@@ -130,6 +254,7 @@ fn boots_with_no_sessions_and_no_snapshot_waits_without_starting_a_server() {
     let booted = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -159,9 +284,13 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
-    let mut client = phoenix_daemon::connect_and_boot(
+    let phoenix_daemon::Booted {
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
+    } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
@@ -169,6 +298,7 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
     .expect("a server with sessions, or a snapshot to restore, yields a client");
 
     assert!(log.iter().any(|l| l.contains("restored 1 session")));
+    assert_eq!(boot, phoenix_daemon::Boot::Settled);
 
     let sessions = server.session_names();
     assert_eq!(
@@ -209,6 +339,18 @@ fn boots_with_an_existing_session_never_touches_it() {
         .status()
         .expect("failed to pre-create a session");
     assert!(status.success());
+    // Built out, so this is a session the user made, not a bootstrap one.
+    let status = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            &server.socket,
+            "split-window",
+            "-t",
+            &existing_session,
+        ])
+        .status()
+        .expect("failed to split the pre-existing session");
+    assert!(status.success());
 
     let data_dir = TestDataDir::new("stay-live");
     let store = Store::new(&data_dir.0);
@@ -223,16 +365,29 @@ fn boots_with_an_existing_session_never_touches_it() {
         .unwrap();
 
     let mut log = Vec::new();
-    let mut client = phoenix_daemon::connect_and_boot(
+    let phoenix_daemon::Booted {
+        mut client,
+        decided: phoenix_daemon::Decided { boot, .. },
+    } = phoenix_daemon::connect_and_boot(
         Some(server.socket.clone()),
         &store,
+        None,
         |line| log.push(line.to_string()),
         drop,
     )
     .expect("connect_and_boot failed")
     .expect("a server with sessions, or a snapshot to restore, yields a client");
 
-    assert!(log.iter().any(|l| l.contains("staying in save mode")));
+    assert!(
+        log.iter()
+            .any(|l| l.contains("staying in save mode") && l.contains(&existing_session)),
+        "the daemon should say which session kept it from restoring: {log:?}"
+    );
+    assert!(
+        matches!(&boot, phoenix_daemon::Boot::Declined(built)
+            if built.iter().any(|name| name.as_str() == existing_session)),
+        "staying out of a built server is provisional, naming what it saw: {boot:?}"
+    );
     assert_eq!(
         server.session_names(),
         vec![existing_session],
@@ -268,8 +423,8 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
         )
         .expect("failed to seed a snapshot to restore");
 
-    let mut client =
-        phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, |_| {}, drop)
+    let phoenix_daemon::Booted { mut client, .. } =
+        phoenix_daemon::connect_and_boot(Some(server.socket.clone()), &store, None, |_| {}, drop)
             .expect("connect_and_boot failed")
             .expect("a snapshot to restore yields a client");
 

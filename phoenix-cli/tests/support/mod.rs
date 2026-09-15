@@ -21,6 +21,17 @@ impl IsolatedTmux {
         Self { socket, session }
     }
 
+    /// Splits the session's window so the server holds a session the user
+    /// built. A lone window with one idle shell is a bootstrap session, which
+    /// `save` refuses to publish and restore replaces.
+    pub fn build(&self) {
+        let status = std::process::Command::new("tmux")
+            .args(["-S", &self.socket, "split-window", "-t", &self.session])
+            .status()
+            .expect("failed to run tmux split-window");
+        assert!(status.success(), "tmux split-window failed");
+    }
+
     /// Blocks until a save would come back clean: every pane reports a
     /// working directory, and every pane's process holds its terminal's
     /// foreground (`ps` STAT carries `+`), which is what argv recovery keys
