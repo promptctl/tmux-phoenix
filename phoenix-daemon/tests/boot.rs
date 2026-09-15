@@ -151,7 +151,11 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
 
     let session_name = unique_name("restored-session");
     store
-        .save(&single_pane_snapshot(&session_name), 5, Duration::ZERO)
+        .save(
+            &single_pane_snapshot(&session_name),
+            std::num::NonZeroUsize::new(5).unwrap(),
+            Duration::ZERO,
+        )
         .expect("failed to seed a snapshot to restore");
 
     let mut log = Vec::new();
@@ -213,7 +217,7 @@ fn boots_with_an_existing_session_never_touches_it() {
     store
         .save(
             &single_pane_snapshot(&unique_name("would-be-restored")),
-            5,
+            std::num::NonZeroUsize::new(5).unwrap(),
             Duration::ZERO,
         )
         .unwrap();
@@ -259,7 +263,7 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
     store
         .save(
             &snapshot_with_program(&session_name, program),
-            5,
+            std::num::NonZeroUsize::new(5).unwrap(),
             Duration::ZERO,
         )
         .expect("failed to seed a snapshot to restore");
