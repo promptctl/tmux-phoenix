@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phoenix_core::{
-    CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId, PaneIndex,
-    ProgramName, Session, SessionName, Snapshot, TmuxVersion, Utf8PathBuf, Window, WindowIndex,
-    WindowName,
+    Content, ContentFailure, Cwd, Foreground, Layout, Made, NonEmpty, OffsetDateTime, Origin, Pane,
+    PaneId, PaneIndex, Session, SessionName, Snapshot, TmuxVersion, Touched, WinLink, Window,
+    WindowId, WindowIndex, WindowName,
 };
-use phoenix_store::Store;
+use phoenix_store::{Retention, Store};
 use tmux_control::CommandLine;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -80,44 +80,51 @@ impl Drop for TestDataDir {
     }
 }
 
-fn snapshot_with_program(session_name: &str, program: CapturedProgram) -> Snapshot {
+fn snapshot_with_program(session_name: &str, foreground: Foreground) -> Snapshot {
     let pane = Pane {
         id: PaneId(0),
         index: PaneIndex(0),
-        cwd: Utf8PathBuf::parse("/tmp"),
-        program,
-        content: None,
+        cwd: Cwd::parse("/tmp"),
+        foreground,
+        content: Content::NotCaptured {
+            reason: ContentFailure::NotRecorded,
+        },
     };
     let window = Window::new(
-        WindowIndex(0),
+        WindowId(0),
+        Made::NotByPhoenix,
         WindowName::parse("shell").unwrap(),
         Layout::parse("b25d,80x24,0,0,0").unwrap(),
+        false,
         NonEmpty::singleton(pane),
         PaneIndex(0),
     )
     .unwrap();
     let session = Session::new(
         SessionName::parse(session_name).unwrap(),
-        NonEmpty::singleton(window),
+        None,
+        NonEmpty::singleton(WinLink {
+            index: WindowIndex(0),
+            window: WindowId(0),
+        }),
         WindowIndex(0),
+        None,
     )
     .unwrap();
-    Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 5 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::singleton(session),
-    }
+    Snapshot::new(
+        Origin::BeforeOriginWasRecorded,
+        Touched::Never,
+        OffsetDateTime::from_unix_timestamp(1_700_000_000),
+        TmuxVersion { major: 3, minor: 5 },
+        NonEmpty::singleton(window),
+        NonEmpty::singleton(session),
+        vec![],
+    )
+    .unwrap()
 }
 
 fn single_pane_snapshot(session_name: &str) -> Snapshot {
-    snapshot_with_program(
-        session_name,
-        CapturedProgram {
-            command: ProgramName::parse("zsh").unwrap(),
-            argv: None,
-        },
-    )
+    snapshot_with_program(session_name, Foreground::Shell)
 }
 
 /// Blocks until the server holds only bootstrap sessions as `probe` sees
@@ -139,15 +146,7 @@ fn wait_until_bootstrap_only(socket: &str) {
 /// doing, not a misreading.
 #[test]
 fn a_declined_boot_misread_the_server_only_while_its_built_sessions_remain() {
-    let idle = |name: &str| {
-        snapshot_with_program(
-            name,
-            CapturedProgram {
-                command: ProgramName::parse("zsh").unwrap(),
-                argv: Some(NonEmpty::singleton("-zsh".to_string())),
-            },
-        )
-    };
+    let idle = |name: &str| snapshot_with_program(name, Foreground::Shell);
     let declined = |names: &[&str]| {
         phoenix_daemon::Boot::Declined(
             NonEmpty::from_vec(
@@ -194,7 +193,10 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
     store
         .save(
             &single_pane_snapshot("0"),
-            std::num::NonZeroUsize::new(5).unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
+            },
             Duration::ZERO,
         )
         .expect("failed to seed a snapshot to restore");
@@ -278,7 +280,10 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
     store
         .save(
             &single_pane_snapshot(&session_name),
-            std::num::NonZeroUsize::new(5).unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
+            },
             Duration::ZERO,
         )
         .expect("failed to seed a snapshot to restore");
@@ -359,7 +364,10 @@ fn boots_with_an_existing_session_never_touches_it() {
     store
         .save(
             &single_pane_snapshot(&unique_name("would-be-restored")),
-            std::num::NonZeroUsize::new(5).unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
+            },
             Duration::ZERO,
         )
         .unwrap();
@@ -408,17 +416,19 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
     let store = Store::new(&data_dir.0);
 
     let session_name = unique_name("relaunch-session");
-    let program = CapturedProgram {
-        command: ProgramName::parse("echo").unwrap(),
-        argv: Some(NonEmpty::new(
+    let program = Foreground::Program {
+        argv: NonEmpty::new(
             "echo".to_string(),
             vec!["DISTINCTIVE-BOOT-RELAUNCH-MARKER".to_string()],
-        )),
+        ),
     };
     store
         .save(
             &snapshot_with_program(&session_name, program),
-            std::num::NonZeroUsize::new(5).unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
+            },
             Duration::ZERO,
         )
         .expect("failed to seed a snapshot to restore");

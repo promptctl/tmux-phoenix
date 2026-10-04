@@ -76,7 +76,7 @@ impl Boot {
             Boot::Settled => false,
             Boot::Declined(built) => built
                 .iter()
-                .all(|name| refused.sessions.iter().any(|s| s.name() == name)),
+                .all(|name| refused.sessions().iter().any(|s| s.name() == name)),
         }
     }
 }
@@ -150,7 +150,7 @@ pub fn connect_and_boot(
                     .map_err(BootError::Restore)?;
             on_log(&format!(
                 "restored {} session(s) from the latest snapshot",
-                snapshot.sessions.len()
+                snapshot.sessions().len()
             ));
             Some((client, Boot::Settled))
         }

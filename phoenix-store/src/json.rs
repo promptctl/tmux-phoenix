@@ -1,14 +1,15 @@
-//! A hand-rolled, inspection-only JSON encoder (DESIGN.md §7: "a
-//! `--format=json` option ... for inspection"). One-way — this crate never
-//! reads JSON back in; `latest` and every generation on disk are always the
-//! binary format from [`crate::header`]. No external crate available (see
-//! DESIGN.md §4's implementation note), so this hand-rolls a small JSON
-//! value tree + renderer rather than pulling in `serde_json`.
+//! A hand-rolled, inspection-only JSON encoder (`--format=json` for
+//! inspection). One-way — this crate never reads JSON back in; every
+//! generation on disk is always the binary format from [`crate::header`].
+//! No external crate available (see DESIGN.md §4's implementation note), so
+//! this hand-rolls a small JSON value tree + renderer rather than pulling
+//! in `serde_json`.
 
-use phoenix_core::Snapshot;
+use phoenix_core::{Content, Cwd, Foreground, Made, Origin, Session, Snapshot, Touched, Window};
 
 enum Value {
     Null,
+    Bool(bool),
     Number(i64),
     Str(String),
     Array(Vec<Value>),
@@ -42,6 +43,7 @@ fn push_indent(out: &mut String, depth: usize) {
 fn render(value: &Value, depth: usize, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(&n.to_string()),
         Value::Str(s) => out.push_str(&escape(s)),
         Value::Array(items) => {
@@ -83,46 +85,108 @@ fn render(value: &Value, depth: usize, out: &mut String) {
     }
 }
 
+fn string(s: impl ToString) -> Value {
+    Value::Str(s.to_string())
+}
+
 fn snapshot_value(s: &Snapshot) -> Value {
     Value::Object(vec![
         (
-            "format_version",
-            Value::Number(i64::from(s.format_version.0)),
+            "origin",
+            match s.origin {
+                Origin::Recorded(id) => string(id),
+                Origin::BeforeOriginWasRecorded => Value::Null,
+            },
+        ),
+        (
+            "touched",
+            match s.touched {
+                Touched::By(generation) => Value::Number(generation.0),
+                Touched::Never => Value::Null,
+            },
         ),
         (
             "tmux_version",
-            Value::Str(format!("{}.{}", s.tmux_version.major, s.tmux_version.minor)),
+            string(format!("{}.{}", s.tmux_version.major, s.tmux_version.minor)),
         ),
         (
             "captured_at_unix",
             Value::Number(s.captured_at.unix_timestamp()),
         ),
         (
+            "windows",
+            Value::Array(s.windows().iter().map(window_value).collect()),
+        ),
+        (
             "sessions",
-            Value::Array(s.sessions.iter().map(session_value).collect()),
+            Value::Array(s.sessions().iter().map(session_value).collect()),
+        ),
+        (
+            "clients",
+            Value::Array(
+                s.clients()
+                    .iter()
+                    .map(|c| {
+                        Value::Object(vec![
+                            ("name", string(&c.name)),
+                            ("session", string(&c.session)),
+                        ])
+                    })
+                    .collect(),
+            ),
         ),
     ])
 }
 
-fn session_value(session: &phoenix_core::Session) -> Value {
+fn session_value(session: &Session) -> Value {
     Value::Object(vec![
-        ("name", Value::Str(session.name().as_str().to_string())),
+        ("name", string(session.name())),
+        ("group", session.group().map(string).unwrap_or(Value::Null)),
         (
             "active_window",
             Value::Number(i64::from(session.active().0)),
         ),
         (
+            "last_window",
+            session
+                .last()
+                .map(|w| Value::Number(i64::from(w.0)))
+                .unwrap_or(Value::Null),
+        ),
+        (
             "windows",
-            Value::Array(session.windows().iter().map(window_value).collect()),
+            Value::Array(
+                session
+                    .windows()
+                    .iter()
+                    .map(|link| {
+                        Value::Object(vec![
+                            ("index", Value::Number(i64::from(link.index.0))),
+                            ("window", string(link.window)),
+                        ])
+                    })
+                    .collect(),
+            ),
         ),
     ])
 }
 
-fn window_value(window: &phoenix_core::Window) -> Value {
+fn window_value(window: &Window) -> Value {
     Value::Object(vec![
-        ("index", Value::Number(i64::from(window.index().0))),
-        ("name", Value::Str(window.name().as_str().to_string())),
-        ("layout", Value::Str(window.layout().as_str().to_string())),
+        ("id", string(window.id())),
+        (
+            "made",
+            match window.made() {
+                Made::ByPhoenix { generation, saved } => Value::Object(vec![
+                    ("generation", Value::Number(generation.0)),
+                    ("saved", string(saved)),
+                ]),
+                Made::NotByPhoenix => Value::Null,
+            },
+        ),
+        ("name", string(window.name())),
+        ("layout", string(window.layout())),
+        ("zoomed", Value::Bool(window.zoomed())),
         ("active_pane", Value::Number(i64::from(window.active().0))),
         (
             "panes",
@@ -133,38 +197,47 @@ fn window_value(window: &phoenix_core::Window) -> Value {
 
 fn pane_value(pane: &phoenix_core::Pane) -> Value {
     Value::Object(vec![
-        ("id", Value::Number(i64::from(pane.id.0))),
+        ("id", string(pane.id)),
         ("index", Value::Number(i64::from(pane.index.0))),
         (
             "cwd",
             match &pane.cwd {
-                None => Value::Null,
-                Some(cwd) => Value::Str(cwd.as_str().to_string()),
+                Cwd::Known(path) => string(path),
+                Cwd::Unreadable => Value::Null,
             },
         ),
         (
-            "command",
-            Value::Str(pane.program.command.as_str().to_string()),
-        ),
-        (
-            "argv",
-            match &pane.program.argv {
-                None => Value::Null,
-                Some(argv) => Value::Array(argv.iter().cloned().map(Value::Str).collect()),
+            "foreground",
+            match &pane.foreground {
+                Foreground::Shell => Value::Object(vec![("kind", string("shell"))]),
+                Foreground::Program { argv } => Value::Object(vec![
+                    ("kind", string("program")),
+                    ("argv", Value::Array(argv.iter().map(string).collect())),
+                ]),
+                Foreground::Unrecovered { reason } => Value::Object(vec![
+                    ("kind", string("unrecovered")),
+                    ("reason", string(reason)),
+                ]),
             },
         ),
         (
             "content",
             match &pane.content {
-                None => Value::Null,
-                Some(content) => Value::Object(vec![
-                    ("history_size", Value::Number(content.history_size as i64)),
-                    ("history_bytes", Value::Number(content.history_bytes as i64)),
+                Content::NotCaptured { reason } => {
+                    Value::Object(vec![("not_captured", string(reason))])
+                }
+                Content::Captured {
+                    indicator,
+                    scrollback,
+                    visible,
+                } => Value::Object(vec![
+                    ("history_size", Value::Number(indicator.history_size as i64)),
                     (
-                        "scrollback_lines",
-                        Value::Number(content.scrollback.len() as i64),
+                        "history_bytes",
+                        Value::Number(indicator.history_bytes as i64),
                     ),
-                    ("visible_lines", Value::Number(content.visible.len() as i64)),
+                    ("scrollback_lines", Value::Number(scrollback.len() as i64)),
+                    ("visible_lines", Value::Number(visible.len() as i64)),
                 ]),
             },
         ),
@@ -180,48 +253,11 @@ pub fn to_json(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_core::{
-        CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId, PaneIndex,
-        ProgramName, Session, SessionName, TmuxVersion, Utf8PathBuf, Window, WindowIndex,
-        WindowName,
-    };
-
-    fn sample() -> Snapshot {
-        let pane = Pane {
-            id: PaneId(0),
-            index: PaneIndex(0),
-            cwd: Utf8PathBuf::parse("/home/user"),
-            program: CapturedProgram {
-                command: ProgramName::parse("zsh").unwrap(),
-                argv: None,
-            },
-            content: None,
-        };
-        let window = Window::new(
-            WindowIndex(0),
-            WindowName::parse("shell").unwrap(),
-            Layout::parse("b25d,80x24,0,0,0").unwrap(),
-            NonEmpty::singleton(pane),
-            PaneIndex(0),
-        )
-        .unwrap();
-        let session = Session::new(
-            SessionName::parse("main").unwrap(),
-            NonEmpty::singleton(window),
-            WindowIndex(0),
-        )
-        .unwrap();
-        Snapshot {
-            format_version: FormatVersion::CURRENT,
-            tmux_version: TmuxVersion { major: 3, minor: 5 },
-            captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-            sessions: NonEmpty::singleton(session),
-        }
-    }
+    use crate::testing::sample_snapshot;
 
     #[test]
     fn produces_balanced_braces_and_brackets() {
-        let json = to_json(&sample());
+        let json = to_json(&sample_snapshot(1_700_000_000));
         let opens = json.matches('{').count() + json.matches('[').count();
         let closes = json.matches('}').count() + json.matches(']').count();
         assert_eq!(opens, closes);
@@ -229,20 +265,18 @@ mod tests {
 
     #[test]
     fn contains_expected_field_values() {
-        let json = to_json(&sample());
+        let json = to_json(&sample_snapshot(1_700_000_000));
         assert!(json.contains("\"name\": \"main\""));
-        assert!(json.contains("\"command\": \"zsh\""));
-        assert!(json.contains("\"tmux_version\": \"3.5\""));
+        assert!(json.contains("\"kind\": \"shell\""));
+        assert!(json.contains("\"kind\": \"program\""));
+        assert!(json.contains("\"tmux_version\": \"3.7\""));
         assert!(json.contains("\"captured_at_unix\": 1700000000"));
+        assert!(json.contains("\"origin\": \"4242:1700000000\""));
     }
 
     #[test]
-    fn escapes_quotes_and_backslashes_in_strings() {
+    fn escapes_quotes_backslashes_and_control_characters() {
         assert_eq!(escape("a\"b\\c"), r#""a\"b\\c""#);
-    }
-
-    #[test]
-    fn escapes_control_characters() {
         assert_eq!(escape("a\nb\tc"), r#""a\nb\tc""#);
         assert_eq!(escape("\u{1}"), "\"\\u0001\"");
     }

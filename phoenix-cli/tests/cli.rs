@@ -81,16 +81,19 @@ fn save_then_list_round_trips_through_the_real_binary() {
     let fields: Vec<&str> = lines[0].split('\t').collect();
     assert_eq!(
         fields.len(),
-        3,
-        "expected captured_at\\tformat_version\\tpath"
+        5,
+        "expected captured_at\\tformat_version\\torigin\\ttag\\tpath"
     );
-    assert_eq!(fields[2], saved_path);
+    assert_eq!(fields[1], "2");
+    assert_ne!(fields[2], "-", "a fresh save records its server's identity");
+    assert_eq!(fields[3], "-");
+    assert_eq!(fields[4], saved_path);
 
     let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
     let loaded = store
         .load_latest()
         .expect("saved snapshot should load back");
-    assert_eq!(loaded.sessions.first().name().as_str(), harness.session);
+    assert_eq!(loaded.sessions().first().name().as_str(), harness.session);
 }
 
 #[test]
@@ -479,7 +482,7 @@ fn daemon_saves_after_a_structural_change_through_the_real_binary() {
 
     let saved = saved.expect("expected the daemon to have saved after the debounce settled");
     assert_eq!(
-        saved.sessions.first().active_window().panes().len(),
+        saved.active_window(saved.sessions().first()).panes().len(),
         2,
         "the save should reflect the split that triggered it"
     );

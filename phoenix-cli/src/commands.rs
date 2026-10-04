@@ -5,8 +5,9 @@
 
 use std::path::Path;
 
-use phoenix_core::Snapshot;
-use phoenix_store::Store;
+use phoenix_capture::Previous;
+use phoenix_core::{Shells, Snapshot};
+use phoenix_store::{Retention, Store, StoreError};
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
 /// DESIGN.md §9's contract: `0` ok, `3` degraded, `1` fail.
@@ -42,18 +43,6 @@ fn open_store() -> Result<Store, String> {
     Store::xdg_default().map_err(|e| format!("could not determine save directory: {e}"))
 }
 
-/// DESIGN.md §5/§9's "degraded" save: some pane's best-effort recovery came
-/// back absent — `argv` when `ps` could not resolve its foreground program,
-/// `cwd` when tmux could not read its working directory.
-fn is_degraded(snapshot: &Snapshot) -> bool {
-    snapshot
-        .sessions
-        .iter()
-        .flat_map(|s| s.windows().iter())
-        .flat_map(|w| w.panes().iter())
-        .any(|p| p.program.argv.is_none() || p.cwd.is_none())
-}
-
 pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
     let mut client = match connect(socket) {
         Ok(c) => c,
@@ -63,11 +52,25 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
         }
     };
 
-    // One-shot save captures structure only; content capture needs the
-    // previous generation's per-pane content for dirty-tracking, which is
-    // tmux-parity-ure.3's work.
-    let snapshot = match phoenix_capture::capture(&mut client, phoenix_capture::ContentCapture::Off)
-    {
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("phoenix save: {msg}");
+            return EXIT_FAIL;
+        }
+    };
+
+    // The previous generation's indicators let an unchanged pane reuse its
+    // scrollback; nothing saved yet is the normal first run.
+    let previous = match store.load_latest() {
+        Ok(snapshot) => Previous::from_snapshot(&snapshot),
+        Err(StoreError::NoLatest) => Previous::default(),
+        Err(e) => {
+            eprintln!("phoenix save: failed to load the latest snapshot: {e}");
+            return EXIT_FAIL;
+        }
+    };
+    let snapshot = match phoenix_capture::capture(&mut client, &previous, &Shells::default()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("phoenix save: capture failed: {e}");
@@ -77,15 +80,10 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
     };
     client.close();
 
-    let store = match open_store() {
-        Ok(s) => s,
-        Err(msg) => {
-            eprintln!("phoenix save: {msg}");
-            return EXIT_FAIL;
-        }
+    let retention = Retention {
+        keep_untagged: keep,
     };
-
-    let outcome = match store.save(&snapshot, keep, SAVE_WAIT) {
+    let outcome = match store.save(&snapshot, None, retention, SAVE_WAIT) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("phoenix save: failed to write snapshot: {e}");
@@ -101,11 +99,14 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
         );
     }
 
-    if is_degraded(&snapshot) {
-        eprintln!("phoenix save: warning: argv or cwd recovery degraded for one or more panes");
-        EXIT_DEGRADED
-    } else {
+    let degradations = snapshot.degradations();
+    for degradation in &degradations {
+        eprintln!("phoenix save: warning: {degradation}");
+    }
+    if degradations.is_empty() {
         EXIT_OK
+    } else {
+        EXIT_DEGRADED
     }
 }
 
@@ -122,9 +123,11 @@ pub fn run_list() -> i32 {
         Ok(generations) => {
             for g in &generations {
                 println!(
-                    "{}\t{}\t{}",
-                    g.captured_at_unix,
-                    g.format_version,
+                    "{}\t{}\t{}\t{}\t{}",
+                    g.captured_at.unix_timestamp(),
+                    g.format_version.0,
+                    g.origin,
+                    g.tag.as_ref().map(|t| t.as_str()).unwrap_or("-"),
                     g.path.display()
                 );
             }
@@ -189,7 +192,7 @@ pub fn run_restore(dry_run: bool, file: Option<String>, socket: Option<String>) 
     let report = |outcome: &phoenix_restore::ApplyOutcome| {
         println!(
             "restored {} session(s): {} commands applied, {} redundant move-window(s) skipped",
-            snapshot.sessions.len(),
+            snapshot.sessions().len(),
             outcome.executed,
             outcome.skipped_move_window
         )
@@ -290,73 +293,5 @@ pub fn run_install(settings: crate::cli::DaemonSettings) -> i32 {
             );
             EXIT_FAIL
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use phoenix_core::{
-        CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId, PaneIndex,
-        ProgramName, Session, SessionName, TmuxVersion, Utf8PathBuf, Window, WindowIndex,
-        WindowName,
-    };
-
-    fn snapshot_with(argv: Option<NonEmpty<String>>, cwd: Option<Utf8PathBuf>) -> Snapshot {
-        let pane = Pane {
-            id: PaneId(0),
-            index: PaneIndex(0),
-            cwd,
-            program: CapturedProgram {
-                command: ProgramName::parse("zsh").unwrap(),
-                argv,
-            },
-            content: None,
-        };
-        let window = Window::new(
-            WindowIndex(0),
-            WindowName::parse("shell").unwrap(),
-            Layout::parse("b25d,80x24,0,0,0").unwrap(),
-            NonEmpty::singleton(pane),
-            PaneIndex(0),
-        )
-        .unwrap();
-        let session = Session::new(
-            SessionName::parse("main").unwrap(),
-            NonEmpty::singleton(window),
-            WindowIndex(0),
-        )
-        .unwrap();
-        Snapshot {
-            format_version: FormatVersion::CURRENT,
-            tmux_version: TmuxVersion { major: 3, minor: 5 },
-            captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-            sessions: NonEmpty::singleton(session),
-        }
-    }
-
-    fn zsh() -> Option<NonEmpty<String>> {
-        Some(NonEmpty::singleton("zsh".to_string()))
-    }
-
-    #[test]
-    fn absent_argv_is_degraded() {
-        assert!(is_degraded(&snapshot_with(
-            None,
-            Utf8PathBuf::parse("/home")
-        )));
-    }
-
-    #[test]
-    fn absent_cwd_is_degraded() {
-        assert!(is_degraded(&snapshot_with(zsh(), None)));
-    }
-
-    #[test]
-    fn fully_recovered_pane_is_not_degraded() {
-        assert!(!is_degraded(&snapshot_with(
-            zsh(),
-            Utf8PathBuf::parse("/home")
-        )));
     }
 }

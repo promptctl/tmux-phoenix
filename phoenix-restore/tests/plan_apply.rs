@@ -6,13 +6,9 @@
 //! reordering, so the assertions here are the geometry ones.
 
 mod support;
-use support::{line, IsolatedTmux};
+use support::{line, linked, snapshot, tree, IsolatedTmux};
 
-use phoenix_core::{
-    CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId, PaneIndex,
-    ProgramName, Session, SessionName, Snapshot, TmuxVersion, Utf8PathBuf, Window, WindowIndex,
-    WindowName,
-};
+use phoenix_core::{Content, ContentFailure, Cwd, Foreground, NonEmpty, Pane, PaneId, PaneIndex};
 use phoenix_restore::{apply, plan};
 use tmux_control::{Client, Transport};
 
@@ -20,12 +16,11 @@ fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
         id: PaneId(index),
         index: PaneIndex(index),
-        cwd: Utf8PathBuf::parse(cwd),
-        program: CapturedProgram {
-            command: ProgramName::parse("zsh").unwrap(),
-            argv: None,
+        cwd: Cwd::parse(cwd),
+        foreground: Foreground::Shell,
+        content: Content::NotCaptured {
+            reason: ContentFailure::NotRecorded,
         },
-        content: None,
     }
 }
 
@@ -94,14 +89,13 @@ fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_live_server() {
     let cwd_b = cwd_b.canonicalize().unwrap();
     let cwd_c = cwd_c.canonicalize().unwrap();
 
-    let window0 = Window::new(
-        WindowIndex(0),
-        WindowName::parse("shell").unwrap(),
-        Layout::parse("unused,80x24,0,0,0").unwrap(),
+    let window0 = linked(
+        0,
+        "shell",
+        "unused,80x24,0,0,0",
         NonEmpty::singleton(pane(0, base.to_str().unwrap())),
-        PaneIndex(0),
-    )
-    .unwrap();
+        0,
+    );
 
     // The active pane (index 0) is originally *first* in the snapshot, to
     // actually exercise the "reorder so the active pane is split last"
@@ -112,32 +106,17 @@ fn a_planned_multi_window_multi_pane_tree_applies_cleanly_to_a_live_server() {
         pane(2, cwd_c.to_str().unwrap()),
     ])
     .unwrap();
-    let window1 = Window::new(
-        WindowIndex(5),
-        WindowName::parse("editor").unwrap(),
-        // A real layout string captured live from an actual 3-pane tmux
-        // window — tmux validates the leading checksum against the rest of
-        // the string, so this can't be hand-typed.
-        Layout::parse("77dd,100x30,0,0{50x30,0,0,0,49x30,51,0[49x15,51,0,1,49x14,51,16,2]}")
-            .unwrap(),
+    let window1 = linked(
+        5,
+        "editor",
+        "77dd,100x30,0,0{50x30,0,0,0,49x30,51,0[49x15,51,0,1,49x14,51,16,2]}",
         panes1,
-        PaneIndex(0),
-    )
-    .unwrap();
+        0,
+    );
 
-    let session = Session::new(
-        SessionName::parse("restored").unwrap(),
-        NonEmpty::new(window0, vec![window1]),
-        WindowIndex(5),
-    )
-    .unwrap();
+    let session = tree("restored", NonEmpty::new(window0, vec![window1]), 5);
 
-    let snapshot = Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 5 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::singleton(session),
-    };
+    let snapshot = snapshot(vec![session]);
 
     let restore_plan = plan(&snapshot);
     let outcome = apply(&mut client, &restore_plan).expect("apply failed");
