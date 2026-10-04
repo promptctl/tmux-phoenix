@@ -41,7 +41,7 @@ mod demux;
 mod error;
 mod event;
 
-pub use connection::{Attach, Connection, Opened, Wake};
+pub use connection::{Attach, Connection, EventSink, Opened};
 pub use connection_state::{CloseReason, ConnectionState};
 pub use error::TmuxError;
 pub use event::Event;
@@ -260,6 +260,12 @@ impl<T: Transport> Client<T> {
     pub fn execute(&mut self, command: &CommandLine) -> Result<CommandOutput, TmuxError> {
         if self.state != ConnectionState::Ready {
             return Err(TmuxError::NotReady(self.state));
+        }
+        // A block settled while nothing was in flight is tmux breaking the
+        // one-block-per-command rule; reported before a command is written
+        // against it, as `Connection::idle` does (`[LAW:no-silent-failure]`).
+        if let Some(stray) = self.replies.pop_front() {
+            return Err(TmuxError::UnsolicitedReply(Box::new(stray)));
         }
         self.send_or_close(command)?;
         self.next_reply()?

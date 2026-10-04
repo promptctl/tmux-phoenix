@@ -140,10 +140,14 @@ fn capture_and_save<T: Transport>(
 /// be classified here before this compiles.
 fn is_connection_dead(e: &TmuxError) -> bool {
     match e {
+        // An unsolicited block means every later reply may be the answer
+        // to the command before it; nothing over this link can be trusted
+        // again, so it ends the link like a dead transport does.
         TmuxError::Send(_)
         | TmuxError::Read(_)
         | TmuxError::TransportClosed
-        | TmuxError::NotReady(_) => true,
+        | TmuxError::NotReady(_)
+        | TmuxError::UnsolicitedReply(_) => true,
         TmuxError::Encode(_)
         | TmuxError::Command { .. }
         | TmuxError::Protocol { .. }

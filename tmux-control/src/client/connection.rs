@@ -1,10 +1,17 @@
 //! The connection with an owned reader (ARCHITECTURE.md §4): a thread owns
-//! the transport's read side and delivers [`Event`]s on a channel, while
-//! [`Connection::execute`] correlates replies off the same stream. The one
-//! owner of "when does a notification arrive" is that reader
+//! the transport's read side and delivers [`Event`]s to the caller's sink,
+//! while [`Connection::execute`] correlates replies off the same stream. The
+//! one owner of "when does a notification arrive" is that reader
 //! (`[LAW:no-ambient-temporal-coupling]`): a caller that wants to react while
-//! idle waits on the channel, with or without a deadline, and no heartbeat
+//! idle gives a sink that forwards to whatever it waits on, and no heartbeat
 //! command exists anywhere.
+//!
+//! The sink is the caller's, not a queue of this crate's: a caller that only
+//! ever executes passes a sink that drops, and nothing accumulates on its
+//! behalf for the life of the connection — the same shape as
+//! [`super::Client`]'s sinks, for the same reason: "events with nowhere to
+//! go" is not a state, so there is no buffer to cover it. The sink runs on
+//! the reader thread, ahead of any reply that follows in the same read.
 //!
 //! [`Connection::open`] is also the one place a `tmux` process is started in
 //! order to reach a server. `attach-session` is always tried first; when it
@@ -15,10 +22,10 @@
 //! 3.7b). The failed attach *is* the signal: there is no prior "does this
 //! server have sessions?" probe to race against, and no plain `tmux` is run.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 use super::connection_state::{CloseReason, ConnectionState};
 use super::demux::{Demux, Routed};
@@ -50,19 +57,19 @@ pub enum Opened {
     Created(SessionName),
 }
 
-/// What [`Connection::wait`] returns.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Wake {
-    Event(Event),
-    /// The deadline passed with nothing delivered.
-    Deadline,
-}
+/// Where the reader delivers everything that is not a reply.
+pub type EventSink = Box<dyn FnMut(Event) + Send>;
+
+/// A block's outcome: its output, or the `%error`/malformed-terminator it
+/// settled with.
+type Settled = Result<CommandOutput, TmuxError>;
 
 /// A settled block, or the reader's report that no more will come. The
-/// terminal item is sent on this channel as well as [`Event::Closed`] on the
-/// event channel, so whichever call is blocked learns the ending.
+/// terminal item is sent here as well as delivered as [`Event::Closed`] to
+/// the sink, so both the caller blocked in a call and the caller watching
+/// its sink learn the ending.
 enum Reply {
-    Settled(Result<CommandOutput, TmuxError>),
+    Settled(Settled),
     Ended(ReadEnd),
 }
 
@@ -105,14 +112,13 @@ enum Side {
 
 /// A control-mode connection whose reader runs on its own thread.
 ///
-/// Only ever observed `Ready` or `Closed`: [`Connection::open`] and
-/// [`Connection::over`] consume tmux's unsolicited greeting block before
-/// returning, so the off-by-one that correlates a caller's first command
-/// against the greeting has no window to occur in.
+/// Only ever observed `Ready` or `Closed`: tmux's unsolicited greeting block
+/// is consumed before a `Connection` exists at all (see [`Link::greet`]), so
+/// the off-by-one that correlates a caller's first command against the
+/// greeting has no window to occur in.
 pub struct Connection {
     side: Side,
     replies: Receiver<Reply>,
-    events: Receiver<Event>,
     state: ConnectionState,
 }
 
@@ -126,22 +132,40 @@ impl Connection {
     /// Open a connection to the server `options` selects: `attach-session`,
     /// then — on exactly the no-sessions failure, and only if `attach`
     /// permits — `new-session -s <name>`. See the module docs.
-    pub fn open(options: &SpawnOptions, attach: Attach) -> Result<(Self, Opened), TmuxError> {
-        match Self::spawn(&["attach-session"], options) {
+    ///
+    /// `events` receives everything the server says that is not a reply, on
+    /// the reader thread, from the moment the connection exists; a failed
+    /// attempt never reaches it. Pass `drop` to discard events, which is an
+    /// intent this crate would otherwise have to infer.
+    pub fn open(
+        options: &SpawnOptions,
+        attach: Attach,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<(Self, Opened), TmuxError> {
+        let (commands, link, opened) = match Self::spawn(&["attach-session"], options) {
+            Ok((commands, link)) => (commands, link, Opened::Attached),
             Err(TmuxError::NoSessions) => match attach {
-                Attach::Existing => Err(TmuxError::NoSessions),
+                Attach::Existing => return Err(TmuxError::NoSessions),
                 Attach::OrCreate { name } => {
-                    let connection = Self::spawn(&["new-session", "-s", name.as_str()], options)?;
-                    Ok((connection, Opened::Created(name)))
+                    let (commands, link) =
+                        Self::spawn(&["new-session", "-s", name.as_str()], options)?;
+                    (commands, link, Opened::Created(name))
                 }
             },
-            other => other.map(|connection| (connection, Opened::Attached)),
-        }
+            Err(err) => return Err(err),
+        };
+        Ok((Self::start(commands, link, Box::new(events)), opened))
     }
 
-    fn spawn(args: &[&str], options: &SpawnOptions) -> Result<Self, TmuxError> {
+    /// Spawn and read the greeting. A failure here drops the writer, which
+    /// ends the child (see [`Connection::over`]).
+    fn spawn(
+        args: &[&str],
+        options: &SpawnOptions,
+    ) -> Result<(impl Write + Send + 'static, Link), TmuxError> {
         let (commands, output) = spawn_halves(args, options).map_err(TmuxError::Spawn)?;
-        Self::over(commands, output)
+        let link = Link::greet(Box::new(output))?;
+        Ok((commands, link))
     }
 
     /// Build a connection over an already-open byte link, consuming the
@@ -155,34 +179,40 @@ impl Connection {
     pub fn over(
         commands: impl Write + Send + 'static,
         output: impl Read + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
     ) -> Result<Self, TmuxError> {
+        let link = Link::greet(Box::new(output))?;
+        Ok(Self::start(commands, link, Box::new(events)))
+    }
+
+    /// Hand a greeted link its sink and its thread. Whatever arrived behind
+    /// the greeting terminator is delivered first — events to the sink on
+    /// this thread, a further settled block to the reply channel, where
+    /// [`Connection::idle`] will find it for the protocol violation it is.
+    fn start(commands: impl Write + Send + 'static, link: Link, mut events: EventSink) -> Self {
         let (reply_tx, replies) = mpsc::channel();
-        let (event_tx, events) = mpsc::channel();
-        let reader = thread::spawn(move || pump(Box::new(output), reply_tx, event_tx));
-        let mut connection = Self {
+        let Link {
+            output,
+            codec,
+            demux,
+            behind_greeting,
+        } = link;
+        for item in behind_greeting {
+            match item {
+                Behind::Event(event) => events(event),
+                Behind::Settled(settled) => reply_tx
+                    .send(Reply::Settled(settled))
+                    .expect("the receiver is held right here"),
+            }
+        }
+        let reader = thread::spawn(move || pump(output, codec, demux, reply_tx, events));
+        Self {
             side: Side::Open {
                 commands: Box::new(commands),
                 reader,
             },
             replies,
-            events,
             state: ConnectionState::Ready,
-        };
-        connection.greeting()?;
-        Ok(connection)
-    }
-
-    /// The first block on a fresh transport is tmux's reply to the command
-    /// it was started with. `%end` means attached (or created); `%error`
-    /// means that command failed and tmux is exiting, which is an error to
-    /// report rather than a greeting to skip past.
-    fn greeting(&mut self) -> Result<(), TmuxError> {
-        match self.next_reply() {
-            Ok(_) => Ok(()),
-            Err(TmuxError::Command { lines, .. }) if lines.as_slice() == [NO_SESSIONS] => {
-                Err(TmuxError::NoSessions)
-            }
-            Err(err) => Err(err),
         }
     }
 
@@ -198,63 +228,64 @@ impl Connection {
         if self.state != ConnectionState::Ready {
             return Err(TmuxError::NotReady(self.state));
         }
+        self.idle()?;
         self.send(command)?;
         self.next_reply()
     }
 
+    /// Nothing may be waiting on the reply channel while no command is in
+    /// flight: a settled block there is tmux breaking the one-block-per-
+    /// command rule, after which positional correlation is lost, and an
+    /// ending there is the reader having already reported a close that no
+    /// call had yet observed. Both are found here, before a command is
+    /// written against them (`[LAW:no-silent-failure]`).
+    fn idle(&mut self) -> Result<(), TmuxError> {
+        match self.replies.try_recv() {
+            Err(TryRecvError::Empty) => Ok(()),
+            Ok(Reply::Settled(reply)) => Err(TmuxError::UnsolicitedReply(Box::new(reply))),
+            Ok(Reply::Ended(end)) => Err(self.ended(end)),
+            Err(TryRecvError::Disconnected) => Err(self.reader_vanished()),
+        }
+    }
+
+    /// A write that fails after the reader has reported its ending is that
+    /// ending — tmux left, and the dead pipe is how the writer found out —
+    /// so the reported reason wins over the write error.
     fn send(&mut self, command: &CommandLine) -> Result<(), TmuxError> {
         let Side::Open { commands, .. } = &mut self.side else {
             return Err(TmuxError::NotReady(self.state));
         };
-        commands
+        let written = commands
             .write_all(command.wire())
-            .and_then(|()| commands.flush())
-            .map_err(|err| {
-                self.state = self.state.closed(CloseReason::TransportError);
-                TmuxError::Send(err)
-            })
+            .and_then(|()| commands.flush());
+        match written {
+            Ok(()) => Ok(()),
+            Err(err) => match self.replies.try_recv() {
+                Ok(Reply::Ended(end)) => Err(self.ended(end)),
+                _ => {
+                    self.state = self.state.closed(CloseReason::TransportError);
+                    Err(TmuxError::Send(err))
+                }
+            },
+        }
     }
 
     /// The oldest reply not yet taken, waiting for the reader if none has
-    /// settled. A reader that ended closes the connection with its reason
-    /// and returns its error, so [`Connection::state`] says so afterwards
-    /// no matter which call observed the ending.
+    /// settled.
     fn next_reply(&mut self) -> Result<CommandOutput, TmuxError> {
         match self.replies.recv() {
             Ok(Reply::Settled(reply)) => reply,
-            Ok(Reply::Ended(end)) => {
-                self.state = self.state.closed(end.reason());
-                Err(end.error())
-            }
+            Ok(Reply::Ended(end)) => Err(self.ended(end)),
             Err(mpsc::RecvError) => Err(self.reader_vanished()),
         }
     }
 
-    /// Wait for the next event, up to `deadline`. `Closed` closes the
-    /// connection as it is delivered, so the caller sees it exactly once and
-    /// every later call refuses with [`TmuxError::NotReady`].
-    pub fn wait(&mut self, deadline: Option<Instant>) -> Result<Wake, TmuxError> {
-        if self.state != ConnectionState::Ready {
-            return Err(TmuxError::NotReady(self.state));
-        }
-        let received = match deadline {
-            None => self
-                .events
-                .recv()
-                .map_err(|_| RecvTimeoutError::Disconnected),
-            Some(deadline) => self
-                .events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now())),
-        };
-        match received {
-            Ok(Event::Closed(reason)) => {
-                self.state = self.state.closed(reason);
-                Ok(Wake::Event(Event::Closed(reason)))
-            }
-            Ok(event) => Ok(Wake::Event(event)),
-            Err(RecvTimeoutError::Timeout) => Ok(Wake::Deadline),
-            Err(RecvTimeoutError::Disconnected) => Err(self.reader_vanished()),
-        }
+    /// The reader's ending, applied: closes with its reason and becomes its
+    /// error, so [`Connection::state`] says so afterwards no matter which
+    /// call observed it.
+    fn ended(&mut self, end: ReadEnd) -> TmuxError {
+        self.state = self.state.closed(end.reason());
+        end.error()
     }
 
     /// The reader always reports its ending before it exits, so a channel
@@ -300,36 +331,116 @@ impl Execute for Connection {
     }
 }
 
-/// The reader thread: read, decode, route, until the read side ends; then
-/// report the ending on both channels and stop. A send that fails means the
-/// [`Connection`] is gone, and with it anyone to report to.
-fn pump(mut output: Box<dyn Read + Send>, replies: Sender<Reply>, events: Sender<Event>) {
-    let mut codec = Codec::new();
-    let mut demux = Demux::default();
-    let mut buf = [0u8; READ_CHUNK];
-    let end = loop {
-        let n = match output.read(&mut buf) {
-            Ok(0) => break ReadEnd::Eof,
-            Ok(n) => n,
-            Err(err) => break ReadEnd::Failed(err),
-        };
-        for msg in codec.feed(&buf[..n]) {
-            let delivered = match demux.route(msg) {
-                None => Ok(()),
-                Some(Routed::Reply(reply)) => replies.send(Reply::Settled(reply)).map_err(drop),
-                Some(Routed::Notification(msg)) => {
-                    events.send(Event::Notification(msg)).map_err(drop)
-                }
-                Some(Routed::PaneOutput(pane, data)) => {
-                    events.send(Event::PaneOutput(pane, data)).map_err(drop)
-                }
-            };
-            if delivered.is_err() {
-                return;
+/// Something decoded from the same read as the greeting's terminator, in
+/// arrival order. Held rather than delivered because no sink exists until
+/// the greeting has succeeded — a failed attempt's `%exit` is not an event
+/// of any connection the caller has.
+enum Behind {
+    Event(Event),
+    Settled(Settled),
+}
+
+/// A read side past its greeting, with the decoder state that read it.
+struct Link {
+    output: Box<dyn Read + Send>,
+    codec: Codec,
+    demux: Demux,
+    behind_greeting: Vec<Behind>,
+}
+
+impl Link {
+    /// Read until the first block settles. `%end` means attached (or
+    /// created); `%error` means that command failed and tmux is exiting,
+    /// which is an error to report rather than a greeting to skip past; EOF
+    /// first is the transport closing.
+    fn greet(mut output: Box<dyn Read + Send>) -> Result<Self, TmuxError> {
+        let mut codec = Codec::new();
+        let mut demux = Demux::default();
+        let mut routed = VecDeque::new();
+        let greeting = loop {
+            read_routed(&mut output, &mut codec, &mut demux, |r| routed.push_back(r))
+                .map_err(ReadEnd::error)?;
+            let settled_at = routed.iter().position(|r| matches!(r, Routed::Reply(_)));
+            if let Some(at) = settled_at {
+                let Some(Routed::Reply(greeting)) = routed.remove(at) else {
+                    unreachable!("position found a reply")
+                };
+                break greeting;
             }
+        };
+        match greeting {
+            Ok(_) => {}
+            Err(TmuxError::Command { lines, .. }) if lines.as_slice() == [NO_SESSIONS] => {
+                return Err(TmuxError::NoSessions)
+            }
+            Err(err) => return Err(err),
+        }
+        let behind_greeting = routed
+            .into_iter()
+            .map(|r| match r {
+                Routed::Reply(settled) => Behind::Settled(settled),
+                Routed::Notification(msg) => Behind::Event(Event::Notification(msg)),
+                Routed::PaneOutput(pane, data) => Behind::Event(Event::PaneOutput(pane, data)),
+            })
+            .collect();
+        Ok(Self {
+            output,
+            codec,
+            demux,
+            behind_greeting,
+        })
+    }
+}
+
+/// One read, decoded and routed: every message the chunk held, in order, to
+/// `routed`. The one read-and-route for both the greeting and the pump
+/// (`[LAW:single-enforcer]`).
+fn read_routed(
+    output: &mut dyn Read,
+    codec: &mut Codec,
+    demux: &mut Demux,
+    mut routed: impl FnMut(Routed),
+) -> Result<(), ReadEnd> {
+    let mut buf = [0u8; READ_CHUNK];
+    let n = match output.read(&mut buf) {
+        Ok(0) => return Err(ReadEnd::Eof),
+        Ok(n) => n,
+        Err(err) => return Err(ReadEnd::Failed(err)),
+    };
+    codec
+        .feed(&buf[..n])
+        .into_iter()
+        .filter_map(|msg| demux.route(msg))
+        .for_each(&mut routed);
+    Ok(())
+}
+
+/// The reader thread: read, decode, route, until the read side ends; then
+/// report the ending to both the reply channel and the sink and stop. A reply
+/// send that fails means the [`Connection`] is gone, and with it anyone to
+/// report to.
+fn pump(
+    mut output: Box<dyn Read + Send>,
+    mut codec: Codec,
+    mut demux: Demux,
+    replies: Sender<Reply>,
+    mut events: EventSink,
+) {
+    let end = loop {
+        let mut gone = false;
+        let read = read_routed(&mut output, &mut codec, &mut demux, |r| match r {
+            Routed::Reply(reply) => gone |= replies.send(Reply::Settled(reply)).is_err(),
+            Routed::Notification(msg) => events(Event::Notification(msg)),
+            Routed::PaneOutput(pane, data) => events(Event::PaneOutput(pane, data)),
+        });
+        if gone {
+            return;
+        }
+        if let Err(end) = read {
+            break end;
         }
     };
-    let _ = events.send(Event::Closed(end.reason()));
+    events(Event::Closed(end.reason()));
     let _ = replies.send(Reply::Ended(end));
 }
 

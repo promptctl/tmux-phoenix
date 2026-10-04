@@ -15,7 +15,10 @@ use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use tmux_control::{Client, CommandLine, PaneId, ServerMessage, TmuxError, Transport};
+use tmux_control::{
+    Attach, Client, CommandLine, Connection, Event, PaneId, ServerMessage, SessionName,
+    SpawnOptions, Target, TmuxError, Transport,
+};
 
 /// For a command that takes no arguments.
 pub const NO_ARGS: [&str; 0] = [];
@@ -23,6 +26,40 @@ pub const NO_ARGS: [&str; 0] = [];
 /// A command line for tests, whose arguments never hold a NUL.
 pub fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
     CommandLine::new(name, args).expect("test arguments hold no NUL")
+}
+
+/// The one socket path for a test's throw-away server: isolated from the
+/// developer's default server, unique per test and per run.
+fn test_socket(name: &str) -> String {
+    format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id())
+}
+
+/// Every session name on `socket`, as plain `tmux` sees it; empty when no
+/// server runs there.
+pub fn sessions_on(socket: &str) -> Vec<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["-S", socket, "list-sessions", "-F", "#{session_name}"])
+        .output()
+        .expect("failed to run tmux list-sessions");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Session-scoped teardown, the one form this repository allows, through
+/// the crate's own exact target so no harness renders `-t` by hand.
+fn kill_session(socket: &str, session: &str) {
+    let name = SessionName::parse(session).expect("a session tmux listed is addressable");
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket,
+            "kill-session",
+            "-t",
+            &Target::Session(name).to_string(),
+        ])
+        .status();
 }
 
 /// Isolated throw-away socket path + a guard that tears the session down via
@@ -34,7 +71,7 @@ pub struct IsolatedTmux {
 
 impl IsolatedTmux {
     pub fn new(name: &str) -> Self {
-        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
+        let socket = test_socket(name);
         let session = format!("phoenix-test-{name}");
         // Pre-create the session out-of-band (not through the transport
         // under test) so `attach-session` has something real to attach to,
@@ -46,13 +83,26 @@ impl IsolatedTmux {
         assert!(status.success(), "tmux new-session failed");
         Self { socket, session }
     }
+
+    pub fn options(&self) -> SpawnOptions {
+        SpawnOptions {
+            socket: Some(self.socket.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// A `Connection` attached to this server, its events discarded: the
+    /// one recipe for every live test that is not about events.
+    pub fn connect(&self) -> Connection {
+        let (connection, _) =
+            Connection::open(&self.options(), Attach::Existing, drop::<Event>).expect("open");
+        connection
+    }
 }
 
 impl Drop for IsolatedTmux {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
-            .args(["-S", &self.socket, "kill-session", "-t", &self.session])
-            .status();
+        kill_session(&self.socket, &self.session);
         // Ending the session leaves the socket file itself behind, so every
         // run of these tests used to deposit one more in /tmp permanently.
         let _ = std::fs::remove_file(&self.socket);
@@ -61,45 +111,30 @@ impl Drop for IsolatedTmux {
 
 /// An isolated socket path with *no* server on it, for tests about reaching
 /// a server that may not exist. Whatever a test leaves running there is torn
-/// down session by session on drop — only ever session-scoped kills, the one
-/// form of teardown this repository allows.
+/// down session by session on drop.
 pub struct EmptySocket {
     pub socket: String,
 }
 
 impl EmptySocket {
     pub fn new(name: &str) -> Self {
-        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
+        let socket = test_socket(name);
         let _ = std::fs::remove_file(&socket);
         Self { socket }
     }
 
-    /// Every session name on this socket, as plain `tmux` sees it; empty
-    /// when no server runs.
-    pub fn sessions(&self) -> Vec<String> {
-        let output = std::process::Command::new("tmux")
-            .args(["-S", &self.socket, "list-sessions", "-F", "#{session_name}"])
-            .output()
-            .expect("failed to run tmux list-sessions");
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect()
+    pub fn options(&self) -> SpawnOptions {
+        SpawnOptions {
+            socket: Some(self.socket.clone()),
+            ..Default::default()
+        }
     }
 }
 
 impl Drop for EmptySocket {
     fn drop(&mut self) {
-        for session in self.sessions() {
-            let _ = std::process::Command::new("tmux")
-                .args([
-                    "-S",
-                    &self.socket,
-                    "kill-session",
-                    "-t",
-                    &format!("={session}"),
-                ])
-                .status();
+        for session in sessions_on(&self.socket) {
+            kill_session(&self.socket, &session);
         }
         let _ = std::fs::remove_file(&self.socket);
     }

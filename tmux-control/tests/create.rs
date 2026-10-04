@@ -97,34 +97,32 @@ fn a_reply_without_the_asked_for_ids_is_unexpected_not_a_pane() {
         let (transport, _state) = MockTransport::new(vec![&reply(body)]);
         let (mut client, _collected) = collecting_client(transport);
         let err = split_window(&mut client, PaneId(0), None).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                TmuxError::UnexpectedReply {
-                    expected: "#{pane_id}",
-                    ..
-                }
-            ),
-            "{body:?} gave {err:?}"
-        );
+        match err {
+            TmuxError::UnexpectedReply { expected, output } => {
+                assert_eq!(expected, "#{pane_id}");
+                // The whole reply travels, whichever field was at fault.
+                assert_eq!(output, vec![body.as_bytes().to_vec()], "{body:?}");
+            }
+            other => panic!("{body:?} gave {other:?}"),
+        }
+    }
+
+    // A reply whose shape is right but whose fields are not: the full line,
+    // not the one field, is what the operator gets to look at.
+    let (transport, _state) = MockTransport::new(vec![&reply("$2 @4 x5")]);
+    let (mut client, _collected) = collecting_client(transport);
+    let err = new_session(&mut client, &name("zz"), None, None).unwrap_err();
+    match err {
+        TmuxError::UnexpectedReply { output, .. } => {
+            assert_eq!(output, vec![b"$2 @4 x5".to_vec()])
+        }
+        other => panic!("expected UnexpectedReply, got {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Live tmux integration
 // ---------------------------------------------------------------------------
-
-fn connect(harness: &IsolatedTmux) -> tmux_control::Connection {
-    let (connection, _) = tmux_control::Connection::open(
-        &tmux_control::SpawnOptions {
-            socket: Some(harness.socket.clone()),
-            ..Default::default()
-        },
-        tmux_control::Attach::Existing,
-    )
-    .expect("open");
-    connection
-}
 
 /// `list-panes -t <target> -F <format>`, one string per line.
 fn list_panes(
@@ -148,7 +146,7 @@ fn list_panes(
 #[test]
 fn live_new_window_lands_at_the_index_asked_for_and_reports_its_ids() {
     let harness = IsolatedTmux::new("new-window-index");
-    let mut connection = connect(&harness);
+    let mut connection = harness.connect();
     let session = name(&harness.session);
 
     let created = new_window(
@@ -196,7 +194,7 @@ fn live_new_window_lands_at_the_index_asked_for_and_reports_its_ids() {
 #[test]
 fn live_new_session_reports_the_ids_of_what_it_made() {
     let harness = IsolatedTmux::new("new-session-ids");
-    let mut connection = connect(&harness);
+    let mut connection = harness.connect();
     let name = name(&format!("{}-second", harness.session));
 
     let created = new_session(&mut connection, &name, Some("first"), None).expect("new-session");
@@ -223,7 +221,7 @@ fn live_new_session_reports_the_ids_of_what_it_made() {
 #[test]
 fn live_an_exact_session_target_does_not_match_a_longer_name() {
     let harness = IsolatedTmux::new("exact-target");
-    let mut connection = connect(&harness);
+    let mut connection = harness.connect();
     let longer = name(&format!("{}-x", harness.session));
     new_session(&mut connection, &longer, None, None).expect("new-session");
 
@@ -242,9 +240,50 @@ fn live_an_exact_session_target_does_not_match_a_longer_name() {
 }
 
 #[test]
+fn live_a_dotted_session_name_is_addressed_exactly() {
+    // `.` is tmux's window/pane separator, so `=a.b` alone cannot name this
+    // session; the trailing colon the renderer adds is what makes it exact.
+    let harness = IsolatedTmux::new("dotted-name");
+    let mut connection = harness.connect();
+    let dotted = name(&format!("{}.v2", harness.session));
+    let created = new_session(&mut connection, &dotted, None, None).expect("new-session");
+
+    assert_eq!(
+        list_panes(
+            &mut connection,
+            &Target::Session(dotted.clone()),
+            "#{session_name}"
+        ),
+        vec![dotted.as_str().to_owned()]
+    );
+    assert_eq!(
+        list_panes(
+            &mut connection,
+            &Target::SessionId(created.session),
+            "#{session_name}"
+        ),
+        vec![dotted.as_str().to_owned()]
+    );
+    assert_eq!(
+        list_panes(
+            &mut connection,
+            &Target::WindowId(created.window),
+            "#{pane_id}"
+        ),
+        vec![format!("%{}", created.pane.0)]
+    );
+    connection
+        .execute(&line(
+            "kill-session",
+            ["-t", &Target::Session(dotted).to_string()],
+        ))
+        .expect("kill-session");
+}
+
+#[test]
 fn live_a_missing_exact_target_is_a_command_error() {
     let harness = IsolatedTmux::new("missing-target");
-    let mut connection = connect(&harness);
+    let mut connection = harness.connect();
 
     let err = connection
         .execute(&line(

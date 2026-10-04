@@ -162,7 +162,9 @@ unchanged by this work. Three additions make the layers above it pure:
 **A connection opens on any server.** `Connection::open(socket, attach: Attach) ->
 (Connection, Opened)` where `Attach::{Existing, OrCreate { name }}` is what the caller
 permits and `Opened::{Attached, Created(SessionName)}` is what happened. `Existing`
-runs `tmux -C attach-session` and fails with a typed `NoServer`/`NoSessions` error.
+runs `tmux -C attach-session` and fails with a typed `NoSessions` error — tmux presents
+"no server on this socket" and "a server holding no sessions" identically (verified live
+on 3.7b), and for every caller they mean the same thing: there is no session here.
 `OrCreate` runs the same command and, on exactly that error, `tmux -C new-session -s
 <name>`, which opens control mode and creates the session in one step (verified live
 on tmux 3.7b). The failed attach *is* the signal; there is no prior "does this server
@@ -175,15 +177,18 @@ collapse to `TmuxError`. Nothing above this crate spawns `tmux` again.
 
 **The client owns its reader.** A reader thread (or task) owns the transport's read
 side and delivers `Event::{Notification(ServerMessage), PaneOutput(PaneId, Vec<u8>),
-Closed(CloseReason)}` on a channel; `execute` correlates replies off the same stream.
-A caller that wants to react to notifications while idle *waits on the channel*,
-optionally with a deadline. The heartbeat command and the poll interval disappear
+Closed(CloseReason)}` to the sink the caller gave `open`; `execute` correlates replies
+off the same stream. The sink is the caller's, so the crate holds no queue on anyone's
+behalf: a caller that wants to react to notifications while idle forwards to a channel
+of its own and *waits on that*, optionally with a deadline; a caller that only executes
+passes `drop`. The heartbeat command and the poll interval disappear
 (`[LAW:no-ambient-temporal-coupling]`: the one owner of "when does a notification
 arrive" is the reader).
 
-**Typed targets.** `Target::{Session(SessionName), Window(SessionName, WindowIndex),
-Pane(PaneId)}` renders to tmux's target syntax in one place, exact-match (`=name`)
-where tmux allows it. `split-window`/`new-window` return the created id (`-P -F
+**Typed targets.** `Target::{Session(SessionName), SessionId, Window(SessionName,
+WindowIndex), WindowId, Pane(PaneId)}` renders to tmux's target syntax in one place,
+exact-match (`=name:` — the trailing colon is what keeps a window- or pane-taking
+command from prefix-matching the session) where tmux allows it. `split-window`/`new-window` return the created id (`-P -F
 '#{pane_id}'`, verified live) as a typed value.
 
 ---
@@ -449,7 +454,7 @@ Every open feature becomes data on an existing seam rather than a new mode:
 The dependency among the changes, which is also the order that keeps the tree
 shippable at every step:
 
-1. **`tmux-control`:** open-on-any-server, owned reader + event channel, typed
+1. **`tmux-control`:** open-on-any-server, owned reader + event sink, typed
    targets, `-P` ids. Pure addition; nothing above breaks.
 2. **`phoenix-core` + capture + store:** the §5 graph with reasoned absences,
    `origin` in the header, exact argv, content always on, `latest` derived, reader

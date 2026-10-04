@@ -41,11 +41,12 @@ pub fn new_session<C: Execute>(
     args.extend(flag("-c", cwd));
     args.extend(["-P", "-F", FORMAT]);
     let output = client.execute(&CommandLine::new("new-session", args)?)?;
-    let [session, window, pane] = ids(output, FORMAT)?;
-    Ok(NewSession {
-        session: SessionId::parse(&session).ok_or_else(|| unexpected(FORMAT, &session))?,
-        window: WindowId::parse(&window).ok_or_else(|| unexpected(FORMAT, &window))?,
-        pane: PaneId::parse(&pane).ok_or_else(|| unexpected(FORMAT, &pane))?,
+    reported(output, FORMAT, |[session, window, pane]| {
+        Some(NewSession {
+            session: SessionId::parse(session)?,
+            window: WindowId::parse(window)?,
+            pane: PaneId::parse(pane)?,
+        })
     })
 }
 
@@ -66,10 +67,11 @@ pub fn new_window<C: Execute>(
     args.extend(flag("-c", cwd));
     args.extend(["-P", "-F", FORMAT]);
     let output = client.execute(&CommandLine::new("new-window", args)?)?;
-    let [window, pane] = ids(output, FORMAT)?;
-    Ok(NewWindow {
-        window: WindowId::parse(&window).ok_or_else(|| unexpected(FORMAT, &window))?,
-        pane: PaneId::parse(&pane).ok_or_else(|| unexpected(FORMAT, &pane))?,
+    reported(output, FORMAT, |[window, pane]| {
+        Some(NewWindow {
+            window: WindowId::parse(window)?,
+            pane: PaneId::parse(pane)?,
+        })
     })
 }
 
@@ -87,8 +89,7 @@ pub fn split_window<C: Execute>(
     args.extend(flag("-c", cwd));
     args.extend(["-P", "-F", FORMAT]);
     let output = client.execute(&CommandLine::new("split-window", args)?)?;
-    let [pane] = ids(output, FORMAT)?;
-    PaneId::parse(&pane).ok_or_else(|| unexpected(FORMAT, &pane))
+    reported(output, FORMAT, |[pane]| PaneId::parse(pane))
 }
 
 /// `flag value` when the value is given, nothing when it is not — the one
@@ -97,30 +98,23 @@ fn flag<'a>(flag: &'a str, value: Option<&'a str>) -> impl Iterator<Item = &'a s
     value.into_iter().flat_map(move |value| [flag, value])
 }
 
-/// The `-P -F <format>` reply: exactly one line holding exactly `N`
-/// space-separated fields. Anything else is [`TmuxError::UnexpectedReply`].
-fn ids<const N: usize>(
+/// The `-P -F <format>` reply, parsed: exactly one line holding exactly `N`
+/// space-separated fields, each of which `parse` accepts. Any other shape is
+/// [`TmuxError::UnexpectedReply`] carrying the whole reply, from the one
+/// place that knows what was asked for (`[LAW:single-enforcer]`).
+fn reported<const N: usize, T>(
     output: CommandOutput,
     format: &'static str,
-) -> Result<[Vec<u8>; N], TmuxError> {
-    let fields: Option<[Vec<u8>; N]> = match output.lines.as_slice() {
-        [line] => line
-            .split(|b| *b == b' ')
-            .map(<[u8]>::to_vec)
-            .collect::<Vec<_>>()
-            .try_into()
-            .ok(),
+    parse: impl FnOnce([&[u8]; N]) -> Option<T>,
+) -> Result<T, TmuxError> {
+    let parsed = match output.lines.as_slice() {
+        [line] => <[&[u8]; N]>::try_from(line.split(|b| *b == b' ').collect::<Vec<_>>())
+            .ok()
+            .and_then(parse),
         _ => None,
     };
-    fields.ok_or(TmuxError::UnexpectedReply {
+    parsed.ok_or(TmuxError::UnexpectedReply {
         expected: format,
         output: output.lines,
     })
-}
-
-fn unexpected(format: &'static str, field: &[u8]) -> TmuxError {
-    TmuxError::UnexpectedReply {
-        expected: format,
-        output: vec![field.to_vec()],
-    }
 }

@@ -20,7 +20,7 @@ pub mod version;
 
 pub use client::{
     Attach, Client, CloseReason, CommandOutput, Connection, ConnectionState, Event, Execute,
-    Opened, TmuxError, Wake,
+    Opened, TmuxError,
 };
 pub use commands::{
     ClientFlag, ColonInSubscriptionName, NewSession, NewWindow, PaneAction, SessionName,

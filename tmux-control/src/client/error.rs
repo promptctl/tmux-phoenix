@@ -1,4 +1,5 @@
 use super::connection_state::ConnectionState;
+use super::CommandOutput;
 use crate::protocol::{Guard, NulInArgument};
 use crate::version::TmuxVersion;
 use std::fmt;
@@ -48,6 +49,11 @@ pub enum TmuxError {
         required: TmuxVersion,
         have: TmuxVersion,
     },
+    /// A guard block settled while no command was in flight. tmux answers
+    /// exactly one block per command (SPEC §5.1), so after this the
+    /// positional correlation every reply depends on is lost for good; the
+    /// block is carried so the operator can see what arrived.
+    UnsolicitedReply(Box<Result<CommandOutput, TmuxError>>),
     /// A command succeeded but its reply was not in the shape the command
     /// asked for: a version probe without a `<major>.<minor>`, a `-P -F`
     /// report without its ids. `expected` names the shape asked for.
@@ -96,6 +102,12 @@ impl fmt::Display for TmuxError {
                     f,
                     "{operation} requires tmux {}.{}+, connected server is {}.{}",
                     required.major, required.minor, have.major, have.minor
+                )
+            }
+            TmuxError::UnsolicitedReply(reply) => {
+                write!(
+                    f,
+                    "a reply block settled with no command in flight: {reply:?}"
                 )
             }
             TmuxError::UnexpectedReply { expected, output } => {
