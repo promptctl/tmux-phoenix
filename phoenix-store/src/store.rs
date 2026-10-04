@@ -7,7 +7,8 @@
 //! (`[LAW:one-source-of-truth]`).
 //!
 //! **One lock, two modes.** Every save runs under an exclusive `flock` on
-//! the store directory, from the temp write through prune, so saves
+//! the store directory (entered through a turnstile, so readers cannot
+//! starve it), from the temp write through prune, so saves
 //! from separate processes (a manual `phoenix save`, the daemon) run one at
 //! a time. Every reader takes the same lock shared, so a listing is a
 //! consistent view and [`StoreError::NoLatest`] can only mean "no
@@ -33,6 +34,7 @@ const GENERATION_SUFFIX: &str = ".phnx";
 /// first save, since nothing reads it any more.
 const RETIRED_LATEST_NAME: &str = "latest";
 const BLOBS_DIR: &str = "blobs";
+const TURNSTILE_NAME: &str = ".lock";
 /// How often a waiting save retries the lock. Granularity of the caller's
 /// `wait` only — correctness rests on the lock, never on this interval.
 const LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -225,33 +227,45 @@ impl Store {
     }
 
     /// Takes this store's lock in `mode`, released when the returned handle
-    /// closes. The lock is on the store directory itself: it needs no file
-    /// that could be unlinked out from under a waiting holder, and a reader
-    /// needs only to open the directory, so a store it cannot write to is
-    /// still one it can list and load (verified live: `flock` on a directory
-    /// handle, shared and exclusive, on Darwin 25).
+    /// closes. The lock is on the store directory itself, and is entered
+    /// through a turnstile every locker passes one at a time.
+    ///
+    /// [LAW:no-ambient-temporal-coupling] The turnstile is what orders saves
+    /// against readers. `flock` grants a shared lock whenever no exclusive
+    /// one is *held*, so readers that overlap would keep a waiting save out
+    /// for as long as they kept arriving (seen live: four looping readers
+    /// starved eight saves past a 30s wait). A locker holds the turnstile
+    /// until it holds the directory, so a save waiting for the readers
+    /// already inside keeps every later reader queued behind it, and its
+    /// wait is bounded by reads in progress rather than by reads to come.
     fn lock(&self, mode: LockMode, wait: Duration) -> Result<fs::File, StoreError> {
-        let file = fs::File::open(&self.dir)?;
         let deadline = Instant::now() + wait;
-        loop {
-            let attempt = match mode {
-                LockMode::Shared => file.try_lock_shared(),
-                LockMode::Exclusive => file.try_lock(),
-            };
-            match attempt {
-                Ok(()) => return Ok(file),
-                Err(fs::TryLockError::Error(e)) => return Err(e.into()),
-                Err(fs::TryLockError::WouldBlock) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(StoreError::Contended {
-                            lock: self.dir.clone(),
-                            waited: wait,
-                        });
-                    }
-                    std::thread::sleep(remaining.min(LOCK_RETRY));
-                }
-            }
+        let turnstile = self.open_turnstile()?;
+        let directory = fs::File::open(&self.dir)?;
+        let held = acquire(&turnstile, LockMode::Exclusive, deadline)?
+            && acquire(&directory, mode, deadline)?;
+        // `turnstile` closes on return either way: released once the
+        // directory is held, or when this locker gives up.
+        held.then_some(directory)
+            .ok_or_else(|| StoreError::Contended {
+                lock: self.dir.clone(),
+                waited: wait,
+            })
+    }
+
+    /// The turnstile file is opened for reading (a reader needs no write
+    /// access to a store it can list) and made only where it is missing. It
+    /// is never deleted: unlinking it while another locker holds or awaits
+    /// the old inode would let two lockers each pass a different turnstile.
+    fn open_turnstile(&self) -> io::Result<fs::File> {
+        let path = self.dir.join(TURNSTILE_NAME);
+        match fs::File::open(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path),
+            opened => opened,
         }
     }
 
@@ -386,6 +400,28 @@ fn prune(retention: Retention, generations: impl Iterator<Item = GenerationInfo>
         }
     }
     (pruned, errors)
+}
+
+/// Polls `file`'s `flock` in `mode` until it is held (`true`) or `deadline`
+/// has passed (`false`).
+fn acquire(file: &fs::File, mode: LockMode, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let attempt = match mode {
+            LockMode::Shared => file.try_lock_shared(),
+            LockMode::Exclusive => file.try_lock(),
+        };
+        match attempt {
+            Ok(()) => return Ok(true),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+            Err(fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(remaining.min(LOCK_RETRY));
+            }
+        }
+    }
 }
 
 fn generation_id_from_file_name(name: &str) -> Option<GenerationId> {
@@ -607,7 +643,16 @@ mod tests {
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(2));
         let stop = std::sync::atomic::AtomicBool::new(false);
+        // Set on the way out however this scope ends: a writer that panics
+        // must fail the test, not leave the readers looping forever.
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         std::thread::scope(|scope| {
+            let stopper = StopOnDrop(&stop);
             let readers: Vec<_> = (0..4)
                 .map(|_| {
                     scope.spawn(|| {
@@ -623,12 +668,47 @@ mod tests {
                 })
                 .collect();
             race_saves(&dir.0, keep(2));
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(stopper);
             for reader in readers {
                 assert!(reader.join().unwrap() > 0);
             }
         });
         assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_save_is_not_starved_by_readers_that_always_overlap() {
+        // Two readers hold the shared lock in alternation with overlap, so
+        // at no instant is the directory unlocked. Without the turnstile an
+        // exclusive poll never finds a gap however long it waits.
+        let dir = TestDir::new("starvation");
+        let store = Store::new(&dir.0);
+        save(&store, 1_700_000_000, keep(5));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for offset in [0, 25] {
+                let stop = &stop;
+                let dir = &dir.0;
+                scope.spawn(move || {
+                    let store = Store::new(dir);
+                    std::thread::sleep(Duration::from_millis(offset));
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let held = store.lock(LockMode::Shared, Duration::from_secs(10));
+                        std::thread::sleep(Duration::from_millis(50));
+                        drop(held);
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            let outcome = store.save(
+                &sample_snapshot(1_700_000_100),
+                None,
+                keep(5),
+                Duration::from_secs(5),
+            );
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            outcome.expect("a save must get past overlapping readers");
+        });
     }
 
     #[test]
