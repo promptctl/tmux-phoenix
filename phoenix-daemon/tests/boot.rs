@@ -131,8 +131,8 @@ fn single_pane_snapshot(session_name: &str) -> Snapshot {
 /// them: a session just created is still starting its shell.
 fn wait_until_bootstrap_only(socket: &str) {
     for _ in 0..50 {
-        if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
-            phoenix_restore::probe(Some(socket))
+        if let Ok(Some(phoenix_daemon::ServerState::BootstrapOnly(_))) =
+            phoenix_daemon::probe(Some(socket))
         {
             return;
         }
@@ -165,11 +165,11 @@ fn a_declined_boot_misread_the_server_only_while_its_built_sessions_remain() {
     assert!(!phoenix_daemon::Boot::Settled.misread(&idle("0")));
 }
 
-/// tmux-parity-ure.j0f criterion 1: a terminal that reaches tmux before the
-/// daemon leaves a lone bootstrap session, named `0` exactly like the
-/// snapshot's own session. Boot restore puts the snapshot in its place.
+/// A terminal that reaches tmux before the daemon leaves a lone bootstrap
+/// session, named `0` exactly like the snapshot's own session. Boot restore
+/// adds the snapshot's window into it and leaves the terminal's window alone.
 #[test]
-fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
+fn boots_over_a_lone_bootstrap_session_by_adding_the_snapshot_into_it() {
     let server = EmptyServer::new("login-race");
     // A shell that reads no startup files: a developer's zsh prompt runs `git`,
     // which the probe rightly reads as a program.
@@ -223,7 +223,7 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
     assert_eq!(
         server.session_names(),
         vec!["0".to_string()],
-        "the login session should be replaced, with no scaffolding left"
+        "the snapshot's session is the login session, and nothing else is left"
     );
     let windows = std::process::Command::new("tmux")
         .args([
@@ -231,17 +231,19 @@ fn boots_over_a_lone_bootstrap_session_by_restoring_in_its_place() {
             &server.socket,
             "list-windows",
             "-t",
-            "=0",
+            "=0:",
             "-F",
             "#{window_name}",
         ])
         .output()
-        .expect("failed to list the restored session's windows");
+        .expect("failed to list the session's windows");
+    let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(
-        String::from_utf8_lossy(&windows.stdout).trim(),
-        "shell",
-        "session 0 should be the snapshot's, not the login terminal's"
+        windows.lines().count(),
+        2,
+        "session 0 keeps the login terminal's window and gains the saved one: {windows:?}"
     );
+    assert!(windows.lines().any(|name| name == "shell"), "{windows:?}");
 
     client.close();
 }
@@ -271,7 +273,7 @@ fn boots_with_no_sessions_and_no_snapshot_waits_without_starting_a_server() {
 }
 
 #[test]
-fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_session() {
+fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_session_it_attached_with() {
     let server = EmptyServer::new("restore");
     let data_dir = TestDataDir::new("restore");
     let store = Store::new(&data_dir.0);
@@ -309,11 +311,10 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_bootstrap_sess
     assert_eq!(
         sessions,
         vec![session_name.clone()],
-        "the throwaway bootstrap session should be gone, leaving only the restored one"
+        "the session made to attach with should be gone, leaving only the restored one"
     );
 
-    // The client should have reconnected onto the restored session, not be
-    // left dangling on the now-destroyed bootstrap one.
+    // The client is attached to the restored session, the only one there is.
     let out = client
         .execute(
             &CommandLine::new("display-message", ["-p", "#{session_name}"])
@@ -438,9 +439,8 @@ fn a_panes_captured_program_is_relaunched_on_boot() {
             .expect("connect_and_boot failed")
             .expect("a snapshot to restore yields a client");
 
-    // Never assume the target-side pane index matches the snapshot's
-    // captured one (`phoenix-restore` never targets panes by index at all —
-    // see its `panes_active_last` doc comment); enumerate live indices.
+    // The target server's `pane-base-index` is its own, so the live pane
+    // indices are enumerated rather than assumed.
     let window_target = format!("{session_name}:0");
     let mut found_marker = false;
     for _ in 0..30 {

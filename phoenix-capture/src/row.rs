@@ -34,7 +34,7 @@ const PANE_FIELDS: [&str; 17] = [
     "window_active",
     "window_last_flag",
     "window_zoomed_flag",
-    "@phoenix-window",
+    Made::OPTION,
     "pane_index",
     "pane_id",
     "pane_pid",

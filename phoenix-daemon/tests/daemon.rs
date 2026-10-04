@@ -169,8 +169,8 @@ fn daemon_max_interval_backstop_saves_with_zero_structural_activity() {
 /// them: a session just created is still starting its shell.
 fn wait_until_bootstrap_only(socket: &str) {
     for _ in 0..50 {
-        if let Ok(phoenix_restore::ServerState::BootstrapOnly(_)) =
-            phoenix_restore::probe(Some(socket))
+        if let Ok(Some(phoenix_daemon::ServerState::BootstrapOnly(_))) =
+            phoenix_daemon::probe(Some(socket))
         {
             return;
         }

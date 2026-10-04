@@ -205,8 +205,33 @@ fn unknown_subcommand_exits_nonzero() {
     assert!(!output.status.success());
 }
 
+/// A socket path with no server on it.
+fn empty_socket(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = format!(
+        "/tmp/phoenix-cli-test-{name}-{}-{nanos}",
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&socket);
+    socket
+}
+
+fn sessions_on(socket: &str) -> Vec<String> {
+    let out = Command::new("tmux")
+        .args(["-S", socket, "list-sessions", "-F", "#{session_name}"])
+        .output()
+        .expect("failed to run tmux list-sessions");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
-fn restore_dry_run_prints_commands_and_touches_nothing() {
+fn restore_dry_run_prints_the_plan_and_touches_nothing() {
     let harness = IsolatedTmux::new("cli-restore-dry-run");
     harness.build();
     let data_dir = TestDataDir::new("restore-dry-run");
@@ -218,34 +243,75 @@ fn restore_dry_run_prints_commands_and_touches_nothing() {
         .output()
         .expect("failed to run phoenix save");
     assert!(save.status.success());
+    let dry_run = |socket: &str| {
+        let out = Command::new(phoenix_bin())
+            .args(["restore", "--dry-run", "--socket", socket])
+            .env("XDG_DATA_HOME", &data_dir.0)
+            .output()
+            .expect("failed to run phoenix restore --dry-run");
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
 
-    let dry_run = Command::new(phoenix_bin())
-        .args(["restore", "--dry-run"])
-        .env("XDG_DATA_HOME", &data_dir.0)
-        .output()
-        .expect("failed to run phoenix restore --dry-run");
-
-    assert!(dry_run.status.success());
-    let stdout = String::from_utf8(dry_run.stdout).unwrap();
+    // Onto no server: everything is built in a session made to attach
+    // with, which the plan ends by moving its clients off and removing.
+    let target = empty_socket("dry-run-target");
+    let plan = dry_run(&target);
+    let lines: Vec<&str> = plan.lines().collect();
     assert!(
-        stdout.contains("new-session"),
-        "dry-run output should contain the plan's commands, got: {stdout:?}"
+        lines[0].starts_with(&format!("w0 p0 = new-session -s {}", harness.session)),
+        "{plan}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("p1 = split-window p0")),
+        "{plan}"
+    );
+    assert_eq!(
+        lines[lines.len() - 3..],
+        [
+            format!(
+                "switch-client every client on phoenix-scratch-0 to {}",
+                harness.session
+            )
+            .as_str(),
+            "kill-session phoenix-scratch-0",
+            lines[lines.len() - 1],
+        ],
+        "{plan}"
+    );
+    assert!(
+        lines[lines.len() - 1].starts_with("set-option server @phoenix-generation "),
+        "{plan}"
+    );
+    assert!(
+        sessions_on(&target).is_empty(),
+        "--dry-run must not have started a server"
     );
 
-    // Only one session should exist on the server: --dry-run must not have
-    // created anything.
-    let sessions = Command::new("tmux")
-        .args([
-            "-S",
-            &harness.socket,
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ])
+    // Onto the server it was saved from: every window is already there, no
+    // session was made to attach with, and nothing is created or removed.
+    let plan = dry_run(&harness.socket);
+    assert!(
+        plan.lines().all(|l| l.starts_with("set-option ")),
+        "only the marks of a finished restore are left to set: {plan}"
+    );
+    assert_eq!(
+        sessions_on(&harness.socket),
+        std::slice::from_ref(&harness.session)
+    );
+    let mark = Command::new("tmux")
+        .args(["-S", &harness.socket, "show-options", "-s", "-q", "-v"])
+        .arg("@phoenix-generation")
         .output()
-        .expect("failed to list sessions");
-    let session_names = String::from_utf8(sessions.stdout).unwrap();
-    assert_eq!(session_names.lines().count(), 1);
+        .expect("failed to read the server mark");
+    assert!(
+        mark.stdout.is_empty(),
+        "--dry-run must not have set the mark"
+    );
 }
 
 #[test]
@@ -297,8 +363,6 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         .status()
         .expect("failed to create the keepalive session");
     assert!(status.success());
-    // Built out too: a lone idle session is a bootstrap session, which
-    // restore replaces instead of keeping alongside.
     let status = Command::new("tmux")
         .args(["-S", &harness.socket, "split-window", "-t", "keepalive"])
         .status()
@@ -347,24 +411,30 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         "restored session should have the 2 panes that were captured"
     );
 
+    // The same restore again finds everything there.
+    let again = Command::new(phoenix_bin())
+        .args(["restore", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix restore");
+    assert!(again.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout),
+        "restored: 0 step(s) applied\n"
+    );
+
     let _ = Command::new("tmux")
         .args(["-S", &harness.socket, "kill-session", "-t", "keepalive"])
         .status();
 }
 
-/// tmux-parity-ure.1 criteria 1, 2, 4 & 5: restoring onto a server with no
-/// sessions used to die with "transport closed before the command's reply
-/// arrived" because bare `attach-session` had nothing to attach to. It now
-/// bootstraps a throwaway session, restores, and tears the bootstrap down.
-///
-/// Criteria 1 ("no server process running") and 2 ("running server, zero
-/// sessions") are one and the same to `restore`: tmux tears a server down the
-/// instant it has no sessions (a running-but-empty server is not a state that
-/// persists long enough to invoke a separate command against), and the shared
-/// connection strategy keys off `count_sessions == 0`, which is identical for
-/// both. So the reachable "no server running" case exercises both.
+/// Restoring onto a socket no server runs on: restore makes a session to
+/// attach with, builds the snapshot, and removes that session. A server
+/// running with no sessions is not a state that lasts long enough to invoke
+/// a command against — tmux exits the instant its last session goes — so
+/// this is the one "nothing there" case.
 #[test]
-fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
+fn restore_onto_no_server_leaves_only_the_snapshot() {
     let source = IsolatedTmux::new("cli-restore-empty-source");
     let data_dir = TestDataDir::new("restore-empty");
 
@@ -384,17 +454,8 @@ fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
         .expect("failed to run phoenix save");
     assert!(save.status.success());
 
-    // A separate socket with no tmux server running at all — the exact
-    // scenario the old CLI could not handle.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let target_socket = format!(
-        "/tmp/phoenix-cli-test-empty-target-{}-{nanos}",
-        std::process::id()
-    );
-    let _ = std::fs::remove_file(&target_socket);
+    // A separate socket with no tmux server running at all.
+    let target_socket = empty_socket("empty-target");
 
     let restore = Command::new(phoenix_bin())
         .args(["restore", "--socket", &target_socket])
@@ -413,29 +474,15 @@ fn restore_bootstraps_an_empty_server_and_leaves_no_scaffolding() {
         "the cryptic transport error must be gone; got stderr={restore_stderr:?}"
     );
 
-    // Only the restored session remains — the phoenix-boot scaffolding is
-    // gone (criterion 4).
-    let sessions = Command::new("tmux")
-        .args([
-            "-S",
-            &target_socket,
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ])
-        .output()
-        .expect("failed to list sessions on the target");
-    let session_names: Vec<String> = String::from_utf8_lossy(&sessions.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
+    // Only the restored session remains: the one made to attach with is gone.
+    let session_names = sessions_on(&target_socket);
     assert_eq!(
         session_names,
         vec![source.session.clone()],
-        "the restored session should be the only one, with no bootstrap residue"
+        "the restored session should be the only one"
     );
 
-    // The full pane tree was recreated (criterion 1).
+    // The full pane tree was recreated.
     let panes = Command::new("tmux")
         .args([
             "-S",

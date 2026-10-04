@@ -24,19 +24,22 @@ generation's path on stdout.
 (default 10); older ones are pruned after each save.
 list: one saved generation per line on stdout, tab-separated
 (captured_at_unix, format_version, path), newest first.
-restore: rebuilds the latest (or --file) snapshot into new tmux sessions,
-replacing the server's sessions only when every one is a bootstrap session,
-each pane back at its captured working directory and running the program it
-was running. A pane that was idle at its shell comes back as an idle shell.
---dry-run prints the tmux commands that would run without running them. A pane's
-scrollback replay prints as a `#` summary line: its command names a temp file
-that only exists once restore actually runs.
+restore: adds what the server lacks of the latest (or --file) snapshot and
+removes nothing: a saved session the server has no session named like is
+created, a saved window not already there is built into its session at its
+saved index (the next free one when that is taken), each pane back at its
+captured working directory and running the program it was running. A pane
+that was idle at its shell comes back as an idle shell. Restoring the same
+snapshot again does nothing. Exit 3 when a saved session could not be
+restored. --file takes a generation file named as `list` prints it.
+--dry-run prints the steps that would run without running them, naming each
+window and pane it would create (w0, p1, ...) where tmux's id will be.
 daemon: runs in the foreground until killed. Saves pane structure and
 scrollback once activity has been quiet for --debounce seconds (default 10),
 with a --max-interval backstop (default 300) so idle sessions still
 checkpoint. On a server with no sessions, or only bootstrap sessions (what a
-terminal starting tmux creates), it restores the latest snapshot in their
-place; on one holding a session you built it never restores. Keeps retrying
+terminal starting tmux creates), it restores the latest snapshot beside
+them; on one holding a session you built it never restores. Keeps retrying
 while tmux is not running.
 install: writes a launchd user agent (macOS) or systemd --user unit (Linux)
 that runs \"phoenix daemon\" with these settings, and prints the command to

@@ -2,7 +2,9 @@
 //! for the exact command lines and the reply parsing, live for what tmux
 //! actually does with them.
 
-use tmux_control::commands::{new_session, new_window, split_window, NewSession, NewWindow};
+use tmux_control::commands::{
+    move_window, new_session, new_window, split_window, Moved, NewSession, NewWindow,
+};
 use tmux_control::{PaneId, SessionId, SessionName, Target, TmuxError, WindowId, WindowIndex};
 
 mod support;
@@ -120,9 +122,60 @@ fn a_reply_without_the_asked_for_ids_is_unexpected_not_a_pane() {
     }
 }
 
+#[test]
+fn move_window_names_the_window_by_id_and_reads_same_index_as_already_there() {
+    let (transport, state) = MockTransport::new(vec![
+        "%begin 1 1 1\n%end 1 1 1\n",
+        "%begin 2 2 1\nsame index: 3\n%error 2 2 1\n",
+        "%begin 3 3 1\nsame index: 4\n%error 3 3 1\n",
+    ]);
+    let (mut client, _collected) = collecting_client(transport);
+    let mut moved = || move_window(&mut client, WindowId(9), &name("zz"), WindowIndex(3));
+
+    assert_eq!(moved().unwrap(), Moved::Moved);
+    assert_eq!(moved().unwrap(), Moved::AlreadyThere);
+    // Only the refusal naming the index asked for is the answer "it is
+    // there"; any other error stays an error.
+    assert!(matches!(moved(), Err(TmuxError::Command { .. })));
+    assert_eq!(
+        state.sent.borrow()[0],
+        "move-window -d -s @9 -t =zz:=3".to_owned()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live tmux integration
 // ---------------------------------------------------------------------------
+
+#[test]
+fn live_move_window_places_a_new_sessions_window_and_says_when_it_was_there() {
+    let harness = IsolatedTmux::new("move-window");
+    let mut connection = harness.connect();
+    let session = name(&format!("{}-moved", harness.session));
+    let created = new_session(&mut connection, &session, None, None).expect("new-session");
+    let index_of_the_window = |connection: &mut tmux_control::Connection| {
+        list_panes(
+            connection,
+            &Target::WindowId(created.window),
+            "#{window_index}",
+        )
+    };
+
+    let first = move_window(&mut connection, created.window, &session, WindowIndex(6));
+    assert_eq!(first.expect("move-window"), Moved::Moved);
+    assert_eq!(index_of_the_window(&mut connection), ["6"]);
+
+    let again = move_window(&mut connection, created.window, &session, WindowIndex(6));
+    assert_eq!(again.expect("move-window"), Moved::AlreadyThere);
+    assert_eq!(index_of_the_window(&mut connection), ["6"]);
+
+    connection
+        .execute(&line(
+            "kill-session",
+            ["-t", &Target::Session(session).to_string()],
+        ))
+        .expect("kill-session");
+}
 
 /// `list-panes -t <target> -F <format>`, one string per line.
 fn list_panes(

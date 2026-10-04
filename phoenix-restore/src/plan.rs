@@ -1,165 +1,523 @@
-//! `plan(&Snapshot) -> RestorePlan` (DESIGN.md §6): pure, no I/O,
-//! unit-testable with no tmux running. `tmux-restore-qll.2` executes the
-//! resulting ordered [`TmuxCommand`]s.
+//! `plan` (ARCHITECTURE.md §8): the difference between a saved snapshot and
+//! a server, over recorded identity, as an ordered list of [`Step`]s. Pure —
+//! no I/O — so every case below is a unit test with no tmux running.
 //!
-//! Walks the graph session by session: a window linked by several sessions
-//! is built once per session here, by index and name. `tmux-laws-a4x.kdi`
-//! replaces this with the difference over recorded identity, where a shared
-//! window is built once and linked.
+//! A saved window is *present* when a live window is that window: one this
+//! generation's restore built and stamped ([`Made::ByPhoenix`]), or — on the
+//! server incarnation the snapshot was saved from — the very window, by its
+//! tmux id. Never when something merely sits at the same index or bears the
+//! same name. A saved session is present when a live session has its name,
+//! because tmux keeps names unique. Everything absent is built, everything
+//! present is left alone, and nothing live is removed.
+//!
+//! The order tmux imposes — a session before its windows, every pane before
+//! the layout, the layout before content is printed into it — is encoded
+//! here once, as the sequence of the steps, and nowhere as a contract
+//! between functions (`[LAW:no-ambient-temporal-coupling]`). What varies
+//! between one restore and the next is this list, never which code runs
+//! (`[LAW:dataflow-not-control-flow]`).
 
-use phoenix_core::{Content, Foreground, Pane, Session, Snapshot, WinLink, Window, WindowIndex};
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 
-use crate::command::{PlanStep, TmuxCommand};
+use phoenix_core::{
+    Content, Foreground, GenerationId, Made, Origin, Session, Snapshot, Touched, WinLink, Window,
+    WindowId, WindowIndex,
+};
+use tmux_control::{Opened, SessionName, UnaddressableSessionName};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestorePlan {
-    pub commands: Vec<PlanStep>,
+use crate::step::{LinkSource, OptionScope, PaneRef, Step, WindowRef};
+
+/// The session option a restore sets on every session it finishes. Its
+/// reader is outside phoenix: an integration waiting for "restore finished"
+/// waits on this value.
+const RESTORED_OPTION: &str = "@phoenix-restored";
+
+/// What a restore lands on: the three states a caller can be in, and no
+/// fourth — a scratch session with no account of who made it, or an attached
+/// connection with no capture, cannot be written (`[LAW:types-are-the-program]`).
+#[derive(Debug, Clone, Copy)]
+pub enum Onto<'a> {
+    /// The connection attached to a session the server already held; `live`
+    /// is a capture taken over it.
+    Server { live: &'a Snapshot },
+    /// No session existed, so the connection made `scratch` to attach with;
+    /// `live` is a capture taken over it. The plan ends by removing
+    /// `scratch`.
+    Scratch {
+        scratch: &'a SessionName,
+        live: &'a Snapshot,
+    },
+    /// No session exists and nothing has been opened: what a dry run finds,
+    /// previewing the restore that would make `scratch`.
+    NoServer { scratch: &'a SessionName },
 }
 
-pub fn plan(snapshot: &Snapshot) -> RestorePlan {
-    let mut commands = Vec::new();
-    for session in snapshot.sessions().iter() {
-        plan_session(snapshot, session, &mut commands);
-    }
-    RestorePlan { commands }
-}
-
-/// `window.panes()` reordered so the window's originally-active pane is
-/// last. Neither `split-window` nor anything else lets a plan request or
-/// fix up a specific *pane* index (unlike windows — see
-/// [`TmuxCommand::MoveWindow`]), so this crate never targets a pane by
-/// index at all; instead the active pane is always the *last* one created.
-/// Verified live: the most recently split pane is the one tmux leaves
-/// active, and a later `select-layout` doesn't change that — so creation
-/// order alone is enough to end up with the right pane active, with no
-/// `select-pane` needed (DESIGN.md §6 mentions `select-pane` among the
-/// commands a plan might use; this restore never needs it).
-fn panes_active_last(window: &Window) -> Vec<&Pane> {
-    let active = window.active();
-    let mut ordered: Vec<&Pane> = window.panes().iter().collect();
-    if let Some(pos) = ordered.iter().position(|p| p.index == active) {
-        let active_pane = ordered.remove(pos);
-        ordered.push(active_pane);
-    }
-    ordered
-}
-
-fn plan_session(snapshot: &Snapshot, session: &Session, commands: &mut Vec<PlanStep>) {
-    let mut windows = snapshot.windows_of(session);
-    let (first_link, first_window) = windows
-        .next()
-        .expect("NonEmpty<WinLink> always has a first element");
-
-    // tmux always creates exactly one window with a new session, so the
-    // first window is special: its creation and one of its panes' creation
-    // are both folded into the one `new-session` call.
-    let first_window_panes = panes_active_last(first_window);
-    commands.push(PlanStep::Command(TmuxCommand::NewSession {
-        session: session.name().clone(),
-        first_window_name: first_window.name().clone(),
-        cwd: first_window_panes[0].cwd.known().cloned(),
-    }));
-    // `new-session` has no way to request a specific window index (unlike
-    // `new-window`, below) — the window lands wherever the target server's
-    // `base-index` puts it, so this relocates it to the captured index
-    // before anything else references it by that index. See
-    // `TmuxCommand::MoveWindow`'s doc comment.
-    commands.push(PlanStep::Command(TmuxCommand::MoveWindow {
-        session: session.name().clone(),
-        window: first_link.index,
-    }));
-    // The implicit first pane is current right now, immediately after
-    // creation — the only moment `ReplayContent`/`RelaunchProgram`'s
-    // "current pane" targeting can reach it (see their doc comments).
-    plan_pane_extras(session, first_link.index, first_window_panes[0], commands);
-    plan_remaining_panes(
-        session,
-        first_link,
-        first_window,
-        &first_window_panes,
-        commands,
-    );
-
-    for (link, window) in windows {
-        let window_panes = panes_active_last(window);
-        commands.push(PlanStep::Command(TmuxCommand::NewWindow {
-            session: session.name().clone(),
-            window: link.index,
-            name: window.name().clone(),
-            cwd: window_panes[0].cwd.known().cloned(),
-        }));
-        plan_pane_extras(session, link.index, window_panes[0], commands);
-        plan_remaining_panes(session, link, window, &window_panes, commands);
-    }
-
-    commands.push(PlanStep::Command(TmuxCommand::SelectWindow {
-        session: session.name().clone(),
-        window: session.active(),
-    }));
-}
-
-/// `ordered_panes` (see [`panes_active_last`]): whichever command created
-/// `window` already created `ordered_panes[0]` implicitly, so this only
-/// needs `split-window` for the rest.
-fn plan_remaining_panes(
-    session: &Session,
-    link: &WinLink,
-    window: &Window,
-    ordered_panes: &[&Pane],
-    commands: &mut Vec<PlanStep>,
-) {
-    for pane in &ordered_panes[1..] {
-        commands.push(PlanStep::Command(TmuxCommand::SplitWindow {
-            session: session.name().clone(),
-            window: link.index,
-            cwd: pane.cwd.known().cloned(),
-        }));
-        // Still the current pane of `window` right after this split — see
-        // `PlanStep::ReplayContent`'s doc comment for why this can't be
-        // deferred to later.
-        plan_pane_extras(session, link.index, pane, commands);
-    }
-
-    if ordered_panes.len() > 1 {
-        commands.push(PlanStep::Command(TmuxCommand::SelectLayout {
-            session: session.name().clone(),
-            window: link.index,
-            layout: window.layout().clone(),
-        }));
-    }
-}
-
-/// Everything that targets `pane` as the window's *current* pane, right
-/// after it was created: captured scrollback first (so it's visible history
-/// by the time the program that produced it gets relaunched on top — same
-/// ordering tmux-resurrect used), then that program. A pane's content and
-/// foreground are each a closed enum: replay happens for captured content,
-/// relaunch for a program; an idle shell gets nothing because restore
-/// already creates every pane as a fresh shell at its cwd, and an
-/// unrecovered foreground has no command line to run.
-fn plan_pane_extras(
-    session: &Session,
-    window: WindowIndex,
-    pane: &Pane,
-    commands: &mut Vec<PlanStep>,
-) {
-    match &pane.content {
-        Content::Captured { scrollback, .. } => commands.push(PlanStep::ReplayContent {
-            session: session.name().clone(),
-            window,
-            lines: scrollback.clone(),
-        }),
-        Content::NotCaptured { .. } => {}
-    }
-    match &pane.foreground {
-        Foreground::Program { argv } => {
-            commands.push(PlanStep::Command(TmuxCommand::RelaunchProgram {
-                session: session.name().clone(),
-                window,
-                argv: argv.clone(),
-            }))
+impl<'a> Onto<'a> {
+    /// What [`tmux_control::Connection::open`] reported, with the capture
+    /// taken over that connection.
+    pub fn opened(opened: &'a Opened, live: &'a Snapshot) -> Self {
+        match opened {
+            Opened::Attached => Onto::Server { live },
+            Opened::Created(scratch) => Onto::Scratch { scratch, live },
         }
-        Foreground::Shell | Foreground::Unrecovered { .. } => {}
+    }
+
+    fn live(self) -> Option<&'a Snapshot> {
+        match self {
+            Onto::Server { live } | Onto::Scratch { live, .. } => Some(live),
+            Onto::NoServer { .. } => None,
+        }
+    }
+
+    fn scratch(self) -> Option<&'a SessionName> {
+        match self {
+            Onto::Server { .. } => None,
+            Onto::Scratch { scratch, .. } | Onto::NoServer { scratch } => Some(scratch),
+        }
+    }
+}
+
+/// Something the plan left alone or did differently from the snapshot, for
+/// the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// The server already holds a session of this name; what it lacks is
+    /// added into it.
+    SessionPresent { session: SessionName },
+    /// The window saved at `index` is already on the server.
+    WindowPresent {
+        session: SessionName,
+        index: WindowIndex,
+    },
+    /// The saved index holds another window, so this one lands at `landed`.
+    Relocated {
+        session: SessionName,
+        saved: WindowIndex,
+        landed: WindowIndex,
+    },
+    /// A live window in a saved session that is not one of the snapshot's.
+    /// It stays.
+    NotFromSnapshot {
+        session: SessionName,
+        index: WindowIndex,
+    },
+    /// tmux cannot be told this session's name as a target, so nothing of
+    /// it is restored.
+    Unaddressable(UnaddressableSessionName),
+}
+
+impl fmt::Display for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Note::SessionPresent { session } => write!(
+                f,
+                "session {session} is already on the server; what it lacks is added into it"
+            ),
+            Note::WindowPresent { session, index } => write!(
+                f,
+                "session {session}: the window saved at index {} is already on the server",
+                index.0
+            ),
+            Note::Relocated {
+                session,
+                saved,
+                landed,
+            } => write!(
+                f,
+                "session {session}: index {} is taken, so the window saved there lands at {}",
+                saved.0, landed.0
+            ),
+            Note::NotFromSnapshot { session, index } => write!(
+                f,
+                "session {session}: the window at index {} is not from this snapshot and is left alone",
+                index.0
+            ),
+            Note::Unaddressable(name) => write!(f, "{name}, so nothing of it is restored"),
+        }
+    }
+}
+
+/// An ordered list of steps in which every reference is defined by an
+/// earlier step. Only [`plan`] builds one, so `apply` relies on that rather
+/// than checking it (`[LAW:types-are-the-program]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    steps: Vec<Step>,
+    notes: Vec<Note>,
+}
+
+impl Plan {
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
+    pub fn notes(&self) -> &[Note] {
+        &self.notes
+    }
+}
+
+/// A session name no session in `snapshot` has, for the session a restore
+/// makes in order to attach to a server holding none. Chosen against the
+/// snapshot so the plan can never take the scratch for a session to keep.
+pub fn scratch_name(snapshot: &Snapshot) -> SessionName {
+    let taken = |name: &str| {
+        snapshot
+            .sessions()
+            .iter()
+            .any(|s| s.name().as_str() == name)
+    };
+    (0u64..)
+        .map(|n| format!("phoenix-scratch-{n}"))
+        .find(|name| !taken(name))
+        .map(|name| SessionName::parse(name).expect("the scratch prefix is addressable"))
+        .expect("an unbounded range always holds a free name")
+}
+
+/// The steps that make `onto` hold everything `snapshot` holds, where
+/// `generation` is the store's id for `snapshot` — the identity the windows
+/// it builds are stamped with.
+pub fn plan(generation: GenerationId, snapshot: &Snapshot, onto: Onto<'_>) -> Plan {
+    let live = onto.live();
+    let mut draft = Draft {
+        generation,
+        snapshot,
+        live,
+        // The server mark is the last step of a restore that finished, so a
+        // server not carrying this generation's mark has not been finished.
+        unfinished: live.map_or(Touched::Never, |live| live.touched) != Touched::By(generation),
+        steps: Vec::new(),
+        notes: Vec::new(),
+        built: HashMap::new(),
+        refs: 0,
+    };
+
+    let restored: Vec<SessionName> = snapshot
+        .sessions()
+        .iter()
+        .filter_map(|session| draft.session(session))
+        .collect();
+
+    // The scratch goes once there is a restored session to move its clients
+    // onto; a snapshot with no restorable session leaves it standing.
+    let closing = onto.scratch().zip(restored.first()).map(|(scratch, to)| {
+        [
+            Step::SwitchClients {
+                from: scratch.clone(),
+                to: to.clone(),
+            },
+            Step::KillSession {
+                name: scratch.clone(),
+            },
+        ]
+    });
+    draft.steps.extend(closing.into_iter().flatten());
+    if draft.unfinished {
+        draft.steps.push(Step::SetOption {
+            scope: OptionScope::Server,
+            key: Touched::OPTION,
+            value: generation.to_string(),
+        });
+    }
+
+    Plan {
+        steps: draft.steps,
+        notes: draft.notes,
+    }
+}
+
+struct Draft<'a> {
+    generation: GenerationId,
+    snapshot: &'a Snapshot,
+    live: Option<&'a Snapshot>,
+    unfinished: bool,
+    steps: Vec<Step>,
+    notes: Vec<Note>,
+    /// Saved windows this plan has built so far.
+    built: HashMap<WindowId, WindowRef>,
+    refs: u32,
+}
+
+/// The lowest index at or above `from` that `taken` lacks, taken.
+fn free_from(from: WindowIndex, taken: &mut BTreeSet<WindowIndex>) -> WindowIndex {
+    let free = (from.0..)
+        .map(WindowIndex)
+        .find(|index| !taken.contains(index))
+        .expect("a session's windows never exhaust u32");
+    taken.insert(free);
+    free
+}
+
+/// Removes the first link `pick` accepts, saying whether there was one.
+fn claim(links: &mut Vec<WinLink>, pick: impl Fn(&WinLink) -> bool) -> bool {
+    links
+        .iter()
+        .position(pick)
+        .map(|at| links.remove(at))
+        .is_some()
+}
+
+impl<'a> Draft<'a> {
+    fn fresh(&mut self) -> (WindowRef, PaneRef) {
+        let window = WindowRef(self.refs);
+        (window, self.fresh_pane())
+    }
+
+    /// Windows and panes draw from one counter, so a dry run never shows a
+    /// `w3` beside an unrelated `p3`.
+    fn fresh_pane(&mut self) -> PaneRef {
+        let pane = PaneRef(self.refs);
+        self.refs += 1;
+        pane
+    }
+
+    /// The live window that is `saved`, if the server holds it.
+    fn present(&self, saved: &Window) -> Option<WindowId> {
+        let live = self.live?;
+        let stamp = Made::ByPhoenix {
+            generation: self.generation,
+            saved: saved.id(),
+        };
+        let same_server = matches!(
+            (self.snapshot.origin, live.origin),
+            (Origin::Recorded(saved_on), Origin::Recorded(live_on)) if saved_on == live_on
+        );
+        live.windows()
+            .iter()
+            .find(|w| w.made() == stamp || (same_server && w.id() == saved.id()))
+            .map(Window::id)
+    }
+
+    /// Where `saved` can be linked from, if it exists yet.
+    fn existing(&self, saved: &Window) -> Option<LinkSource> {
+        self.built
+            .get(&saved.id())
+            .map(|window| LinkSource::Built(*window))
+            .or_else(|| self.present(saved).map(LinkSource::Live))
+    }
+
+    /// What `saved` lacks on the server: each of its links no live link
+    /// answers, with the index it lands at.
+    fn lacking(
+        &mut self,
+        name: &SessionName,
+        saved: &'a Session,
+        live_links: &[WinLink],
+    ) -> Vec<(WindowIndex, &'a Window)> {
+        // Each saved link is paired with a live link to the same window when
+        // the session has one: at the saved index first, then at any index —
+        // a window an earlier restore had to place elsewhere is still linked.
+        let wanted: Vec<(&WinLink, &Window)> = self.snapshot.windows_of(saved).collect();
+        let mut unpaired = live_links.to_vec();
+        let mut linked = vec![false; wanted.len()];
+        for exact in [true, false] {
+            for (at, (link, window)) in wanted.iter().enumerate() {
+                let live_id = self.present(window);
+                linked[at] = linked[at]
+                    || claim(&mut unpaired, |l| {
+                        Some(l.window) == live_id && (!exact || l.index == link.index)
+                    });
+            }
+        }
+        self.notes.extend(
+            wanted
+                .iter()
+                .zip(&linked)
+                .filter(|(_, linked)| **linked)
+                .map(|((link, _), _)| Note::WindowPresent {
+                    session: name.clone(),
+                    index: link.index,
+                }),
+        );
+        self.notes
+            .extend(unpaired.iter().map(|link| Note::NotFromSnapshot {
+                session: name.clone(),
+                index: link.index,
+            }));
+
+        // A missing link lands at its saved index unless a live window holds
+        // it; then at the next index no live window holds and no saved link
+        // wants.
+        let live_indices: BTreeSet<WindowIndex> = live_links.iter().map(|l| l.index).collect();
+        let mut taken: BTreeSet<WindowIndex> = live_indices
+            .iter()
+            .copied()
+            .chain(wanted.iter().map(|(link, _)| link.index))
+            .collect();
+        let mut missing = Vec::new();
+        for ((link, window), _) in wanted.iter().zip(&linked).filter(|(_, linked)| !**linked) {
+            let index = if live_indices.contains(&link.index) {
+                let landed = free_from(link.index, &mut taken);
+                self.notes.push(Note::Relocated {
+                    session: name.clone(),
+                    saved: link.index,
+                    landed,
+                });
+                landed
+            } else {
+                link.index
+            };
+            missing.push((index, *window));
+        }
+        missing
+    }
+
+    /// Every step for one saved session, and the name it is addressed by.
+    fn session(&mut self, saved: &'a Session) -> Option<SessionName> {
+        // [LAW:parse-dont-validate] the one crossing from a saved name to a
+        // name tmux can target; every step below holds the proven type.
+        let name = match SessionName::parse(saved.name().as_str()) {
+            Ok(name) => name,
+            Err(unaddressable) => {
+                self.notes.push(Note::Unaddressable(unaddressable));
+                return None;
+            }
+        };
+        let first_step = self.steps.len();
+
+        let live_session = self
+            .live
+            .and_then(|live| live.sessions().iter().find(|s| s.name() == saved.name()));
+        let live_links: Vec<WinLink> = live_session
+            .iter()
+            .flat_map(|session| session.windows().iter().copied())
+            .collect();
+        if live_session.is_some() {
+            self.notes.push(Note::SessionPresent {
+                session: name.clone(),
+            });
+        }
+        let mut missing = self.lacking(&name, saved, &live_links);
+
+        // tmux makes a session with one window. For a session the server
+        // lacks, that window is the first one here that has to be built —
+        // or, when every window it links exists already, one made only so
+        // the session can exist, put where the first link goes for that link
+        // to replace.
+        let mut placeholder = None;
+        if live_session.is_none() {
+            let (window, pane) = self.fresh();
+            let seed = missing
+                .iter()
+                .position(|(_, saved)| self.existing(saved).is_none())
+                .map(|at| missing.remove(at));
+            self.steps.push(Step::CreateSession {
+                name: name.clone(),
+                window_name: seed.map(|(_, saved)| saved.name().clone()),
+                cwd: seed.and_then(|(_, saved)| saved.panes().first().cwd.known().cloned()),
+                window,
+                pane,
+            });
+            self.steps.push(Step::MoveWindow {
+                window,
+                session: name.clone(),
+                to: seed
+                    .or(missing.first().copied())
+                    .map(|(index, _)| index)
+                    .expect("a session links at least one window, and this one has none yet"),
+            });
+            match seed {
+                Some((_, saved)) => self.furnish(saved, window, pane),
+                None => placeholder = Some(window),
+            }
+        }
+
+        for (index, saved) in missing {
+            match self.existing(saved) {
+                Some(source) => self.steps.push(Step::LinkWindow {
+                    source,
+                    into: name.clone(),
+                    index,
+                    replacing: placeholder.take(),
+                }),
+                None => {
+                    let (window, pane) = self.fresh();
+                    self.steps.push(Step::NewWindow {
+                        session: name.clone(),
+                        index,
+                        name: saved.name().clone(),
+                        cwd: saved.panes().first().cwd.known().cloned(),
+                        window,
+                        pane,
+                    });
+                    self.furnish(saved, window, pane);
+                }
+            }
+        }
+
+        // Which window a live session shows is its user's; only a session
+        // this plan made is pointed at its saved active window.
+        if live_session.is_none() {
+            self.steps.push(Step::SelectWindow {
+                session: name.clone(),
+                index: saved.active(),
+            });
+        }
+        if self.unfinished || self.steps.len() > first_step {
+            self.steps.push(Step::SetOption {
+                scope: OptionScope::Session(name.clone()),
+                key: RESTORED_OPTION,
+                value: self.generation.to_string(),
+            });
+        }
+        Some(name)
+    }
+
+    /// Everything inside a window just created with its first pane: the
+    /// other panes, the layout, each pane's content and program, the active
+    /// pane — and last the stamp that makes it count as built, so a restore
+    /// dropped anywhere before it leaves a window the next plan rebuilds
+    /// whole.
+    fn furnish(&mut self, saved: &Window, window: WindowRef, first: PaneRef) {
+        let mut panes = vec![first];
+        for pane in saved.panes().iter().skip(1) {
+            let from = *panes.last().expect("starts with the first pane");
+            let made = self.fresh_pane();
+            self.steps.push(Step::SplitPane {
+                from,
+                cwd: pane.cwd.known().cloned(),
+                pane: made,
+            });
+            panes.push(made);
+        }
+        self.steps.push(Step::SelectLayout {
+            window,
+            layout: saved.layout().clone(),
+        });
+        for (pane, at) in saved.panes().iter().zip(&panes) {
+            // Scrollback first, so it is history by the time the program
+            // that produced it starts again on top of it.
+            match &pane.content {
+                Content::Captured { scrollback, .. } => self.steps.push(Step::ReplayContent {
+                    pane: *at,
+                    lines: scrollback.clone(),
+                }),
+                Content::NotCaptured { .. } => {}
+            }
+            // An idle shell is what every new pane already is, and an
+            // unrecovered foreground has no command line to run.
+            match &pane.foreground {
+                Foreground::Program { argv } => self.steps.push(Step::Relaunch {
+                    pane: *at,
+                    argv: argv.clone(),
+                }),
+                Foreground::Shell | Foreground::Unrecovered { .. } => {}
+            }
+        }
+        let active = saved
+            .panes()
+            .iter()
+            .zip(&panes)
+            .find(|(pane, _)| pane.index == saved.active())
+            .map(|(_, at)| *at)
+            .expect("Window::new validated that `active` resolves to a member");
+        self.steps.push(Step::SelectPane { pane: active });
+        self.steps.push(Step::SetOption {
+            scope: OptionScope::Window(window),
+            key: Made::OPTION,
+            value: Made::option_value(self.generation, saved.id()),
+        });
+        self.built.insert(saved.id(), window);
     }
 }
 
@@ -167,122 +525,90 @@ fn plan_pane_extras(
 mod tests {
     use super::*;
     use phoenix_core::{
-        Content, ContentFailure, Cwd, HistoryIndicator, Layout, Made, NonEmpty, OffsetDateTime,
-        Origin, PaneId, PaneIndex, RecoveryFailure, SessionName, Shells, TerminalHolder,
-        TmuxVersion, Touched, Utf8PathBuf, WindowId, WindowIndex, WindowName,
+        ContentFailure, Cwd, HistoryIndicator, Layout, NonEmpty, OffsetDateTime, Pane, PaneId,
+        PaneIndex, ServerId, TmuxVersion, Utf8PathBuf, WindowName,
     };
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// The old capture's two reads, classified by the one rule: `command`
-    /// naming a shell stands in for "the pane is at its own process"; an
-    /// empty argv is a failed recovery.
-    fn program(command: &str, argv: &[&str]) -> Foreground {
-        let shells = Shells::default();
-        let Some(argv) = NonEmpty::from_vec(argv.iter().map(|a| a.to_string()).collect()) else {
-            return Foreground::Unrecovered {
-                reason: RecoveryFailure::NotRecorded,
-            };
-        };
-        let at_own_process = Foreground::of(
-            TerminalHolder {
-                at_own_process: true,
-                argv: NonEmpty::singleton(command.to_string()),
-            },
-            &shells,
-        ) == Foreground::Shell;
-        Foreground::of(
-            TerminalHolder {
-                at_own_process,
-                argv,
-            },
-            &shells,
-        )
+    const GEN: GenerationId = GenerationId(7);
+
+    fn name(raw: &str) -> SessionName {
+        SessionName::parse(raw).unwrap()
     }
 
-    fn captured(
-        history_size: u64,
-        history_bytes: u64,
-        scrollback: Vec<String>,
-        visible: Vec<String>,
-    ) -> Content {
-        Content::Captured {
-            indicator: HistoryIndicator {
-                history_size,
-                history_bytes,
-            },
-            scrollback,
-            visible,
-        }
-    }
-
-    fn pane(index: u32, cwd: &str) -> Pane {
+    fn pane(index: u32) -> Pane {
         Pane {
             id: PaneId(index),
             index: PaneIndex(index),
-            cwd: Cwd::parse(cwd),
-            foreground: program("zsh", &["zsh"]),
+            cwd: Cwd::parse(format!("/p{index}")),
+            foreground: Foreground::Shell,
             content: Content::NotCaptured {
                 reason: ContentFailure::NotRecorded,
             },
         }
     }
 
-    static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
-
-    /// A window at its per-session index; ids are unique across a test.
-    fn window(index: u32, name: &str, panes: NonEmpty<Pane>, active: u32) -> (WindowIndex, Window) {
-        let window = Window::new(
-            WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)),
-            Made::NotByPhoenix,
-            WindowName::parse(name).unwrap(),
-            Layout::parse("b25d,80x24,0,0,0").unwrap(),
+    fn window_of(id: u32, made: Made, panes: Vec<Pane>, active: u32) -> Window {
+        Window::new(
+            WindowId(id),
+            made,
+            WindowName::parse(format!("win{id}")).unwrap(),
+            Layout::parse(format!("layout{id}")).unwrap(),
             false,
-            panes,
+            NonEmpty::from_vec(panes).unwrap(),
             PaneIndex(active),
         )
-        .unwrap();
-        (WindowIndex(index), window)
+        .unwrap()
     }
 
-    struct Tree {
-        session: Session,
-        windows: Vec<Window>,
+    /// A one-pane window nobody stamped.
+    fn window(id: u32) -> Window {
+        window_of(id, Made::NotByPhoenix, vec![pane(0)], 0)
     }
 
-    fn tree(name: &str, windows: NonEmpty<(WindowIndex, Window)>, active: u32) -> Tree {
-        let links: Vec<WinLink> = windows
+    /// A live window an earlier restore of [`GEN`] built from saved `saved`.
+    fn built(id: u32, saved: u32) -> Window {
+        let made = Made::ByPhoenix {
+            generation: GEN,
+            saved: WindowId(saved),
+        };
+        window_of(id, made, vec![pane(0)], 0)
+    }
+
+    /// `links` are `(index, window id)`; the first is the active one.
+    fn session(session: &str, links: &[(u32, u32)]) -> Session {
+        let links: Vec<WinLink> = links
             .iter()
             .map(|(index, window)| WinLink {
-                index: *index,
-                window: window.id(),
+                index: WindowIndex(*index),
+                window: WindowId(*window),
             })
             .collect();
-        let session = Session::new(
-            SessionName::parse(name).unwrap(),
+        let active = links[0].index;
+        Session::new(
+            phoenix_core::SessionName::parse(session).unwrap(),
             None,
             NonEmpty::from_vec(links).unwrap(),
-            WindowIndex(active),
+            active,
             None,
         )
-        .unwrap();
-        Tree {
-            session,
-            windows: windows.into_iter().map(|(_, w)| w).collect(),
-        }
+        .unwrap()
     }
 
-    fn snapshot(trees: Vec<Tree>) -> Snapshot {
-        let mut windows = Vec::new();
-        let mut sessions = Vec::new();
-        for tree in trees {
-            windows.extend(tree.windows);
-            sessions.push(tree.session);
-        }
+    fn server(pid: u32) -> Origin {
+        Origin::Recorded(ServerId { pid, start_time: 1 })
+    }
+
+    fn snapshot_on(
+        origin: Origin,
+        touched: Touched,
+        windows: Vec<Window>,
+        sessions: Vec<Session>,
+    ) -> Snapshot {
         Snapshot::new(
-            Origin::BeforeOriginWasRecorded,
-            Touched::Never,
+            origin,
+            touched,
             OffsetDateTime::from_unix_timestamp(1_700_000_000),
-            TmuxVersion { major: 3, minor: 5 },
+            TmuxVersion { major: 3, minor: 7 },
             NonEmpty::from_vec(windows).unwrap(),
             NonEmpty::from_vec(sessions).unwrap(),
             vec![],
@@ -290,301 +616,503 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn single_session_single_window_single_pane_is_new_session_plus_move_window() {
-        let win = window(0, "shell", NonEmpty::singleton(pane(0, "/home/user")), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
+    /// A saved snapshot, from a server no test's live server is.
+    fn saved(windows: Vec<Window>, sessions: Vec<Session>) -> Snapshot {
+        snapshot_on(server(1), Touched::Never, windows, sessions)
+    }
 
+    /// A live server other than the one the snapshot came from.
+    fn live(touched: Touched, windows: Vec<Window>, sessions: Vec<Session>) -> Snapshot {
+        snapshot_on(server(2), touched, windows, sessions)
+    }
+
+    fn stamp(window: u32, saved: u32) -> Step {
+        Step::SetOption {
+            scope: OptionScope::Window(WindowRef(window)),
+            key: "@phoenix-window",
+            value: format!("7:@{saved}"),
+        }
+    }
+
+    fn restored(session: &str) -> Step {
+        Step::SetOption {
+            scope: OptionScope::Session(name(session)),
+            key: "@phoenix-restored",
+            value: "7".to_owned(),
+        }
+    }
+
+    fn server_mark() -> Step {
+        Step::SetOption {
+            scope: OptionScope::Server,
+            key: "@phoenix-generation",
+            value: "7".to_owned(),
+        }
+    }
+
+    fn layout(window: u32, saved: u32) -> Step {
+        Step::SelectLayout {
+            window: WindowRef(window),
+            layout: Layout::parse(format!("layout{saved}")).unwrap(),
+        }
+    }
+
+    fn cwd(index: u32) -> Option<Utf8PathBuf> {
+        Utf8PathBuf::parse(format!("/p{index}"))
+    }
+
+    fn window_name(saved: u32) -> WindowName {
+        WindowName::parse(format!("win{saved}")).unwrap()
+    }
+
+    /// The steps that fill a one-pane window made as reference `at` from
+    /// saved window `saved`.
+    fn furnished(at: u32, saved: u32) -> Vec<Step> {
+        vec![
+            layout(at, saved),
+            Step::SelectPane { pane: PaneRef(at) },
+            stamp(at, saved),
+        ]
+    }
+
+    fn new_window(session: &str, index: u32, at: u32, saved: u32) -> Vec<Step> {
+        let mut steps = vec![Step::NewWindow {
+            session: name(session),
+            index: WindowIndex(index),
+            name: window_name(saved),
+            cwd: cwd(0),
+            window: WindowRef(at),
+            pane: PaneRef(at),
+        }];
+        steps.extend(furnished(at, saved));
+        steps
+    }
+
+    /// A session created around saved window `saved`, placed at `index`.
+    fn new_session(session: &str, index: u32, at: u32, saved: u32) -> Vec<Step> {
+        let mut steps = vec![
+            Step::CreateSession {
+                name: name(session),
+                window_name: Some(window_name(saved)),
+                cwd: cwd(0),
+                window: WindowRef(at),
+                pane: PaneRef(at),
+            },
+            Step::MoveWindow {
+                window: WindowRef(at),
+                session: name(session),
+                to: WindowIndex(index),
+            },
+        ];
+        steps.extend(furnished(at, saved));
+        steps
+    }
+
+    fn select_window(session: &str, index: u32) -> Step {
+        Step::SelectWindow {
+            session: name(session),
+            index: WindowIndex(index),
+        }
+    }
+
+    #[test]
+    fn onto_no_server_everything_is_built_and_the_scratch_goes_last_but_for_the_mark() {
+        let snapshot = saved(vec![window(3)], vec![session("main", &[(4, 3)])]);
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        let mut expected = new_session("main", 4, 0, 3);
+        expected.extend([
+            select_window("main", 4),
+            restored("main"),
+            Step::SwitchClients {
+                from: scratch.clone(),
+                to: name("main"),
+            },
+            Step::KillSession { name: scratch },
+            server_mark(),
+        ]);
+        assert_eq!(plan.steps(), expected);
+        assert_eq!(plan.notes(), []);
+    }
+
+    #[test]
+    fn the_scratch_is_removed_only_when_the_connection_made_one() {
+        let snapshot = saved(vec![window(3)], vec![session("main", &[(0, 3)])]);
+        let other = live(
+            Touched::Never,
+            vec![window(0)],
+            vec![session("mine", &[(0, 0)])],
+        );
+        let scratch = name("phoenix-scratch-0");
+        let closes = |onto| {
+            plan(GEN, &snapshot, onto)
+                .steps()
+                .iter()
+                .filter(|s| matches!(s, Step::SwitchClients { .. } | Step::KillSession { .. }))
+                .count()
+        };
+
+        assert_eq!(closes(Onto::opened(&Opened::Attached, &other)), 0);
         assert_eq!(
-            plan.commands,
-            vec![
-                PlanStep::Command(TmuxCommand::NewSession {
-                    session: SessionName::parse("main").unwrap(),
-                    first_window_name: WindowName::parse("shell").unwrap(),
-                    cwd: Utf8PathBuf::parse("/home/user"),
-                }),
-                PlanStep::Command(TmuxCommand::MoveWindow {
-                    session: SessionName::parse("main").unwrap(),
-                    window: WindowIndex(0),
-                }),
-                PlanStep::Command(TmuxCommand::SelectWindow {
-                    session: SessionName::parse("main").unwrap(),
-                    window: WindowIndex(0),
-                }),
+            closes(Onto::opened(&Opened::Created(scratch.clone()), &other)),
+            2
+        );
+    }
+
+    #[test]
+    fn panes_are_split_in_saved_order_and_the_active_one_is_selected_by_reference() {
+        let mut panes = vec![pane(0), pane(1), pane(2)];
+        panes[0].content = Content::Captured {
+            indicator: HistoryIndicator {
+                history_size: 1,
+                history_bytes: 1,
+            },
+            scrollback: vec!["history".to_owned()],
+            visible: vec![],
+        };
+        let argv = NonEmpty::new("vim".to_owned(), vec!["a b".to_owned()]);
+        panes[2].foreground = Foreground::Program { argv: argv.clone() };
+        let snapshot = saved(
+            vec![window_of(3, Made::NotByPhoenix, panes, 1)],
+            vec![session("main", &[(0, 3)])],
+        );
+        let other = live(
+            Touched::Never,
+            vec![window(0)],
+            vec![session("mine", &[(0, 0)])],
+        );
+        let plan = plan(GEN, &snapshot, Onto::Server { live: &other });
+
+        // Every pane exists before the layout, the layout before anything is
+        // printed into a pane, and the stamp after all of it.
+        assert_eq!(
+            plan.steps()[2..9],
+            [
+                Step::SplitPane {
+                    from: PaneRef(0),
+                    cwd: cwd(1),
+                    pane: PaneRef(1),
+                },
+                Step::SplitPane {
+                    from: PaneRef(1),
+                    cwd: cwd(2),
+                    pane: PaneRef(2),
+                },
+                layout(0, 3),
+                Step::ReplayContent {
+                    pane: PaneRef(0),
+                    lines: vec!["history".to_owned()],
+                },
+                Step::Relaunch {
+                    pane: PaneRef(2),
+                    argv,
+                },
+                Step::SelectPane { pane: PaneRef(1) },
+                stamp(0, 3),
             ]
         );
     }
 
     #[test]
-    fn extra_panes_get_split_window_and_a_trailing_select_layout() {
-        let panes = NonEmpty::from_vec(vec![pane(0, "/a"), pane(1, "/b"), pane(2, "/c")]).unwrap();
-        let win = window(0, "shell", panes, 1);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
+    fn a_snapshot_already_restored_plans_nothing() {
+        let snapshot = saved(
+            vec![window(3), window(4)],
+            vec![
+                session("main", &[(0, 3), (1, 4)]),
+                session("side", &[(0, 4)]),
+            ],
+        );
+        let after = live(
+            Touched::By(GEN),
+            vec![built(10, 3), built(11, 4)],
+            vec![
+                session("main", &[(0, 10), (1, 11)]),
+                session("side", &[(0, 11)]),
+            ],
+        );
+        let plan = plan(GEN, &snapshot, Onto::Server { live: &after });
 
-        let splits: Vec<_> = plan
-            .commands
-            .iter()
-            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::SplitWindow { .. })))
-            .collect();
+        assert_eq!(plan.steps(), []);
+    }
+
+    #[test]
+    fn a_window_is_itself_on_the_server_it_was_saved_from() {
+        let windows = vec![window(3)];
+        let sessions = vec![session("main", &[(0, 3)])];
+        let snapshot = snapshot_on(
+            server(1),
+            Touched::By(GEN),
+            windows.clone(),
+            sessions.clone(),
+        );
+        let same = snapshot_on(
+            server(1),
+            Touched::By(GEN),
+            windows.clone(),
+            sessions.clone(),
+        );
+        let restarted = snapshot_on(server(2), Touched::By(GEN), windows, sessions);
+
         assert_eq!(
-            splits.len(),
-            2,
-            "one pane came from new-session, two remain"
+            plan(GEN, &snapshot, Onto::Server { live: &same }).steps(),
+            []
         );
-
-        let layouts: Vec<_> = plan
-            .commands
-            .iter()
-            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. })))
-            .collect();
-        assert_eq!(layouts.len(), 1);
-    }
-
-    #[test]
-    fn single_pane_windows_get_no_select_layout() {
-        let win = window(0, "shell", NonEmpty::singleton(pane(0, "/a")), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-        assert!(!plan
-            .commands
-            .iter()
-            .any(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. }))));
-    }
-
-    #[test]
-    fn the_active_pane_is_always_split_last_regardless_of_its_original_position() {
-        // Active is pane index 0 — originally *first* — so it must be
-        // reordered to be split last, not omitted as "already existing".
-        let panes =
-            NonEmpty::from_vec(vec![pane(0, "/active"), pane(1, "/b"), pane(2, "/c")]).unwrap();
-        let win = window(0, "shell", panes, 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-
-        // new-session must not have swallowed the active pane's cwd as the
-        // implicit first pane.
-        assert!(matches!(
-            &plan.commands[0],
-            PlanStep::Command(TmuxCommand::NewSession { cwd, .. }) if cwd.as_ref().unwrap().as_str() != "/active"
-        ));
-
-        let splits: Vec<_> = plan
-            .commands
-            .iter()
-            .filter_map(|c| match c {
-                PlanStep::Command(TmuxCommand::SplitWindow { cwd, .. }) => {
-                    Some(cwd.as_ref().unwrap().as_str())
-                }
-                _ => None,
-            })
-            .collect();
+        // The same id on another incarnation is another window.
         assert_eq!(
-            splits.last(),
-            Some(&"/active"),
-            "the active pane's split-window must be the last one issued"
+            plan(GEN, &snapshot, Onto::Server { live: &restarted }).steps()[0],
+            new_window("main", 1, 0, 3)[0]
         );
     }
 
     #[test]
-    fn a_second_window_gets_new_window_at_its_captured_index() {
-        let w0 = window(0, "shell", NonEmpty::singleton(pane(0, "/a")), 0);
-        let w1 = window(5, "editor", NonEmpty::singleton(pane(0, "/b")), 0);
-        let session = tree("main", NonEmpty::new(w0, vec![w1]), 5);
-        let plan = plan(&snapshot(vec![session]));
-
-        assert!(plan
-            .commands
-            .contains(&PlanStep::Command(TmuxCommand::NewWindow {
-                session: SessionName::parse("main").unwrap(),
-                window: WindowIndex(5),
-                name: WindowName::parse("editor").unwrap(),
-                cwd: Utf8PathBuf::parse("/b"),
-            })));
-        assert!(plan
-            .commands
-            .contains(&PlanStep::Command(TmuxCommand::SelectWindow {
-                session: SessionName::parse("main").unwrap(),
-                window: WindowIndex(5),
-            })));
-    }
-
-    #[test]
-    fn a_pane_relaunches_its_captured_program_with_the_exact_captured_argv() {
-        let mut p = pane(0, "/proj");
-        p.foreground = program("vim", &["vim", "foo.txt"]);
-        let win = window(0, "editor", NonEmpty::singleton(p), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-
-        let relaunched: Vec<Vec<&str>> = plan
-            .commands
-            .iter()
-            .filter_map(|c| match c {
-                PlanStep::Command(TmuxCommand::RelaunchProgram { argv, .. }) => {
-                    Some(argv.iter().map(String::as_str).collect())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(relaunched, vec![vec!["vim", "foo.txt"]]);
-    }
-
-    #[test]
-    fn a_pane_idle_at_its_shell_is_left_as_a_plain_shell() {
-        // tmux reports the pane's own shell as the foreground program of an
-        // idle pane; restore already creates that shell, so relaunching it
-        // would just nest a second one.
-        for (command, argv) in [
-            ("zsh", vec!["-zsh"]),
-            ("zsh", vec!["/bin/zsh", "-l"]),
-            ("bash", vec!["bash"]),
-            ("fish", vec!["fish"]),
-        ] {
-            let mut p = pane(0, "/a");
-            p.foreground = program(command, &argv);
-            let win = window(0, "shell", NonEmpty::singleton(p), 0);
-            let session = tree("main", NonEmpty::singleton(win), 0);
-            let plan = plan(&snapshot(vec![session]));
-            assert!(
-                !plan
-                    .commands
-                    .iter()
-                    .any(|c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { .. }))),
-                "{command} {argv:?} should not be relaunched"
-            );
-        }
-    }
-
-    #[test]
-    fn a_shell_running_a_script_is_a_real_program_and_is_relaunched() {
-        let mut p = pane(0, "/a");
-        p.foreground = program("bash", &["bash", "deploy.sh"]);
-        let win = window(0, "shell", NonEmpty::singleton(p), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-        assert!(plan.commands.iter().any(
-            |c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { argv, .. }) if argv.get(1).map(String::as_str) == Some("deploy.sh"))
-        ));
-    }
-
-    #[test]
-    fn a_pane_whose_argv_recovery_failed_is_left_as_a_plain_shell() {
-        let mut p = pane(0, "/a");
-        p.foreground = program("vim", &[]);
-        let win = window(0, "editor", NonEmpty::singleton(p), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-        assert!(!plan
-            .commands
-            .iter()
-            .any(|c| matches!(c, PlanStep::Command(TmuxCommand::RelaunchProgram { .. }))));
-    }
-
-    #[test]
-    fn a_pane_with_no_captured_content_gets_no_replay_command() {
-        let win = window(0, "shell", NonEmpty::singleton(pane(0, "/a")), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
-        assert!(!plan
-            .commands
-            .iter()
-            .any(|c| matches!(c, PlanStep::ReplayContent { .. })));
-    }
-
-    #[test]
-    fn a_pane_with_captured_content_gets_a_replay_command_right_after_its_creation() {
-        let mut p = pane(0, "/a");
-        p.content = captured(
-            10,
-            512,
-            vec!["captured line".to_string()],
-            vec!["captured line".to_string()],
+    fn an_unstamped_window_is_not_counted_and_the_saved_one_is_built_whole_beside_it() {
+        // What a restore dropped before the stamp leaves behind: the session,
+        // and a window at the saved index that nothing vouches for.
+        let snapshot = saved(vec![window(3)], vec![session("main", &[(0, 3)])]);
+        let dropped = live(
+            Touched::Never,
+            vec![window(9)],
+            vec![session("main", &[(0, 9)])],
         );
-        let win = window(0, "shell", NonEmpty::singleton(p), 0);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
+        let plan = plan(GEN, &snapshot, Onto::Server { live: &dropped });
 
-        // NewSession creates the one pane; ReplayContent must immediately
-        // follow it (before anything else could shift "current" away).
-        assert_eq!(plan.commands.len(), 4, "{:?}", plan.commands);
-        assert!(matches!(
-            plan.commands[0],
-            PlanStep::Command(TmuxCommand::NewSession { .. })
-        ));
-        assert!(matches!(
-            plan.commands[1],
-            PlanStep::Command(TmuxCommand::MoveWindow { .. })
-        ));
-        match &plan.commands[2] {
-            PlanStep::ReplayContent { lines, .. } => {
-                assert_eq!(lines, &vec!["captured line".to_string()])
-            }
-            other => panic!("expected ReplayContent, got {other:?}"),
-        }
+        let mut expected = new_window("main", 1, 0, 3);
+        expected.extend([restored("main"), server_mark()]);
+        assert_eq!(plan.steps(), expected);
+        assert_eq!(
+            plan.notes(),
+            [
+                Note::SessionPresent {
+                    session: name("main")
+                },
+                Note::NotFromSnapshot {
+                    session: name("main"),
+                    index: WindowIndex(0),
+                },
+                Note::Relocated {
+                    session: name("main"),
+                    saved: WindowIndex(0),
+                    landed: WindowIndex(1),
+                },
+            ]
+        );
     }
 
     #[test]
-    fn each_pane_in_a_multi_pane_window_gets_its_own_content_replayed() {
-        let mut p0 = pane(0, "/a");
-        p0.content = captured(1, 1, vec!["from pane a".to_string()], vec![]);
-        let mut p1 = pane(1, "/b");
-        p1.content = captured(2, 2, vec!["from pane b".to_string()], vec![]);
-        let panes = NonEmpty::new(p0, vec![p1]);
-        // active = 1 (pane b), so panes_active_last reorders pane b to be
-        // split *last* — pane a stays first (the implicit new-session pane).
-        let win = window(0, "shell", panes, 1);
-        let session = tree("main", NonEmpty::singleton(win), 0);
-        let plan = plan(&snapshot(vec![session]));
+    fn a_taken_index_moves_one_window_past_every_index_the_snapshot_wants() {
+        let windows: Vec<Window> = (10..15).map(window).collect();
+        let links: Vec<(u32, u32)> = (0..5).map(|i| (i, 10 + i)).collect();
+        let snapshot = saved(windows, vec![session("0", &links)]);
+        let fresh = live(
+            Touched::Never,
+            vec![window(0)],
+            vec![session("0", &[(0, 0)])],
+        );
+        let plan = plan(GEN, &snapshot, Onto::Server { live: &fresh });
 
-        let replayed: Vec<&str> = plan
-            .commands
+        let landed: Vec<u32> = plan
+            .steps()
             .iter()
-            .filter_map(|c| match c {
-                PlanStep::ReplayContent { lines, .. } => Some(lines[0].as_str()),
+            .filter_map(|step| match step {
+                Step::NewWindow { index, .. } => Some(index.0),
                 _ => None,
             })
             .collect();
-        assert_eq!(replayed, vec!["from pane a", "from pane b"]);
-
-        // The second pane's SplitWindow must come before its ReplayContent
-        // (current-pane targeting requires the pane to exist first), and
-        // that ReplayContent must come before SelectLayout.
-        let split_pos = plan
-            .commands
+        assert_eq!(landed, [5, 1, 2, 3, 4]);
+        // The terminal's session keeps showing what it showed.
+        assert!(!plan
+            .steps()
             .iter()
-            .position(|c| matches!(c, PlanStep::Command(TmuxCommand::SplitWindow { .. })))
-            .unwrap();
-        let second_replay_pos = plan
-            .commands
-            .iter()
-            .position(
-                |c| matches!(c, PlanStep::ReplayContent { lines, .. } if lines[0] == "from pane b"),
-            )
-            .unwrap();
-        let layout_pos = plan
-            .commands
-            .iter()
-            .position(|c| matches!(c, PlanStep::Command(TmuxCommand::SelectLayout { .. })))
-            .unwrap();
-        assert!(split_pos < second_replay_pos);
-        assert!(second_replay_pos < layout_pos);
+            .any(|step| matches!(step, Step::SelectWindow { .. })));
     }
 
     #[test]
-    fn multiple_sessions_are_each_fully_planned() {
-        let w0 = window(0, "shell", NonEmpty::singleton(pane(0, "/a")), 0);
-        let s0 = tree("one", NonEmpty::singleton(w0), 0);
-        let w1 = window(0, "shell", NonEmpty::singleton(pane(0, "/b")), 0);
-        let s1 = tree("two", NonEmpty::singleton(w1), 0);
-        let plan = plan(&snapshot(vec![s0, s1]));
+    fn a_window_an_earlier_restore_placed_elsewhere_is_still_linked() {
+        let snapshot = saved(
+            vec![window(10), window(11)],
+            vec![session("0", &[(0, 10), (1, 11)])],
+        );
+        let after = live(
+            Touched::By(GEN),
+            vec![window(0), built(20, 11), built(21, 10)],
+            vec![session("0", &[(0, 0), (1, 20), (2, 21)])],
+        );
 
-        let new_sessions: Vec<_> = plan
-            .commands
+        assert_eq!(
+            plan(GEN, &snapshot, Onto::Server { live: &after }).steps(),
+            []
+        );
+    }
+
+    #[test]
+    fn a_shared_window_is_built_once_and_linked_into_the_other_session() {
+        let snapshot = saved(
+            vec![window(3), window(4)],
+            vec![session("a", &[(0, 3)]), session("b", &[(0, 3), (1, 4)])],
+        );
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        // `b` is created around the one window only it holds.
+        let mut b = new_session("b", 1, 1, 4);
+        b.extend([
+            Step::LinkWindow {
+                source: LinkSource::Built(WindowRef(0)),
+                into: name("b"),
+                index: WindowIndex(0),
+                replacing: None,
+            },
+            select_window("b", 0),
+            restored("b"),
+        ]);
+        let a_len = new_session("a", 0, 0, 3).len() + 2;
+        assert_eq!(plan.steps()[a_len..a_len + b.len()], b);
+    }
+
+    #[test]
+    fn a_session_whose_every_window_exists_is_made_with_a_window_its_first_link_replaces() {
+        let snapshot = saved(
+            vec![window(3), window(4)],
+            vec![
+                session("a", &[(0, 3), (1, 4)]),
+                session("b", &[(5, 3), (2, 4)]),
+            ],
+        );
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        let a_len = new_session("a", 0, 0, 3).len() + new_window("a", 1, 1, 4).len() + 2;
+        assert_eq!(
+            plan.steps()[a_len..a_len + 6],
+            [
+                Step::CreateSession {
+                    name: name("b"),
+                    window_name: None,
+                    cwd: None,
+                    window: WindowRef(2),
+                    pane: PaneRef(2),
+                },
+                // Where the first link goes, for that link to take its place.
+                Step::MoveWindow {
+                    window: WindowRef(2),
+                    session: name("b"),
+                    to: WindowIndex(5),
+                },
+                Step::LinkWindow {
+                    source: LinkSource::Built(WindowRef(0)),
+                    into: name("b"),
+                    index: WindowIndex(5),
+                    replacing: Some(WindowRef(2)),
+                },
+                Step::LinkWindow {
+                    source: LinkSource::Built(WindowRef(1)),
+                    into: name("b"),
+                    index: WindowIndex(2),
+                    replacing: None,
+                },
+                select_window("b", 5),
+                restored("b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_already_on_the_server_is_linked_by_its_live_id() {
+        let snapshot = saved(
+            vec![window(3)],
+            vec![session("a", &[(0, 3)]), session("b", &[(2, 3)])],
+        );
+        let half = live(
+            Touched::Never,
+            vec![built(40, 3)],
+            vec![session("a", &[(0, 40)])],
+        );
+        let plan = plan(GEN, &snapshot, Onto::Server { live: &half });
+
+        assert!(plan.steps().contains(&Step::LinkWindow {
+            source: LinkSource::Live(WindowId(40)),
+            into: name("b"),
+            index: WindowIndex(2),
+            replacing: Some(WindowRef(0)),
+        }));
+        assert!(!plan
+            .steps()
             .iter()
-            .filter(|c| matches!(c, PlanStep::Command(TmuxCommand::NewSession { .. })))
-            .collect();
-        assert_eq!(new_sessions.len(), 2);
+            .any(|step| matches!(step, Step::NewWindow { .. })));
+    }
+
+    #[test]
+    fn a_session_tmux_cannot_target_is_reported_and_the_rest_restored() {
+        let snapshot = saved(
+            vec![window(3), window(4)],
+            vec![session("$odd", &[(0, 3)]), session("main", &[(0, 4)])],
+        );
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        assert_eq!(
+            plan.notes(),
+            [Note::Unaddressable(SessionName::parse("$odd").unwrap_err())]
+        );
+        assert_eq!(plan.steps()[0], new_session("main", 0, 0, 4)[0]);
+        assert!(plan.steps().contains(&Step::SwitchClients {
+            from: scratch,
+            to: name("main"),
+        }));
+    }
+
+    #[test]
+    fn the_scratch_stays_when_there_is_no_restored_session_to_move_its_clients_onto() {
+        let snapshot = saved(vec![window(3)], vec![session("$odd", &[(0, 3)])]);
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        assert_eq!(plan.steps(), [server_mark()]);
+    }
+
+    #[test]
+    fn the_scratch_name_is_free_of_every_saved_session_name() {
+        let snapshot = saved(
+            vec![window(3)],
+            vec![
+                session("phoenix-scratch-0", &[(0, 3)]),
+                session("phoenix-scratch-1", &[(0, 3)]),
+            ],
+        );
+        assert_eq!(scratch_name(&snapshot).as_str(), "phoenix-scratch-2");
+    }
+
+    #[test]
+    fn a_dry_run_reads_as_tmux_commands_over_references() {
+        let mut panes = vec![pane(0), pane(1)];
+        panes[1].foreground = Foreground::Program {
+            argv: NonEmpty::new("vim".to_owned(), vec!["it's".to_owned()]),
+        };
+        let snapshot = saved(
+            vec![window_of(3, Made::NotByPhoenix, panes, 1)],
+            vec![session("main", &[(2, 3)])],
+        );
+        let scratch = name("phoenix-scratch-0");
+        let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
+
+        let printed: Vec<String> = plan.steps().iter().map(Step::to_string).collect();
+        assert_eq!(
+            printed,
+            [
+                "w0 p0 = new-session -s main -n win3 -c /p0",
+                "move-window w0 to main:2",
+                "p1 = split-window p0 -c /p1",
+                "select-layout w0 layout3",
+                r"send-keys p1 'vim' 'it'\''s'",
+                "select-pane p1",
+                "set-option w0 @phoenix-window 7:@3",
+                "select-window main:2",
+                "set-option session main @phoenix-restored 7",
+                "switch-client every client on phoenix-scratch-0 to main",
+                "kill-session phoenix-scratch-0",
+                "set-option server @phoenix-generation 7",
+            ]
+        );
     }
 }

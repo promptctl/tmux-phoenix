@@ -5,6 +5,6 @@ mod boot;
 mod daemon;
 mod debounce;
 
-pub use boot::{connect_and_boot, Boot, BootError, Booted, Decided};
+pub use boot::{connect_and_boot, probe, Boot, BootError, Booted, Decided, ServerState};
 pub use daemon::{run, run_resilient, DaemonError, RunConfig, StructureActivity};
 pub use debounce::{DebouncePolicy, DebounceState};

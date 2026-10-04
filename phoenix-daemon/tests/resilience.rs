@@ -168,7 +168,7 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
 /// tmux-parity-ure.j0f: the boot probe reads idleness at one instant, so a
 /// lone pane running a program — or a login shell's prompt briefly running
 /// `git` — keeps boot restore out. Once that pane is idle, the store refuses
-/// to save it, and the daemon boots again and restores in its place.
+/// to save it, and the daemon boots again and restores beside it.
 #[test]
 fn run_resilient_restores_once_a_lone_pane_goes_idle() {
     let socket = format!("/tmp/{}", unique("phx-goes-idle"));
@@ -243,7 +243,9 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
     assert!(status.success());
     let mut running = false;
     for _ in 0..50 {
-        if let Ok(phoenix_restore::ServerState::Built(_)) = phoenix_restore::probe(Some(&socket)) {
+        if let Ok(Some(phoenix_daemon::ServerState::Built(_))) =
+            phoenix_daemon::probe(Some(&socket))
+        {
             running = true;
             break;
         }
@@ -279,7 +281,7 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
 
     let mut restored = false;
     for _ in 0..100 {
-        if session_names(&socket) == vec!["work".to_string()] {
+        if session_names(&socket).contains(&"work".to_string()) {
             restored = true;
             break;
         }
@@ -300,7 +302,12 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
 
     assert!(
         restored,
-        "expected work restored in place of the idle lone pane; sessions: {names:?}; log: {log:#?}"
+        "expected work restored beside the idle lone pane; sessions: {names:?}; log: {log:#?}"
+    );
+    assert_eq!(
+        names,
+        vec!["0".to_string(), "work".to_string()],
+        "the lone pane's session stays; log: {log:#?}"
     );
     assert!(
         log.iter().any(|l| l.contains("not restoring into it")),
@@ -329,7 +336,7 @@ fn session_names(socket: &str) -> Vec<String> {
 
 /// tmux-parity-ure.j0f criterion 4, terminal first: the server goes away,
 /// and a terminal starts tmux again before the daemon reconnects. The daemon
-/// still brings the saved session back in place of the terminal's bootstrap
+/// still brings the saved session back, beside the terminal's bootstrap
 /// session, and `latest` keeps naming the real state. (Daemon first is
 /// `run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_comes_back`.)
 #[test]
@@ -407,7 +414,7 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
 
     let mut recovered = false;
     for _ in 0..60 {
-        if session_names(&socket) == vec![session.clone()] && pane_count(&socket, &session) == 2 {
+        if pane_count(&socket, &session) == 2 {
             recovered = true;
             break;
         }
@@ -428,14 +435,21 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
 
     assert!(
         recovered,
-        "expected the saved session back in place of the terminal's; sessions: {names:?}; log: {log:#?}"
+        "expected the saved session back beside the terminal's; sessions: {names:?}; log: {log:#?}"
     );
     assert!(
         log.iter().any(|l| l.contains("restored 1 session")),
         "expected a boot-restore log line; log: {log:#?}"
     );
+    assert!(
+        names.contains(&"0".to_string()),
+        "the terminal's session stays: {names:?}"
+    );
     let latest = store.load_latest().expect("latest should still load");
-    assert_eq!(latest.sessions().first().name().as_str(), session.as_str());
+    assert!(latest
+        .sessions()
+        .iter()
+        .any(|s| s.name().as_str() == session.as_str()));
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 

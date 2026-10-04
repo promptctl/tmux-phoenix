@@ -23,7 +23,7 @@ pub use client::{
     Opened, TmuxError,
 };
 pub use commands::{
-    ClientFlag, ColonInSubscriptionName, NewSession, NewWindow, PaneAction, SessionName,
+    ClientFlag, ColonInSubscriptionName, Moved, NewSession, NewWindow, PaneAction, SessionName,
     SubscriptionName, SubscriptionScope, Target, UnaddressableSessionName, WindowIndex,
 };
 pub use protocol::{
