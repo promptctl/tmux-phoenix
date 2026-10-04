@@ -1,13 +1,22 @@
 use super::connection_state::ConnectionState;
+use super::CommandOutput;
 use crate::protocol::{Guard, NulInArgument};
 use crate::version::TmuxVersion;
 use std::fmt;
 use std::io;
 
-/// Everything `Client::execute`/`connect`/`reconnect`, and the free
-/// functions in [`crate::commands`], can fail with.
+/// Everything `Client::execute`/`connect`/`reconnect`,
+/// `Connection::open`/`execute`, and the free functions in
+/// [`crate::commands`] can fail with.
 #[derive(Debug)]
 pub enum TmuxError {
+    /// The `tmux` process could not be started at all (`Connection::open`).
+    Spawn(io::Error),
+    /// `attach-session` found nothing to attach to: no server runs on the
+    /// socket, or the one that does holds no sessions. tmux presents both the
+    /// same way (a `no sessions` error greeting, verified live on 3.7b), and
+    /// for every caller they mean the same thing — there is no session here.
+    NoSessions,
     /// `execute()` was called while `Client::state()` wasn't `Ready` — a
     /// command sent during `Connecting`/`Reconnecting` would correlate
     /// against the wrong guard block; `Closed` has no transport to send on
@@ -40,14 +49,25 @@ pub enum TmuxError {
         required: TmuxVersion,
         have: TmuxVersion,
     },
-    /// [`crate::commands::query_tmux_version`]'s reply didn't contain a
-    /// recognizable `<major>.<minor>` version string.
-    VersionProbeFailed { output: Vec<Vec<u8>> },
+    /// A guard block settled while no command was in flight. tmux answers
+    /// exactly one block per command (SPEC §5.1), so after this the
+    /// positional correlation every reply depends on is lost for good; the
+    /// block is carried so the operator can see what arrived.
+    UnsolicitedReply(Box<Result<CommandOutput, TmuxError>>),
+    /// A command succeeded but its reply was not in the shape the command
+    /// asked for: a version probe without a `<major>.<minor>`, a `-P -F`
+    /// report without its ids. `expected` names the shape asked for.
+    UnexpectedReply {
+        expected: &'static str,
+        output: Vec<Vec<u8>>,
+    },
 }
 
 impl fmt::Display for TmuxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TmuxError::Spawn(err) => write!(f, "failed to start tmux: {err}"),
+            TmuxError::NoSessions => write!(f, "no tmux session to attach to on this server"),
             TmuxError::NotReady(state) => write!(f, "client is not ready (state: {state:?})"),
             TmuxError::Encode(err) => write!(f, "cannot build the command line: {err}"),
             TmuxError::Send(err) => write!(f, "failed to send command: {err}"),
@@ -84,10 +104,16 @@ impl fmt::Display for TmuxError {
                     required.major, required.minor, have.major, have.minor
                 )
             }
-            TmuxError::VersionProbeFailed { output } => {
+            TmuxError::UnsolicitedReply(reply) => {
                 write!(
                     f,
-                    "could not determine tmux version from reply: {:?}",
+                    "a reply block settled with no command in flight: {reply:?}"
+                )
+            }
+            TmuxError::UnexpectedReply { expected, output } => {
+                write!(
+                    f,
+                    "expected a reply shaped {expected:?}, got {:?}",
                     output
                         .iter()
                         .map(|l| String::from_utf8_lossy(l))

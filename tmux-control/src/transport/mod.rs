@@ -7,13 +7,17 @@
 //! Deliberately protocol-agnostic: `Transport` knows nothing about guard
 //! blocks or `ServerMessage` — it writes already-encoded [`CommandLine`]s and
 //! reads raw bytes. Wiring what it reads into [`crate::Codec::feed`] is the
-//! client layer's job (a later ticket), so dependencies still flow one way
+//! client layer's job, so dependencies still flow one way
 //! (`[LAW:one-way-deps]`): transport uses the protocol's command encoding, and
 //! the protocol layer knows nothing of transports.
+//!
+//! [`spawn_halves`] is the same child in two pieces — a [`ChildWriter`] and
+//! the raw output pipe — for [`crate::Connection`], whose reader runs on its
+//! own thread and so cannot share one `&mut Transport` with the sender.
 
 mod spawn;
 
-pub use spawn::{socket_args, KillHandle, SpawnOptions, SpawnTransport};
+pub use spawn::{socket_args, spawn_halves, ChildWriter, KillHandle, SpawnOptions, SpawnTransport};
 
 use crate::protocol::CommandLine;
 use std::io;

@@ -56,8 +56,12 @@ pub enum CloseReason {
     Exit,
     /// A send or read on the transport itself failed.
     TransportError,
-    /// `Client::close` tore the connection down locally, before anything
-    /// else had ended it.
+    /// tmux broke the protocol — a block settled with no command in flight —
+    /// so replies can no longer be correlated and the connection ended on
+    /// it, with the transport itself still up.
+    Protocol,
+    /// `Client::close` or `Connection::close` (or an `Abort`) tore the
+    /// connection down locally, before anything else had ended it.
     Disposed,
 }
 

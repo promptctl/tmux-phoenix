@@ -1,13 +1,20 @@
-//! Free functions over [`Client::execute`] (DESIGN.md §3.3):
+//! Free functions over [`Execute::execute`] (DESIGN.md §3.3):
 //! `[LAW:single-enforcer]` — these are thin [`CommandLine`] builders, not an
-//! alternate dispatch path. Scoped to what ticket `tmux-control-mode-1ju.6`
-//! asks for: subscriptions (SPEC §14), pane flow control (SPEC §13), client
-//! flags (SPEC §9), and version gating (IMPL.md §2.2). `list-panes`,
-//! `send-keys`, and friends are a later ticket's job.
+//! alternate dispatch path, and they are written once against the
+//! [`Execute`] seam so the same function serves a [`crate::Client`] and a
+//! [`crate::Connection`] alike. Here: subscriptions (SPEC §14), pane flow
+//! control (SPEC §13), client flags (SPEC §9), and version gating (IMPL.md
+//! §2.2). [`create`] holds the pane-creating commands and [`target`] the
+//! typed targets they address.
 
-use crate::client::{Client, CommandOutput, TmuxError};
+mod create;
+mod target;
+
+pub use create::{new_session, new_window, split_window, NewSession, NewWindow};
+pub use target::{SessionName, Target, UnaddressableSessionName, WindowIndex};
+
+use crate::client::{CommandOutput, Execute, TmuxError};
 use crate::protocol::{CommandLine, PaneId, WindowId};
-use crate::transport::Transport;
 use crate::version::{parse_tmux_version, TmuxVersion};
 use std::fmt;
 
@@ -159,8 +166,8 @@ impl SubscriptionScope {
 /// `what` selects scope — empty for the attached session, `%<pane-id>` /
 /// `%*` for a pane / all panes, `@<window-id>` / `@*` for a window / all
 /// windows (SPEC §14's table).
-pub fn subscribe<T: Transport>(
-    client: &mut Client<T>,
+pub fn subscribe<C: Execute>(
+    client: &mut C,
     name: &SubscriptionName,
     scope: SubscriptionScope,
     format: &str,
@@ -181,16 +188,16 @@ pub fn subscribe<T: Transport>(
 /// subscription. tmux decides remove-versus-subscribe by whether the
 /// argument contains a colon, which is why the name is a
 /// [`SubscriptionName`] and not a `&str`.
-pub fn unsubscribe<T: Transport>(
-    client: &mut Client<T>,
+pub fn unsubscribe<C: Execute>(
+    client: &mut C,
     name: &SubscriptionName,
 ) -> Result<CommandOutput, TmuxError> {
     client.execute(&CommandLine::new("refresh-client", ["-B", name.as_str()])?)
 }
 
 /// `refresh-client -A <pane>:<action>` (SPEC §13).
-pub fn set_pane_action<T: Transport>(
-    client: &mut Client<T>,
+pub fn set_pane_action<C: Execute>(
+    client: &mut C,
     pane: PaneId,
     action: PaneAction,
 ) -> Result<CommandOutput, TmuxError> {
@@ -203,8 +210,8 @@ pub fn set_pane_action<T: Transport>(
 }
 
 /// `refresh-client -f <flags>` (SPEC §9), comma-joined.
-pub fn set_flags<T: Transport>(
-    client: &mut Client<T>,
+pub fn set_flags<C: Execute>(
+    client: &mut C,
     flags: &[ClientFlag],
 ) -> Result<CommandOutput, TmuxError> {
     client.execute(&CommandLine::new(
@@ -214,8 +221,8 @@ pub fn set_flags<T: Transport>(
 }
 
 /// `refresh-client -f !<flags>` (SPEC §9): `!`-prefixing a flag clears it.
-pub fn clear_flags<T: Transport>(
-    client: &mut Client<T>,
+pub fn clear_flags<C: Execute>(
+    client: &mut C,
     flags: &[ClientFlag],
 ) -> Result<CommandOutput, TmuxError> {
     client.execute(&CommandLine::new(
@@ -238,7 +245,7 @@ fn join_flags(flags: &[ClientFlag], prefix: &str) -> String {
 /// Convenience wrapper for `set_flags(client, &[ClientFlag::NoOutput])` —
 /// DESIGN.md §3.4's efficiency thesis names this the one flag phoenix
 /// always sets.
-pub fn set_no_output<T: Transport>(client: &mut Client<T>) -> Result<CommandOutput, TmuxError> {
+pub fn set_no_output<C: Execute>(client: &mut C) -> Result<CommandOutput, TmuxError> {
     set_flags(client, &[ClientFlag::NoOutput])
 }
 
@@ -246,13 +253,14 @@ pub fn set_no_output<T: Transport>(client: &mut Client<T>) -> Result<CommandOutp
 /// connection (`display-message -p "#{version}"`) — works over any
 /// [`Transport`], since the probe travels the protocol channel to the real
 /// server rather than spawning a local `tmux -V` (IMPL.md §2.2).
-pub fn query_tmux_version<T: Transport>(client: &mut Client<T>) -> Result<TmuxVersion, TmuxError> {
+pub fn query_tmux_version<C: Execute>(client: &mut C) -> Result<TmuxVersion, TmuxError> {
     let response = client.execute(&CommandLine::new("display-message", ["-p", "#{version}"])?)?;
     response
         .lines
         .iter()
         .find_map(|line| parse_tmux_version(&String::from_utf8_lossy(line)))
-        .ok_or(TmuxError::VersionProbeFailed {
+        .ok_or(TmuxError::UnexpectedReply {
+            expected: "#{version}",
             output: response.lines,
         })
 }

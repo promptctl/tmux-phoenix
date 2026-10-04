@@ -13,7 +13,12 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
-use tmux_control::{Client, CommandLine, PaneId, ServerMessage, TmuxError, Transport};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use tmux_control::{
+    Attach, Client, CommandLine, Connection, Event, PaneId, ServerMessage, SessionName,
+    SpawnOptions, Target, TmuxError, Transport,
+};
 
 /// For a command that takes no arguments.
 pub const NO_ARGS: [&str; 0] = [];
@@ -21,6 +26,40 @@ pub const NO_ARGS: [&str; 0] = [];
 /// A command line for tests, whose arguments never hold a NUL.
 pub fn line(name: &'static str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandLine {
     CommandLine::new(name, args).expect("test arguments hold no NUL")
+}
+
+/// The one socket path for a test's throw-away server: isolated from the
+/// developer's default server, unique per test and per run.
+fn test_socket(name: &str) -> String {
+    format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id())
+}
+
+/// Every session name on `socket`, as plain `tmux` sees it; empty when no
+/// server runs there.
+pub fn sessions_on(socket: &str) -> Vec<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["-S", socket, "list-sessions", "-F", "#{session_name}"])
+        .output()
+        .expect("failed to run tmux list-sessions");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Session-scoped teardown, the one form this repository allows, through
+/// the crate's own exact target so no harness renders `-t` by hand.
+fn kill_session(socket: &str, session: &str) {
+    let name = SessionName::parse(session).expect("a session tmux listed is addressable");
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket,
+            "kill-session",
+            "-t",
+            &Target::Session(name).to_string(),
+        ])
+        .status();
 }
 
 /// Isolated throw-away socket path + a guard that tears the session down via
@@ -32,7 +71,7 @@ pub struct IsolatedTmux {
 
 impl IsolatedTmux {
     pub fn new(name: &str) -> Self {
-        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
+        let socket = test_socket(name);
         let session = format!("phoenix-test-{name}");
         // Pre-create the session out-of-band (not through the transport
         // under test) so `attach-session` has something real to attach to,
@@ -44,17 +83,170 @@ impl IsolatedTmux {
         assert!(status.success(), "tmux new-session failed");
         Self { socket, session }
     }
+
+    pub fn options(&self) -> SpawnOptions {
+        SpawnOptions {
+            socket: Some(self.socket.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// A `Connection` attached to this server, its events discarded: the
+    /// one recipe for every live test that is not about events.
+    pub fn connect(&self) -> Connection {
+        let (connection, _) =
+            Connection::open(&self.options(), Attach::Existing, drop::<Event>).expect("open");
+        connection
+    }
 }
 
 impl Drop for IsolatedTmux {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
-            .args(["-S", &self.socket, "kill-session", "-t", &self.session])
-            .status();
+        kill_session(&self.socket, &self.session);
         // Ending the session leaves the socket file itself behind, so every
         // run of these tests used to deposit one more in /tmp permanently.
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// An isolated socket path with *no* server on it, for tests about reaching
+/// a server that may not exist. Whatever a test leaves running there is torn
+/// down session by session on drop.
+pub struct EmptySocket {
+    pub socket: String,
+}
+
+impl EmptySocket {
+    pub fn new(name: &str) -> Self {
+        let socket = test_socket(name);
+        let _ = std::fs::remove_file(&socket);
+        Self { socket }
+    }
+
+    pub fn options(&self) -> SpawnOptions {
+        SpawnOptions {
+            socket: Some(self.socket.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+impl Drop for EmptySocket {
+    fn drop(&mut self) {
+        for session in sessions_on(&self.socket) {
+            kill_session(&self.socket, &session);
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// What the scripted output half delivers next. `Hangup` is EOF as a value,
+/// so a test can end the stream at any moment — and so the writer's drop can
+/// end it too, which is the contract `Connection::over` relies on, without
+/// the test having to drop anything in a particular order.
+enum Feed {
+    Bytes(Vec<u8>),
+    Hangup,
+}
+
+/// The test's handle on a scripted link: feed tmux's side of the
+/// conversation, or end it.
+#[derive(Clone)]
+pub struct Script {
+    feed: Sender<Feed>,
+}
+
+impl Script {
+    pub fn send(&self, chunk: &str) {
+        self.feed
+            .send(Feed::Bytes(chunk.as_bytes().to_vec()))
+            .expect("the reader is still running");
+    }
+
+    /// The server went away: the next read returns EOF.
+    pub fn hangup(&self) {
+        let _ = self.feed.send(Feed::Hangup);
+    }
+}
+
+/// Every command line the `Connection` wrote, readable after the writer has
+/// been moved into it. Shared across threads because the type must be `Send`
+/// for `Connection::over`.
+#[derive(Clone, Default)]
+pub struct Sent(Arc<Mutex<Vec<String>>>);
+
+impl Sent {
+    pub fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("sent lines poisoned").clone()
+    }
+}
+
+/// The command half of a scripted link. Holds one feeder so that dropping
+/// it hangs the output half up, exactly as killing the child does for a
+/// spawned `tmux`.
+pub struct ScriptWriter {
+    sent: Sent,
+    feed: Sender<Feed>,
+}
+
+impl io::Write for ScriptWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let line = String::from_utf8_lossy(buf);
+        self.sent
+            .0
+            .lock()
+            .expect("sent lines poisoned")
+            .push(line.trim_end_matches('\n').to_owned());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ScriptWriter {
+    fn drop(&mut self) {
+        let _ = self.feed.send(Feed::Hangup);
+    }
+}
+
+/// The output half of a scripted link: blocks until fed, like a pipe.
+pub struct ScriptReader {
+    feed: Receiver<Feed>,
+}
+
+impl io::Read for ScriptReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.feed.recv() {
+            Ok(Feed::Bytes(chunk)) => {
+                assert!(
+                    chunk.len() <= buf.len(),
+                    "test chunk larger than read buffer"
+                );
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+            Ok(Feed::Hangup) | Err(mpsc::RecvError) => Ok(0),
+        }
+    }
+}
+
+/// A scripted link for `Connection::over`, with `chunks` already queued as
+/// tmux's opening bytes (a greeting, typically). More can be fed through the
+/// returned [`Script`] at any time.
+pub fn scripted(chunks: Vec<&str>) -> (ScriptWriter, ScriptReader, Script, Sent) {
+    let (feed, output) = mpsc::channel();
+    let script = Script { feed: feed.clone() };
+    for chunk in chunks {
+        script.send(chunk);
+    }
+    let sent = Sent::default();
+    let writer = ScriptWriter {
+        sent: sent.clone(),
+        feed,
+    };
+    (writer, ScriptReader { feed: output }, script, sent)
 }
 
 /// One dispatched `%output`/`%extended-output` delivery: which pane, what
