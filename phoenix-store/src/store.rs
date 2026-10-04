@@ -276,9 +276,18 @@ impl Store {
         }
     }
 
+    /// The newest generation and its id — the identity a restore stamps
+    /// what it builds with.
+    pub fn latest(&self) -> Result<(GenerationId, Snapshot), StoreError> {
+        self.read_consistent(|ids| {
+            let id = *ids.first().ok_or(StoreError::NoLatest)?;
+            Ok((id, self.read_generation(id)?))
+        })
+    }
+
     /// The newest generation.
     pub fn load_latest(&self) -> Result<Snapshot, StoreError> {
-        self.read_consistent(|ids| self.read_generation(*ids.first().ok_or(StoreError::NoLatest)?))
+        self.latest().map(|(_, snapshot)| snapshot)
     }
 
     pub fn load(&self, generation: GenerationId) -> Result<Snapshot, StoreError> {
@@ -385,6 +394,12 @@ fn prune(retention: Retention, generations: impl Iterator<Item = GenerationInfo>
         }
     }
     (pruned, errors)
+}
+
+/// The id a generation file's name carries, wherever the file now sits —
+/// `None` for a file not named as the store names generations.
+pub fn generation_of(path: &Path) -> Option<GenerationId> {
+    generation_id_from_file_name(&path.file_name()?.to_string_lossy())
 }
 
 fn generation_id_from_file_name(name: &str) -> Option<GenerationId> {

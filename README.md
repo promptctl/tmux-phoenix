@@ -12,14 +12,13 @@ tmux-resurrect and tmux-continuum are shell scripts, so every pane they save or 
 
 Autosave timing is the second difference. tmux-continuum has no timer at all — it hijacks `status-right` redraws to decide when to save, so it silently stops working if your status line is off or another plugin overwrites `status-right`. The tmux-phoenix daemon instead subscribes to tmux's own structural-change notifications, saves once activity has been quiet for a debounce window, and keeps a max-interval save as a backstop so long-idle sessions still checkpoint. It also asks tmux never to stream pane output to it (`no-output`), so an idle connection costs almost nothing until something actually changes (DESIGN.md §3.4, §8).
 
-Three smaller things follow from being a program rather than a script. Restore is planned as data before it runs, so `phoenix restore --dry-run` prints the tmux commands a real restore would execute (scrollback replay shows as a summary line, since its temp file exists only at apply time) — worth having in a tool that can `send-keys` into live shells, and something tmux-resurrect has no equivalent of. `phoenix restore --file <path>` restores a specific past generation directly, where tmux-resurrect wants you to re-point a symlink by hand first. And pane scrollback is stored content-addressed, so an unchanged pane's content is written once and pointed at again rather than copied on every save.
+Three smaller things follow from being a program rather than a script. Restore is planned as data before it runs, so `phoenix restore --dry-run` prints the steps a real restore would run, naming each window and pane it would create (`w0`, `p1`) where tmux's id will be — worth having in a tool that can `send-keys` into live shells, and something tmux-resurrect has no equivalent of. The plan is the difference between the snapshot and the server, so restoring a snapshot that is already there does nothing, and a restore that was cut short is finished by running it again. `phoenix restore --file <path>` restores a specific past generation directly, where tmux-resurrect wants you to re-point a symlink by hand first. And pane scrollback is stored content-addressed, so an unchanged pane's content is written once and pointed at again rather than copied on every save.
 
 ## What it does not do yet
 
 These are documented tmux-resurrect/continuum behaviors that tmux-phoenix does not have, and they are the project's own accounting, not an outside audit:
 
-- **Zoomed panes, alternate window/session, and grouped sessions** are not represented in the snapshot at all.
-- **Restore is not idempotent.** tmux-resurrect skips a session that already exists on the target server; tmux-phoenix's plan emits a bare `new-session` and the restore fails outright instead.
+- **Zoomed panes, the alternate window/session, and session groups** are saved but not restored yet. A window several sessions share is restored once and linked into each, but the sessions come back ungrouped.
 - **No per-program resume strategies.** Restore replays a pane's captured command line and nothing more — there is no equivalent of tmux-resurrect restoring `vim` through its session file, or of its Mosh strategy.
 - **One-shot `phoenix save` captures structure only, not scrollback.** Only the daemon's save path currently delivers content capture.
 - **No tmux-side integration.** It is not a TPM-installable plugin, there are no default keybindings, there is no `#{continuum_status}`-style format string for your status line, and there are no pre/post save and restore hooks.
@@ -45,7 +44,7 @@ tmux-control      phoenix-core
 - **`phoenix-core`** — the domain model: the `Snapshot` tree, pure types, no I/O.
 - **`phoenix-capture`** — drives `tmux-control` to interrogate a live server into a `Snapshot`.
 - **`phoenix-store`** — atomic, versioned, generational persistence.
-- **`phoenix-restore`** — the pure `Snapshot -> RestorePlan` planner; `tmux-control` executes the plan.
+- **`phoenix-restore`** — plans the difference between a saved `Snapshot` and a live one as data, and applies that plan over a connection it is handed.
 - **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
 - **`phoenix-cli`** — maps command lines onto the crates beneath it; builds the `phoenix` binary.
 
@@ -54,8 +53,8 @@ tmux-control      phoenix-core
 `cargo build --release` at the repository root builds the `phoenix` binary into `target/release/`. Every crate depends only on its siblings by path, so there is nothing to fetch from crates.io. `cargo test --workspace` runs the tests; many of them start their own isolated tmux servers, so tmux must be installed, and they never touch your running sessions.
 
 - `phoenix save` captures the current server's structure and prints where it saved it; `phoenix list` shows saved generations. A server holding only the untouched session a terminal creates by starting `tmux` is never saved over your latest snapshot.
-- `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it: onto a running server, one with no sessions, or one holding only a terminal's untouched session, which it replaces while keeping that terminal attached.
-- `phoenix daemon` saves on structural change and restores the latest snapshot into a server holding nothing you built — no sessions, or only a terminal's untouched session, even when the terminal reached tmux first. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
+- `phoenix restore --dry-run` shows what a restore would do, and `phoenix restore` does it. It adds what the server lacks and removes nothing: onto no server it builds the whole snapshot, and into a session that already exists — a terminal's fresh session `0`, say — it adds the saved windows, each at its saved index or the next free one, leaving that session's own windows and its terminal alone.
+- `phoenix daemon` saves on structural change and restores the latest snapshot into a server holding nothing you built — no sessions, or only a terminal's untouched session, beside which the snapshot lands, even when the terminal reached tmux first. `phoenix install` writes a launchd agent or systemd user unit that runs it, and prints the command that activates it.
 
 `phoenix --help` lists every flag.
 

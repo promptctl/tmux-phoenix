@@ -2,9 +2,11 @@
 name = "phoenix-restore"
 version = "0.1.0"
 edition.workspace = true
-description = "Pure Snapshot -> RestorePlan planning for tmux-phoenix"
+description = "The restore plan for tmux-phoenix: the difference between a snapshot and a server, and its application"
 
 [dependencies]
-phoenix-capture = { path = "../phoenix-capture" }
 phoenix-core = { path = "../phoenix-core" }
 tmux-control = { path = "../tmux-control" }
+
+[dev-dependencies]
+phoenix-capture = { path = "../phoenix-capture" }

@@ -56,8 +56,8 @@ tmux-control      phoenix-core
 - **`phoenix-capture`** — drives `tmux-control` to interrogate the server into a
   `Snapshot`.
 - **`phoenix-store`** — atomic, versioned, generational persistence.
-- **`phoenix-restore`** — pure `Snapshot -> RestorePlan`; the plan is executed by
-  `tmux-control`.
+- **`phoenix-restore`** — plans the difference between a saved `Snapshot` and a live one,
+  and applies that plan over a connection it is handed.
 - **`phoenix-daemon`** — keeps one tmux server's state alive across restarts.
 - **`phoenix-cli`** — maps command lines onto the crates below.
 
@@ -306,73 +306,54 @@ bad sequences) rather than failing the pane.
 
 ## 6. Restore — plan, then apply
 
-`plan(&Snapshot) -> RestorePlan` is pure; `phoenix-restore`'s `apply` executes the
-resulting ordered steps over a `tmux-control` client. Because the plan is data, `phoenix
-restore --dry-run` prints what would run before it runs — a real safety property for a
-tool that can `send-keys` into live shells. Every step prints as its exact tmux command
-line except scrollback replay, which prints as a `#` summary: its command names a temp
-file that only exists at apply time.
+`ARCHITECTURE.md` §8 is the full account; this is the summary.
 
-A restored pane comes back **at its captured cwd, running the program it was
-running** — the captured argv is replayed into the pane, unconditionally, on every
-restore path (interactive `phoenix restore` and the daemon's unattended boot restore
-alike). Nothing is asked and nothing is configured: getting your programs back is the
-whole point of restoring. A pane with no captured cwd sends no `-c`, so it opens in
-tmux's default directory for the new session or window.
+`plan(generation, &snapshot, onto) -> Plan` is pure. The plan is the **difference over
+recorded identity** between the snapshot and the server it lands on. A saved window is
+present when a live window *is* that window: one an earlier restore of the same
+generation built and stamped (`@phoenix-window=<generation>:<saved id>`), or, on the
+server incarnation the snapshot was saved from, the same tmux window id. A saved session
+is present when a live session has its name. Whatever is absent is built; whatever is
+present is left alone; nothing live is removed. So restoring twice does nothing the
+second time, and a restore cut short is finished by running it again: the stamp is the
+last step of each window, so a half-built window carries none and is rebuilt whole.
 
-**Implementation notes (found by running the plan against a real tmux server):**
-`new-session` has no flag to request a specific window index — the window lands wherever
-the target server's `base-index` puts it — so `plan` always follows a session's
-`new-session` with a `move-window` relocating it to the captured index. That move can
-legitimately fail with tmux's "same index" error when the window already landed there;
-the executor treats exactly that as success. Panes have no such fix-up at all —
-`split-window` takes no index and there's no pane equivalent of `move-window` — so the
-plan never targets a pane by index: each window's originally-active pane is always the
-last one split (verified live that the most recently split pane stays active through a
-following `select-layout`), so `select-pane` never appears in a plan.
+Where things go: a saved session the server lacks is created around the first of its
+windows that has to be built. A saved window is built once, in the first session that
+links it, and linked into the others (`link-window`). It lands at its saved index, or,
+when a live window holds that index, at the next index no live window holds and no saved
+window wants; the plan's notes say so. A session the plan created is pointed at its
+saved active window; a session that was already there keeps showing what it showed.
 
-**Content replay:** "the authoritative grid comes from capture-pane, not a re-emulated
-stream" — a pane's captured `scrollback` is replayed by typing `cat <tempfile>; rm -f
-<tempfile>` into the pane immediately after it's created, using the same current-pane
-targeting `split-window` relies on. The temp file is created exclusively with mode 0600,
-so another local user can neither read the scrollback nor plant the path first, and the
-pane's own shell removes it once read, since only that shell knows when it has. This is
-the one plan step that isn't a `TmuxCommand` (`PlanStep::ReplayContent`), because its
-command line needs that temp file. A pane with `content: None` has nothing to replay.
+Steps name what they act on by reference (`WindowRef`, `PaneRef`). `apply` binds each
+reference to the id tmux reports (`new-session`/`new-window`/`split-window -P -F`) and
+every later step addresses that id, so no step depends on what tmux considers current.
+Panes are split in saved order, each from the one before it and spread (`select-layout
+tiled`) so the next split has room, the saved layout is applied once they all exist,
+and the saved active pane is selected by id. `phoenix restore --dry-run`
+prints the same steps with the references in place of ids, and runs none of them.
 
-**Program relaunch:** a pane's captured `argv` (§5's best-effort `ps` recovery) becomes a
-`TmuxCommand::RelaunchProgram`, emitted right after that pane's content replay so
-captured history is visible before the program that produced it restarts on top (the
-order tmux-resurrect uses). The argv is shell-quoted element by element, so an argument
-containing spaces round-trips as one shell word. Two pane shapes come back as a plain
-shell at their cwd: one with `argv: None` (there is no command line to run), and one
-that was idle at its prompt, which tmux reports as the pane's own shell being its
-foreground process. The second is recognized by `pane_current_command` being an
-interactive shell (`zsh`, `bash`, `fish`, …) invoked with no non-flag argument —
-restore already creates every pane as a fresh shell, so re-running it would nest a
-second shell, whereas `bash deploy.sh` is a real program and does come back.
+A restored pane comes back **at its captured cwd, running the program it was running**.
+Its saved scrollback is printed into it first (`cat <tempfile>; rm -f <tempfile>`, typed
+into the pane; the file is created exclusively with mode 0600 and the pane's own shell
+removes it), then the saved argv is typed in, each word shell-quoted. A pane that was
+idle at its shell comes back as the idle shell every new pane already is, and a pane
+whose foreground was not recovered has no command line to run.
 
-**Connecting (`phoenix_restore::connect_and_apply`):** a control-mode client attaches to
-a session, and restore creates sessions whose names the server may already use. Every
-restore path goes through one function that first probes what the server holds. It
-counts sessions with a plain `list-sessions` (bare `tmux -C` always creates a session, so
-it can't be the check); only tmux's own no-server replies count as zero, and any other
-failure stops the restore rather than guessing. A populated server is captured over a
-short-lived connection and read as *bootstrap-only* when every session is one window
-holding one pane idle at its shell — what a terminal starting `tmux` creates — and as
-*built* otherwise. Idleness is `phoenix_core::Foreground`, the same reading restore's
-program relaunch uses, and a pane whose argv wasn't recovered is `Unknown`, never idle.
+**Connecting is not restore's job.** The caller opens the connection
+(`tmux_control::Connection::open`), captures the live server over it, and hands both to
+`plan` and `apply`. When the server held no session, `open` made one in order to attach
+and reports its name; as soon as the first restored session exists the plan moves every
+client on that session onto it and kills it — the only session phoenix ever removes —
+so a restore cut short after that leaves no such session behind. Last of all the
+plan sets the server option `@phoenix-generation`, the mark of a restore that finished.
 
-The steps are the same for every server; only the scaffolding differs. An empty server
-gets a created `phoenix-boot-N` session, a bootstrap-only server has every session renamed
-to a free `phoenix-boot-N`, and a built server gets none. Each name is free of the
-server's and the snapshot's names, so no snapshot collides with its own scaffolding. The
-plan applies over the scaffolding, the client reattaches to a restored session (killing
-the session a client is attached to ends that client's connection), every terminal still
-on scaffolding is switched onto that session, and the scaffolding is killed. If the plan
-doesn't apply, the scaffolding is put back instead: a created session is killed and a
-renamed one gets its name back, so a failed restore never kills a login terminal's
-session out from under it.
+Two tmux facts the plan encodes, both found by running it against a real server:
+`new-session` cannot be told a window index, so the session's first window is moved to
+its saved index afterwards, and tmux's "same index" refusal is read as "already there";
+and a server with `renumber-windows on` shifts indices whenever a window closes, so the
+window a session is made with when all of its saved windows already exist is never
+closed — the first link takes its place (`link-window -k`).
 
 ---
 
@@ -437,8 +418,9 @@ subscriptions, and owns *when to save* as explicit state
 - **Interval ceiling (backstop).** A max-interval save so long steady sessions still
   checkpoint.
 - **Boot restore.** On start, if the server holds nothing the user built — no sessions, or
-  only bootstrap sessions (§6) — apply `latest` in their place; if it holds a session the
-  user built, log which one and stay in save mode — never clobber a live server.
+  only bootstrap sessions (one window, one pane idle at its shell) — restore `latest`
+  beside them (§6); if it holds a session the user built, log which one and stay in save
+  mode.
 - **Supervision.** `launchd` user agent (macOS) / `systemd --user` unit (Linux);
   `phoenix daemon` runs it foreground for debugging. Independent of the tmux server —
   if tmux isn't running the connection sits in `Closed`/`Reconnecting` and the daemon
@@ -461,9 +443,11 @@ subscribe is fatal to a connection. The daemon carries each save's per-pane cont
 (seeded from `latest` on start), which is why it is the one path with content capture
 on.
 
-Boot restore probes the server first (§6). With a session the user built, it names that
-session in its log, attaches, and never restores. Holding nothing the user built and with
-a saved `latest`, it restores through `connect_and_apply`. With no sessions and nothing
+Boot restore probes the server first: a capture over a short-lived connection, read as
+*bootstrap-only* when every session is one window holding one pane idle at its shell and
+as *built* otherwise. With a session the user built, it names that session in its log,
+attaches, and never restores. Holding nothing the user built and with a saved `latest`,
+it restores with §6's plan over a connection of its own. With no sessions and nothing
 saved, it attaches to nothing and waits: starting a server nobody asked for is not the
 daemon's call. With only bootstrap sessions and nothing saved, it attaches and stays in
 save mode.

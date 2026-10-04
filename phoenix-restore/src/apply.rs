@@ -1,8 +1,11 @@
-//! Executes a [`RestorePlan`] over an existing `tmux-control` connection
-//! (DESIGN.md §6, §9). The only place in this crate that touches a live
-//! connection — or the local filesystem, for [`PlanStep::ReplayContent`]
-//! — everything upstream ([`crate::plan`]) is pure.
+//! Runs a [`Plan`] over whatever executes tmux commands (ARCHITECTURE.md
+//! §8). The only place in this crate that touches a connection — or the
+//! local filesystem, for [`Step::ReplayContent`]. Each step that creates a
+//! window or pane binds its reference to the id tmux reports, and every
+//! later step addresses that id, so nothing here depends on what tmux
+//! considers current.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -10,50 +13,45 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tmux_control::{Client, CommandLine, TmuxError, Transport};
+use phoenix_core::{Utf8PathBuf, WindowIndex};
+use tmux_control::commands::{move_window, new_session, new_window, split_window, switch_client};
+use tmux_control::{CommandLine, Execute, PaneId, Target, TmuxError, WindowId};
 
-use crate::command::{shell_quote, window_target, PlanStep, TmuxCommand};
-use crate::plan::RestorePlan;
-
-#[derive(Debug)]
-pub struct ApplyOutcome {
-    /// How many commands ran (including a tolerated `MoveWindow` "same
-    /// index" case — see below).
-    pub executed: usize,
-    /// `MoveWindow` commands that hit tmux's benign "same index" error
-    /// (`TmuxCommand::MoveWindow`'s doc comment: the window already
-    /// happened to land on the captured index) — not failures, just
-    /// no-ops, counted separately for visibility.
-    pub skipped_move_window: usize,
-}
+use crate::plan::Plan;
+use crate::step::{relaunch_line, shell_quote, LinkSource, OptionScope, PaneRef, Step, WindowRef};
 
 #[derive(Debug)]
 pub struct ApplyError {
-    /// Which command in `plan.commands` failed (0-indexed) — needed
-    /// because a partially-applied restore leaves the server in a
-    /// known-partial state the caller needs to be able to report.
-    pub command_index: usize,
+    /// Which step of the plan failed (0-indexed). Every step before it ran,
+    /// so the server is partially restored; a window whose group this cut
+    /// short carries no stamp, so the next plan leaves it standing as a
+    /// window that is not the snapshot's and builds the saved one whole.
+    pub step: usize,
     pub source: ApplyErrorSource,
 }
 
 #[derive(Debug)]
 pub enum ApplyErrorSource {
     Tmux(TmuxError),
-    /// [`PlanStep::ReplayContent`] couldn't write its temp file — a
-    /// local filesystem failure, not a tmux protocol one.
+    /// [`Step::ReplayContent`] couldn't write its temp file — a local
+    /// filesystem failure, not a tmux one.
     TempFile(io::Error),
+}
+
+impl From<TmuxError> for ApplyErrorSource {
+    fn from(err: TmuxError) -> Self {
+        ApplyErrorSource::Tmux(err)
+    }
 }
 
 impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.source {
-            ApplyErrorSource::Tmux(e) => {
-                write!(f, "restore command #{} failed: {e}", self.command_index)
-            }
+            ApplyErrorSource::Tmux(e) => write!(f, "restore step #{} failed: {e}", self.step),
             ApplyErrorSource::TempFile(e) => write!(
                 f,
-                "restore command #{} failed to write its content-replay temp file: {e}",
-                self.command_index
+                "restore step #{} failed to write its content-replay temp file: {e}",
+                self.step
             ),
         }
     }
@@ -61,85 +59,210 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-/// Runs every command in `plan`, in order, over `client`. Stops at the
-/// first failure that isn't the documented benign `MoveWindow` case —
-/// DESIGN.md §9's "every external call checked" — leaving the server
-/// partially restored rather than pretending success or silently
-/// continuing past a real error.
-pub fn apply<T: Transport>(
-    client: &mut Client<T>,
-    plan: &RestorePlan,
-) -> Result<ApplyOutcome, ApplyError> {
-    let mut outcome = ApplyOutcome {
-        executed: 0,
-        skipped_move_window: 0,
-    };
-
-    for (index, step) in plan.commands.iter().enumerate() {
-        let line = resolve_command_line(step).map_err(|source| ApplyError {
-            command_index: index,
-            source,
-        })?;
-
-        match client.execute(&line) {
-            Ok(_) => outcome.executed += 1,
-            Err(err) if is_benign_move_window_failure(step, &err) => {
-                outcome.skipped_move_window += 1;
-            }
-            Err(source) => {
-                return Err(ApplyError {
-                    command_index: index,
-                    source: ApplyErrorSource::Tmux(source),
-                });
-            }
-        }
-    }
-
-    Ok(outcome)
+/// Runs every step of `plan`, in order, over `client`, stopping at the first
+/// failure rather than continuing past it.
+pub fn apply<C: Execute>(client: &mut C, plan: &Plan) -> Result<(), ApplyError> {
+    let mut bound = Bound::default();
+    plan.steps()
+        .iter()
+        .enumerate()
+        .try_for_each(|(step, action)| {
+            run(client, &mut bound, action).map_err(|source| ApplyError { step, source })
+        })
 }
 
-fn is_benign_move_window_failure(step: &PlanStep, err: &TmuxError) -> bool {
-    if !matches!(step, PlanStep::Command(TmuxCommand::MoveWindow { .. })) {
-        return false;
+/// The ids tmux gave what the plan has created so far.
+#[derive(Default)]
+struct Bound {
+    windows: HashMap<WindowRef, WindowId>,
+    panes: HashMap<PaneRef, PaneId>,
+}
+
+impl Bound {
+    fn window(&self, window: WindowRef) -> WindowId {
+        *self
+            .windows
+            .get(&window)
+            .expect("`plan` defines every window reference before a step uses it")
     }
-    let TmuxError::Command { lines, .. } = err else {
-        return false;
-    };
-    lines
-        .iter()
-        .any(|line| String::from_utf8_lossy(line).contains("same index"))
+
+    fn pane(&self, pane: PaneRef) -> PaneId {
+        *self
+            .panes
+            .get(&pane)
+            .expect("`plan` defines every pane reference before a step uses it")
+    }
+}
+
+fn index(index: WindowIndex) -> tmux_control::WindowIndex {
+    tmux_control::WindowIndex(index.0)
+}
+
+fn path(cwd: &Option<Utf8PathBuf>) -> Option<&str> {
+    cwd.as_ref().map(Utf8PathBuf::as_str)
+}
+
+fn send<C: Execute>(
+    client: &mut C,
+    name: &'static str,
+    args: &[&str],
+) -> Result<Vec<Vec<u8>>, ApplyErrorSource> {
+    let line = CommandLine::new(name, args).map_err(TmuxError::from)?;
+    Ok(client.execute(&line)?.lines)
+}
+
+fn run<C: Execute>(client: &mut C, bound: &mut Bound, step: &Step) -> Result<(), ApplyErrorSource> {
+    match step {
+        Step::CreateSession {
+            name,
+            window_name,
+            cwd,
+            window,
+            pane,
+        } => {
+            let made = new_session(
+                client,
+                name,
+                window_name.as_ref().map(|n| n.as_str()),
+                path(cwd),
+            )?;
+            bound.windows.insert(*window, made.window);
+            bound.panes.insert(*pane, made.pane);
+        }
+        Step::MoveWindow {
+            window,
+            session,
+            to,
+        } => {
+            // Either answer leaves the window at `to`.
+            move_window(client, bound.window(*window), session, index(*to))?;
+        }
+        Step::NewWindow {
+            session,
+            index: at,
+            name,
+            cwd,
+            window,
+            pane,
+        } => {
+            let made = new_window(client, session, index(*at), Some(name.as_str()), path(cwd))?;
+            bound.windows.insert(*window, made.window);
+            bound.panes.insert(*pane, made.pane);
+        }
+        Step::LinkWindow {
+            source,
+            into,
+            index: at,
+            replacing,
+        } => {
+            let source = Target::WindowId(match source {
+                LinkSource::Built(window) => bound.window(*window),
+                LinkSource::Live(window) => WindowId(window.0),
+            })
+            .to_string();
+            let target = Target::Window(into.clone(), index(*at)).to_string();
+            // `-k` removes the window the link lands on.
+            let args: Vec<&str> = replacing
+                .iter()
+                .map(|_| "-k")
+                .chain(["-d", "-s", &source, "-t", &target])
+                .collect();
+            send(client, "link-window", &args)?;
+        }
+        Step::SplitPane { from, cwd, pane } => {
+            let made = split_window(client, bound.pane(*from), path(cwd))?;
+            bound.panes.insert(*pane, made);
+        }
+        Step::SelectLayout { window, layout } => {
+            let target = Target::WindowId(bound.window(*window)).to_string();
+            send(client, "select-layout", &["-t", &target, layout.as_str()])?;
+        }
+        Step::ReplayContent { pane, lines } => {
+            // The pane's shell reads the file after `send-keys` returns, so
+            // only that shell knows when it has been consumed: the same
+            // keystrokes remove it.
+            let file = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
+            let quoted = shell_quote(&file.to_string_lossy());
+            let typed = type_line(
+                client,
+                bound.pane(*pane),
+                &format!("cat {quoted}; rm -f {quoted}"),
+            );
+            // Nothing was typed, so no shell will remove it. The step
+            // reports the typing failure; a removal that fails too has
+            // nothing to add to it.
+            if typed.is_err() {
+                let _ = fs::remove_file(&file);
+            }
+            typed?;
+        }
+        Step::Relaunch { pane, argv } => {
+            type_line(client, bound.pane(*pane), &relaunch_line(argv))?;
+        }
+        Step::SelectPane { pane } => {
+            let target = Target::Pane(bound.pane(*pane)).to_string();
+            send(client, "select-pane", &["-t", &target])?;
+        }
+        Step::SelectWindow { session, index: at } => {
+            let target = Target::Window(session.clone(), index(*at)).to_string();
+            send(client, "select-window", &["-t", &target])?;
+        }
+        Step::SetOption { scope, key, value } => {
+            let scope: Vec<String> = match scope {
+                OptionScope::Server => vec!["-s".to_owned()],
+                OptionScope::Session(session) => {
+                    vec![
+                        "-t".to_owned(),
+                        Target::Session(session.clone()).to_string(),
+                    ]
+                }
+                OptionScope::Window(window) => vec![
+                    "-w".to_owned(),
+                    "-t".to_owned(),
+                    Target::WindowId(bound.window(*window)).to_string(),
+                ],
+            };
+            let args: Vec<&str> = scope
+                .iter()
+                .map(String::as_str)
+                .chain([*key, value.as_str()])
+                .collect();
+            send(client, "set-option", &args)?;
+        }
+        Step::SwitchClients { from, to } => {
+            const FORMAT: &str = "#{client_name}";
+            let from = Target::Session(from.clone()).to_string();
+            let listed = send(client, "list-clients", &["-t", &from, "-F", FORMAT])?;
+            let clients: Vec<String> = listed
+                .iter()
+                .map(|name| String::from_utf8(name.clone()))
+                .collect::<Result<_, _>>()
+                .map_err(|_| TmuxError::UnexpectedReply {
+                    expected: FORMAT,
+                    output: listed.clone(),
+                })?;
+            // Either answer leaves the client off `from`.
+            for client_name in &clients {
+                switch_client(client, client_name, to)?;
+            }
+        }
+        Step::KillSession { name } => {
+            let target = Target::Session(name.clone()).to_string();
+            send(client, "kill-session", &["-t", &target])?;
+        }
+    }
+    Ok(())
+}
+
+/// Types `line` and Enter into `pane`'s shell.
+fn type_line<C: Execute>(client: &mut C, pane: PaneId, line: &str) -> Result<(), ApplyErrorSource> {
+    let target = Target::Pane(pane).to_string();
+    send(client, "send-keys", &["-t", &target, line, "Enter"]).map(drop)
 }
 
 static REPLAY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The command line a step actually sends. A [`PlanStep::Command`] already
-/// is one; [`PlanStep::ReplayContent`] becomes one only here, because it
-/// writes its content to a temp file first and sends a `cat` of that file
-/// into the target pane. The shell reads the file asynchronously after
-/// `send-keys` returns, so the only party that knows when it has been
-/// consumed is that shell: the keystrokes remove the file right after
-/// reading it.
-fn resolve_command_line(step: &PlanStep) -> Result<CommandLine, ApplyErrorSource> {
-    match step {
-        PlanStep::ReplayContent {
-            session,
-            window,
-            lines,
-        } => {
-            let path = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
-            let target = window_target(session, *window);
-            let quoted = shell_quote(&path.to_string_lossy());
-            let shell_command = format!("cat {quoted}; rm -f {quoted}");
-            CommandLine::new("send-keys", ["-t", &target, &shell_command, "Enter"])
-                .map_err(|e| ApplyErrorSource::Tmux(e.into()))
-        }
-        PlanStep::Command(cmd) => cmd
-            .to_command_line()
-            .map_err(|e| ApplyErrorSource::Tmux(e.into())),
-    }
-}
-
-/// Captured scrollback can hold anything the user saw in a terminal, and the
+/// Saved scrollback can hold anything the user saw in a terminal, and the
 /// temp dir is shared: the file is readable by its owner only, and the open
 /// is exclusive so a path another user pre-placed (a symlink, say) fails
 /// loudly instead of being written through. The name carries the clock as
@@ -168,157 +291,175 @@ fn write_replay_temp_file(lines: &[String]) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_core::{SessionName, WindowIndex};
-    use std::cell::RefCell;
+    use crate::plan::{plan, Onto};
+    use phoenix_core::{
+        Content, ContentFailure, Cwd, Foreground, GenerationId, Layout, Made, NonEmpty,
+        OffsetDateTime, Origin, Pane, PaneIndex, Session, Snapshot, TmuxVersion, Touched, WinLink,
+        Window, WindowName,
+    };
     use std::collections::VecDeque;
-    use std::rc::Rc;
-    use tmux_control::CommandLine;
+    use tmux_control::{CommandOutput, Guard, SessionName};
 
-    #[derive(Clone, Default)]
-    struct MockState {
-        sent: Rc<RefCell<Vec<String>>>,
+    const GUARD: Guard = Guard {
+        timestamp: 0,
+        command_number: 0,
+        flags: 1,
+    };
+
+    /// Answers each command with the next scripted reply — `Ok` lines for
+    /// `%end`, `Err` lines for `%error` — and records what was sent.
+    struct Scripted {
+        replies: VecDeque<Result<Vec<&'static str>, &'static str>>,
+        sent: Vec<String>,
     }
 
-    struct MockTransport {
-        replies: VecDeque<Vec<u8>>,
-        state: MockState,
-    }
-
-    impl MockTransport {
-        fn new(replies: Vec<&str>) -> (Self, MockState) {
-            let state = MockState::default();
-            let transport = Self {
-                replies: replies.into_iter().map(|r| r.as_bytes().to_vec()).collect(),
-                state: state.clone(),
-            };
-            (transport, state)
-        }
-    }
-
-    impl Transport for MockTransport {
-        fn send(&mut self, line: &CommandLine) -> io::Result<()> {
-            self.state.sent.borrow_mut().push(line.as_str().to_string());
-            Ok(())
-        }
-
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            match self.replies.pop_front() {
-                Some(chunk) => {
-                    buf[..chunk.len()].copy_from_slice(&chunk);
-                    Ok(chunk.len())
-                }
-                None => Ok(0),
+    impl Scripted {
+        fn new(replies: Vec<Result<Vec<&'static str>, &'static str>>) -> Self {
+            Self {
+                replies: replies.into(),
+                sent: Vec::new(),
             }
         }
-
-        fn close(&mut self) {}
     }
 
-    fn move_window_plan() -> RestorePlan {
-        RestorePlan {
-            commands: vec![PlanStep::Command(TmuxCommand::MoveWindow {
-                session: SessionName::parse("main").unwrap(),
-                window: WindowIndex(0),
-            })],
+    impl Execute for Scripted {
+        fn execute(&mut self, command: &CommandLine) -> Result<CommandOutput, TmuxError> {
+            self.sent.push(command.as_str().to_owned());
+            let bytes = |lines: Vec<&str>| lines.iter().map(|l| l.as_bytes().to_vec()).collect();
+            match self.replies.pop_front().expect("a reply for every command") {
+                Ok(lines) => Ok(CommandOutput {
+                    guard: GUARD,
+                    lines: bytes(lines),
+                }),
+                Err(line) => Err(TmuxError::Command {
+                    guard: GUARD,
+                    lines: bytes(vec![line]),
+                }),
+            }
         }
     }
 
-    #[test]
-    fn a_benign_same_index_move_window_failure_is_tolerated() {
-        let (transport, state) =
-            MockTransport::new(vec!["%begin 1 1 1\nsame index: 0\n%error 1 1 1\n"]);
-        let mut client = Client::new(transport, drop, |_, _| {});
+    /// Session `main` linking one two-pane window, saved as `@3`, at index
+    /// 2, its second pane active and running `vim`.
+    fn snapshot() -> Snapshot {
+        let pane = |index: u32, foreground| Pane {
+            id: phoenix_core::PaneId(index),
+            index: PaneIndex(index),
+            cwd: Cwd::parse(format!("/p{index}")),
+            foreground,
+            content: Content::NotCaptured {
+                reason: ContentFailure::NotRecorded,
+            },
+        };
+        let vim = Foreground::Program {
+            argv: NonEmpty::singleton("vim".to_owned()),
+        };
+        let window = Window::new(
+            phoenix_core::WindowId(3),
+            Made::NotByPhoenix,
+            WindowName::parse("editor").unwrap(),
+            Layout::parse("layout").unwrap(),
+            false,
+            NonEmpty::new(pane(0, Foreground::Shell), vec![pane(1, vim)]),
+            PaneIndex(1),
+        )
+        .unwrap();
+        let session = Session::new(
+            phoenix_core::SessionName::parse("main").unwrap(),
+            None,
+            NonEmpty::singleton(WinLink {
+                index: WindowIndex(2),
+                window: phoenix_core::WindowId(3),
+            }),
+            WindowIndex(2),
+            None,
+        )
+        .unwrap();
+        Snapshot::new(
+            Origin::BeforeOriginWasRecorded,
+            Touched::Never,
+            OffsetDateTime::from_unix_timestamp(1_700_000_000),
+            TmuxVersion { major: 3, minor: 7 },
+            NonEmpty::singleton(window),
+            NonEmpty::singleton(session),
+            vec![],
+        )
+        .unwrap()
+    }
 
-        let outcome = apply(&mut client, &move_window_plan()).unwrap();
-        assert_eq!(outcome.executed, 0);
-        assert_eq!(outcome.skipped_move_window, 1);
-        assert_eq!(*state.sent.borrow(), vec!["move-window -s main -t main:0"]);
+    fn onto_no_server() -> Plan {
+        let scratch = SessionName::parse("scratch").unwrap();
+        plan(
+            GenerationId(7),
+            &snapshot(),
+            Onto::NoServer { scratch: &scratch },
+        )
     }
 
     #[test]
-    fn a_different_move_window_failure_is_a_real_error() {
-        let (transport, _state) = MockTransport::new(vec![
-            "%begin 1 1 1\ncan't find session: main\n%error 1 1 1\n",
+    fn every_step_addresses_the_ids_tmux_reported_for_what_the_plan_made() {
+        let mut tmux = Scripted::new(vec![
+            Ok(vec!["$1 @5 %9"]),
+            // The window landed on its saved index by itself.
+            Err("same index: 2"),
+            Ok(vec!["client-1", "/dev/ttys004"]),
+            Ok(vec![]),
+            // The terminal closed after it was listed.
+            Err("can't find client: /dev/ttys004"),
+            Ok(vec![]),
+            Ok(vec!["%10"]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
         ]);
-        let mut client = Client::new(transport, drop, |_, _| {});
 
-        let err = apply(&mut client, &move_window_plan()).unwrap_err();
-        assert_eq!(err.command_index, 0);
-        assert!(matches!(err.source, ApplyErrorSource::Tmux(_)));
+        apply(&mut tmux, &onto_no_server()).expect("apply");
+
+        assert_eq!(
+            tmux.sent,
+            [
+                r##"new-session -d -s main -n editor -c /p0 -P -F "#{session_id} #{window_id} #{pane_id}""##,
+                "move-window -d -s @5 -t =main:=2",
+                r##"list-clients -t =scratch: -F "#{client_name}""##,
+                "switch-client -c client-1 -t =main:",
+                "switch-client -c /dev/ttys004 -t =main:",
+                "kill-session -t =scratch:",
+                r##"split-window -d -t "%9" -c /p1 -P -F "#{pane_id}""##,
+                "select-layout -t @5 tiled",
+                "select-layout -t @5 layout",
+                r#"send-keys -t "%10" "'vim'" Enter"#,
+                r#"select-pane -t "%10""#,
+                "set-option -w -t @5 @phoenix-window 7:@3",
+                "select-window -t =main:=2",
+                "set-option -t =main: @phoenix-restored 7",
+                "set-option -s @phoenix-generation 7",
+            ]
+        );
     }
 
     #[test]
-    fn a_successful_command_counts_as_executed() {
-        let (transport, _state) = MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n"]);
-        let mut client = Client::new(transport, drop, |_, _| {});
-
-        let outcome = apply(&mut client, &move_window_plan()).unwrap();
-        assert_eq!(outcome.executed, 1);
-        assert_eq!(outcome.skipped_move_window, 0);
-    }
-
-    #[test]
-    fn a_non_move_window_failure_is_never_treated_as_benign() {
-        let plan = RestorePlan {
-            commands: vec![PlanStep::Command(TmuxCommand::SelectWindow {
-                session: SessionName::parse("main").unwrap(),
-                window: WindowIndex(0),
-            })],
-        };
-        let (transport, _state) =
-            MockTransport::new(vec!["%begin 1 1 1\nsame index: 0\n%error 1 1 1\n"]);
-        let mut client = Client::new(transport, drop, |_, _| {});
-
-        let err = apply(&mut client, &plan).unwrap_err();
-        assert_eq!(err.command_index, 0);
-    }
-
-    #[test]
-    fn stops_at_the_first_real_failure_and_reports_its_index() {
-        let plan = RestorePlan {
-            commands: vec![
-                PlanStep::Command(TmuxCommand::MoveWindow {
-                    session: SessionName::parse("main").unwrap(),
-                    window: WindowIndex(0),
-                }),
-                PlanStep::Command(TmuxCommand::SelectWindow {
-                    session: SessionName::parse("main").unwrap(),
-                    window: WindowIndex(0),
-                }),
-            ],
-        };
-        let (transport, _state) = MockTransport::new(vec![
-            "%begin 1 1 1\n%end 1 1 1\n",
-            "%begin 2 2 2\ncan't find window\n%error 2 2 2\n",
+    fn the_first_failure_stops_the_plan_and_names_its_step() {
+        let mut tmux = Scripted::new(vec![
+            Ok(vec!["$1 @5 %9"]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Err("no space for new pane"),
         ]);
-        let mut client = Client::new(transport, drop, |_, _| {});
 
-        let err = apply(&mut client, &plan).unwrap_err();
-        assert_eq!(err.command_index, 1);
-    }
+        let err = apply(&mut tmux, &onto_no_server()).unwrap_err();
 
-    #[test]
-    fn replay_content_sends_a_send_keys_cat_command() {
-        let plan = RestorePlan {
-            commands: vec![PlanStep::ReplayContent {
-                session: SessionName::parse("main").unwrap(),
-                window: WindowIndex(2),
-                lines: vec!["hello".to_string(), "world".to_string()],
-            }],
-        };
-        let (transport, state) = MockTransport::new(vec!["%begin 1 1 1\n%end 1 1 1\n"]);
-        let mut client = Client::new(transport, drop, |_, _| {});
-
-        apply(&mut client, &plan).unwrap();
-
-        let sent = state.sent.borrow();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].starts_with("send-keys -t main:2 "));
-        // The keystrokes are one argument to tmux, and shell-quoted within
-        // it, because a shell — not tmux — parses what gets typed.
-        assert!(sent[0].contains("\"cat '"));
-        assert!(sent[0].contains("; rm -f '"));
-        assert!(sent[0].ends_with(" Enter"));
+        assert_eq!(err.step, 4);
+        assert!(matches!(
+            err.source,
+            ApplyErrorSource::Tmux(TmuxError::Command { .. })
+        ));
+        assert_eq!(tmux.sent.len(), 5, "nothing runs past the failure");
     }
 
     #[test]

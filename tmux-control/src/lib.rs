@@ -23,8 +23,8 @@ pub use client::{
     Opened, TmuxError,
 };
 pub use commands::{
-    ClientFlag, ColonInSubscriptionName, NewSession, NewWindow, PaneAction, SessionName,
-    SubscriptionName, SubscriptionScope, Target, UnaddressableSessionName, WindowIndex,
+    ClientFlag, ColonInSubscriptionName, Moved, NewSession, NewWindow, PaneAction, SessionName,
+    SubscriptionName, SubscriptionScope, Switched, Target, UnaddressableSessionName, WindowIndex,
 };
 pub use protocol::{
     decode_octal, Codec, CommandLine, Guard, Layout, NulInArgument, PaneId, ServerMessage,

@@ -37,11 +37,17 @@ pub enum Touched {
     Never,
 }
 
+impl Touched {
+    /// The server option's name: capture reads it and the restore plan
+    /// writes it under this one spelling (`[LAW:one-source-of-truth]`).
+    pub const OPTION: &'static str = "@phoenix-generation";
+}
+
 /// Whether a live window is one phoenix built: the window option
-/// `@phoenix-window=<generation>:<saved window id>`, to be stamped by the
-/// restore plan as the last step of the window's group (tmux-laws-a4x.kdi;
-/// until that lands nothing writes it and every live window reads
-/// `NotByPhoenix`). A window option follows the window through
+/// `@phoenix-window=<generation>:<saved window id>`, stamped by the restore
+/// plan as the last step of the window's group, so a window a dropped
+/// restore left half built reads `NotByPhoenix`. A window option follows the
+/// window through
 /// `link-window` (verified live), so a shared window carries one stamp
 /// however many sessions link it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,6 +78,10 @@ impl fmt::Display for MalformedWindowMark {
 impl std::error::Error for MalformedWindowMark {}
 
 impl Made {
+    /// The window option's name, shared by capture's read and the plan's
+    /// write.
+    pub const OPTION: &'static str = "@phoenix-window";
+
     /// The one place the option's string shape is defined
     /// (`[LAW:one-source-of-truth]`): the plan writes
     /// [`Made::option_value`] and capture reads [`Made::parse_option`].

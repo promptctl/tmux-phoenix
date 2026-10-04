@@ -1,15 +1,12 @@
-//! `phoenix-restore` — pure `Snapshot -> RestorePlan` planning (DESIGN.md §6),
-//! plus [`apply`], the one place this crate touches a live `tmux-control`
-//! connection to actually run a plan.
+//! `phoenix-restore` — turns a saved `Snapshot` and a live one into a
+//! [`Plan`], and applies a `Plan` over a connection (ARCHITECTURE.md §8).
+//! Connecting is not this crate's job: [`plan`] is pure and [`apply`] is
+//! handed whatever executes tmux commands.
 
 mod apply;
-mod command;
-mod connect;
 mod plan;
+mod step;
 
-pub use apply::{apply, ApplyError, ApplyErrorSource, ApplyOutcome};
-pub use command::{PlanStep, TmuxCommand};
-pub use connect::{
-    connect_and_apply, count_sessions, probe, server_id, ConnectApplyError, ServerState,
-};
-pub use plan::{plan, RestorePlan};
+pub use apply::{apply, ApplyError, ApplyErrorSource};
+pub use plan::{plan, scratch_name, Note, Onto, Plan};
+pub use step::{LinkSource, OptionScope, PaneRef, Step, WindowRef};

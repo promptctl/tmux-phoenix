@@ -116,7 +116,7 @@ fn list_rows<C: Execute, R>(
 /// exactly one line — an empty one if it was set to the empty string — so
 /// "unset" and "set to something unparseable" stay apart.
 fn server_mark<C: Execute>(client: &mut C) -> Result<Touched, CaptureError> {
-    let line = CommandLine::new("show-options", ["-s", "-q", "-v", "@phoenix-generation"])
+    let line = CommandLine::new("show-options", ["-s", "-q", "-v", Touched::OPTION])
         .map_err(|e| CaptureError::ServerMark(e.into()))?;
     let output = client.execute(&line).map_err(CaptureError::ServerMark)?;
     let lines = utf8_lines(&output.lines)?;
