@@ -11,7 +11,8 @@
 //! behalf for the life of the connection — the same shape as
 //! [`super::Client`]'s sinks, for the same reason: "events with nowhere to
 //! go" is not a state, so there is no buffer to cover it. The sink runs on
-//! the reader thread, ahead of any reply that follows in the same read.
+//! the reader thread, always, ahead of any reply that follows in the same
+//! read.
 //!
 //! [`Connection::open`] is also the one place a `tmux` process is started in
 //! order to reach a server. `attach-session` is always tried first; when it
@@ -62,6 +63,32 @@ pub enum Opened {
 /// Where the reader delivers everything that is not a reply.
 pub type EventSink = Box<dyn FnMut(Event) + Send>;
 
+/// Ends a connection's link from any thread, which is how a caller blocked in
+/// [`Connection::execute`] on a server that stopped answering is released:
+/// the read side ends, the reader reports [`CloseReason::Disposed`], and the
+/// blocked call returns [`TmuxError::TransportClosed`]. Aborting a link that
+/// has already ended is a no-op.
+#[derive(Clone)]
+pub struct Abort {
+    disposed: Arc<AtomicBool>,
+    end: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Abort {
+    pub fn abort(&self) {
+        self.disposed.store(true, Ordering::SeqCst);
+        (self.end)();
+    }
+}
+
+impl std::fmt::Debug for Abort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Abort")
+            .field("disposed", &self.disposed.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
 /// A block's outcome: its output, or the `%error`/malformed-terminator it
 /// settled with.
 type Settled = Result<CommandOutput, TmuxError>;
@@ -77,9 +104,10 @@ enum Reply {
 
 /// How a read side ended. The endings differ for every caller — a clean
 /// EOF is tmux's own `%exit` or exit, a failed read is a broken transport,
-/// and an EOF this side caused by [`Connection::close`] is neither — so the
-/// distinction is carried, and the pairing of each with its [`CloseReason`]
-/// and its [`TmuxError`] is written once (`[LAW:one-source-of-truth]`).
+/// and an EOF this side caused ([`Connection::close`], [`Abort::abort`]) is
+/// neither — so the distinction is carried, and the pairing of each with
+/// its [`CloseReason`] and its [`TmuxError`] is written once
+/// (`[LAW:one-source-of-truth]`).
 pub(crate) enum ReadEnd {
     Eof,
     Failed(io::Error),
@@ -110,11 +138,6 @@ enum Side {
     Open {
         commands: Box<dyn Write + Send>,
         reader: JoinHandle<()>,
-        /// Set by [`Connection::close`] before it drops `commands`: the one
-        /// writer of "this side ended the link", read by the reader when
-        /// it classifies the EOF that follows. Without it a local close
-        /// would reach the sink as tmux exiting.
-        disposed: Arc<AtomicBool>,
     },
     Closed,
 }
@@ -128,6 +151,7 @@ enum Side {
 pub struct Connection {
     side: Side,
     replies: Receiver<Reply>,
+    abort: Abort,
     state: ConnectionState,
 }
 
@@ -163,7 +187,9 @@ impl Connection {
             },
             Err(err) => return Err(err),
         };
-        Ok((Self::start(commands, link, Box::new(events)), opened))
+        let kill = commands.kill_handle();
+        let connection = Self::start(commands, link, Box::new(events), move || kill.kill());
+        Ok((connection, opened))
     }
 
     /// Spawn and read the greeting. A failure here drops the writer, which
@@ -171,7 +197,7 @@ impl Connection {
     fn spawn(
         args: &[&str],
         options: &SpawnOptions,
-    ) -> Result<(impl Write + Send + 'static, Link), TmuxError> {
+    ) -> Result<(crate::transport::ChildWriter, Link), TmuxError> {
         let (commands, output) = spawn_halves(args, options).map_err(TmuxError::Spawn)?;
         let link = Link::greet(Box::new(output))?;
         Ok((commands, link))
@@ -181,52 +207,56 @@ impl Connection {
     /// greeting block. This is how a test stands in for tmux; real usage
     /// goes through [`Connection::open`].
     ///
-    /// Contract on the halves: dropping `commands` must end `output` — the
-    /// reader thread blocks in `read()` and nothing else can return it. The
-    /// spawned child honors it by dying; a scripted stand-in honors it by
-    /// delivering EOF.
+    /// Contract on the halves: dropping `commands` must end `output`, as
+    /// must calling `end` from any thread, and a write to `commands` that
+    /// fails must be followed by `output` ending — the reader thread blocks
+    /// in `read()` and nothing else can return it, and the reader is the one
+    /// classifier of how a link ended. The spawned child honors all three by
+    /// dying; a scripted stand-in honors them by delivering EOF.
     pub fn over(
         commands: impl Write + Send + 'static,
         output: impl Read + Send + 'static,
         events: impl FnMut(Event) + Send + 'static,
+        end: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, TmuxError> {
         let link = Link::greet(Box::new(output))?;
-        Ok(Self::start(commands, link, Box::new(events)))
+        Ok(Self::start(commands, link, Box::new(events), end))
     }
 
-    /// Hand a greeted link its sink and its thread. Whatever arrived behind
-    /// the greeting terminator is delivered first — events to the sink on
-    /// this thread, a further settled block to the reply channel, where
-    /// [`Connection::idle`] will find it for the protocol violation it is.
-    fn start(commands: impl Write + Send + 'static, link: Link, mut events: EventSink) -> Self {
+    /// Hand a greeted link its sink and its thread. The reader delivers
+    /// whatever arrived behind the greeting terminator first, so the sink is
+    /// only ever called from that thread.
+    fn start(
+        commands: impl Write + Send + 'static,
+        link: Link,
+        events: EventSink,
+        end: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let (reply_tx, replies) = mpsc::channel();
-        let Link {
-            output,
-            codec,
-            demux,
-            behind_greeting,
-        } = link;
-        for routed in behind_greeting {
-            deliver(routed, &reply_tx, &mut events);
-        }
-        let disposed = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let disposed = disposed.clone();
-            thread::spawn(move || pump(output, codec, demux, reply_tx, events, disposed))
+        let abort = Abort {
+            disposed: Arc::new(AtomicBool::new(false)),
+            end: Arc::new(end),
         };
+        let disposed = abort.disposed.clone();
+        let reader = thread::spawn(move || pump(link, reply_tx, events, disposed));
         Self {
             side: Side::Open {
                 commands: Box::new(commands),
                 reader,
-                disposed,
             },
             replies,
+            abort,
             state: ConnectionState::Ready,
         }
     }
 
     pub fn state(&self) -> ConnectionState {
         self.state
+    }
+
+    /// A handle that ends this connection's link from another thread.
+    pub fn abort_handle(&self) -> Abort {
+        self.abort.clone()
     }
 
     /// The single command-dispatch path (`[LAW:single-enforcer]`): send
@@ -244,23 +274,22 @@ impl Connection {
 
     /// Nothing may be waiting on the reply channel while no command is in
     /// flight: a settled block there is tmux breaking the one-block-per-
-    /// command rule, after which positional correlation is lost, and an
-    /// ending there is the reader having already reported a close that no
-    /// call had yet observed. Both are found here, before a command is
-    /// written against them (`[LAW:no-silent-failure]`).
+    /// command rule, and an ending there is the reader having already
+    /// reported a close that no call had yet observed. Both are found here,
+    /// before a command is written against them (`[LAW:no-silent-failure]`).
     fn idle(&mut self) -> Result<(), TmuxError> {
         match self.replies.try_recv() {
             Err(TryRecvError::Empty) => Ok(()),
-            Ok(Reply::Settled(reply)) => Err(TmuxError::UnsolicitedReply(Box::new(reply))),
+            Ok(Reply::Settled(reply)) => Err(self.unsolicited(reply)),
             Ok(Reply::Ended(end)) => Err(self.ended(end)),
             Err(TryRecvError::Disconnected) => Err(self.reader_vanished()),
         }
     }
 
-    /// A write that fails after the reader has reported its ending is that
-    /// ending — tmux left, and the dead pipe is how the writer found out —
-    /// so the reported reason wins over the write error; and a block that
-    /// settled in between is reported, not lost with the write.
+    /// A write that fails means the link is ending, and the reader is the
+    /// one that says how (see the contract on [`Connection::over`]): wait
+    /// for its report rather than guess from this side's error. A block that
+    /// settles first is reported, not lost with the write.
     fn send(&mut self, command: &CommandLine) -> Result<(), TmuxError> {
         let Side::Open { commands, .. } = &mut self.side else {
             return Err(TmuxError::NotReady(self.state));
@@ -268,20 +297,14 @@ impl Connection {
         let written = commands
             .write_all(command.wire())
             .and_then(|()| commands.flush());
-        let Err(err) = written else {
-            return Ok(());
-        };
-        Err(match self.replies.try_recv() {
-            Ok(Reply::Ended(end)) => self.ended(end),
-            Ok(Reply::Settled(reply)) => {
-                self.state = self.state.closed(CloseReason::TransportError);
-                TmuxError::UnsolicitedReply(Box::new(reply))
-            }
-            Err(_) => {
-                self.state = self.state.closed(CloseReason::TransportError);
-                TmuxError::Send(err)
-            }
-        })
+        match written {
+            Ok(()) => Ok(()),
+            Err(_) => Err(match self.replies.recv() {
+                Ok(Reply::Settled(reply)) => self.unsolicited(reply),
+                Ok(Reply::Ended(end)) => self.ended(end),
+                Err(mpsc::RecvError) => self.reader_vanished(),
+            }),
+        }
     }
 
     /// The oldest reply not yet taken, waiting for the reader if none has
@@ -302,6 +325,13 @@ impl Connection {
         end.error()
     }
 
+    /// A block that settled with nothing in flight: positional correlation
+    /// is lost for good, so the connection closes on it.
+    fn unsolicited(&mut self, reply: Settled) -> TmuxError {
+        self.state = self.state.closed(CloseReason::Protocol);
+        TmuxError::UnsolicitedReply(Box::new(reply))
+    }
+
     /// The reader always reports its ending before it exits, so a channel
     /// that disconnected without one means the thread died — a panic — and
     /// the read side is gone with it.
@@ -311,15 +341,15 @@ impl Connection {
     }
 
     /// Local-side teardown: drops the command writer — which ends the read
-    /// side, see [`Connection::over`] — and joins the reader. Idempotent.
+    /// side, see [`Connection::over`] — and joins the reader. Idempotent. An
+    /// ending the reader had already reported stays the reason (the first
+    /// close wins); only a link still up becomes `Disposed`.
     pub fn close(&mut self) {
-        if let Side::Open {
-            commands,
-            reader,
-            disposed,
-        } = std::mem::replace(&mut self.side, Side::Closed)
-        {
-            disposed.store(true, Ordering::SeqCst);
+        if let Side::Open { commands, reader } = std::mem::replace(&mut self.side, Side::Closed) {
+            if let Ok(Reply::Ended(end)) = self.replies.try_recv() {
+                self.ended(end);
+            }
+            self.abort.disposed.store(true, Ordering::SeqCst);
             drop(commands);
             // A panic on the reader thread has already been raised louder
             // than here, and the thread is gone either way.
@@ -423,42 +453,39 @@ fn read_routed(
 }
 
 /// One routed message to its destination: a reply to the channel, anything
-/// else to the sink. `false` once the channel's receiver — the
-/// [`Connection`] — is gone, and with it anyone to report to.
-fn deliver(routed: Routed, replies: &Sender<Reply>, events: &mut EventSink) -> bool {
+/// else to the sink. The channel's receiver is the [`Connection`], which
+/// joins this thread before it can go away, so a reply send cannot fail
+/// while there is anything to report to.
+fn deliver(routed: Routed, replies: &Sender<Reply>, events: &mut EventSink) {
     match routed {
-        Routed::Reply(reply) => replies.send(Reply::Settled(reply)).is_ok(),
-        Routed::Notification(msg) => {
-            events(Event::Notification(msg));
-            true
+        Routed::Reply(reply) => {
+            let _ = replies.send(Reply::Settled(reply));
         }
-        Routed::PaneOutput(pane, data) => {
-            events(Event::PaneOutput(pane, data));
-            true
-        }
+        Routed::Notification(msg) => events(Event::Notification(msg)),
+        Routed::PaneOutput(pane, data) => events(Event::PaneOutput(pane, data)),
     }
 }
 
-/// The reader thread: read, decode, route, until the read side ends; then
-/// report the ending — to the reply channel first, so a caller whose sink
-/// wakes it finds the ending waiting on its next call rather than a dead
-/// pipe — and to the sink, and stop.
-fn pump(
-    mut output: Box<dyn Read + Send>,
-    mut codec: Codec,
-    mut demux: Demux,
-    replies: Sender<Reply>,
-    mut events: EventSink,
-    disposed: Arc<AtomicBool>,
-) {
+/// The reader thread: deliver what arrived behind the greeting, then read,
+/// decode, route, until the read side ends; then report the ending — to
+/// the reply channel first, so a caller whose sink wakes it finds the
+/// ending waiting on its next call rather than a dead pipe — and to the
+/// sink, and stop. An EOF this side asked for is `Disposed`, whatever the
+/// pipe said.
+fn pump(link: Link, replies: Sender<Reply>, mut events: EventSink, disposed: Arc<AtomicBool>) {
+    let Link {
+        mut output,
+        mut codec,
+        mut demux,
+        behind_greeting,
+    } = link;
+    for routed in behind_greeting {
+        deliver(routed, &replies, &mut events);
+    }
     let end = loop {
-        let mut connected = true;
         let read = read_routed(&mut output, &mut codec, &mut demux, |r| {
-            connected &= deliver(r, &replies, &mut events)
+            deliver(r, &replies, &mut events)
         });
-        if !connected {
-            return;
-        }
         if let Err(end) = read {
             break end;
         }

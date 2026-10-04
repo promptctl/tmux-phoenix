@@ -8,8 +8,11 @@
 //! a command that takes a window or pane target reads `=main` as an exact
 //! *window* name and falls back to a session prefix match (verified live on
 //! tmux 3.7b: `list-panes -t =s2-lon` lists `s2-longer`, `-t =s2-lon:` is
-//! "can't find session"). The typed target renders both unconditionally so
-//! no caller can forget either.
+//! "can't find session"), and the window part needs its own `=` or an
+//! absent index falls through to name matching (verified live: with no
+//! window 7 but one named `7-logs`, `=main:7` lists it and `=main:=7` is
+//! "can't find window"). The typed target renders every one of these
+//! unconditionally so no caller can forget any.
 
 use std::fmt;
 
@@ -93,7 +96,7 @@ impl fmt::Display for Target {
         match self {
             Target::Session(session) => write!(f, "={session}:"),
             Target::SessionId(session) => write!(f, "${}", session.0),
-            Target::Window(session, index) => write!(f, "={session}:{}", index.0),
+            Target::Window(session, index) => write!(f, "={session}:={}", index.0),
             Target::WindowId(window) => write!(f, "@{}", window.0),
             Target::Pane(pane) => write!(f, "%{}", pane.0),
         }
@@ -132,7 +135,7 @@ mod tests {
         assert_eq!(Target::SessionId(SessionId(2)).to_string(), "$2");
         assert_eq!(
             Target::Window(name("main"), WindowIndex(3)).to_string(),
-            "=main:3"
+            "=main:=3"
         );
         assert_eq!(Target::WindowId(WindowId(4)).to_string(), "@4");
         assert_eq!(Target::Pane(PaneId(7)).to_string(), "%7");

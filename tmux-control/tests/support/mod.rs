@@ -151,6 +151,7 @@ enum Feed {
 
 /// The test's handle on a scripted link: feed tmux's side of the
 /// conversation, or end it.
+#[derive(Clone)]
 pub struct Script {
     feed: Sender<Feed>,
 }

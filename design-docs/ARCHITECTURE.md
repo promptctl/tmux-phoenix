@@ -159,8 +159,8 @@ phoenix's to kill; whether a stray disappears is the user's tmux configuration
 The codec, `ServerMessage`, `CommandLine`, `ConnectionState`, and `execute` are
 unchanged by this work. Three additions make the layers above it pure:
 
-**A connection opens on any server.** `Connection::open(socket, attach: Attach) ->
-(Connection, Opened)` where `Attach::{Existing, OrCreate { name }}` is what the caller
+**A connection opens on any server.** `Connection::open(socket, attach: Attach, events)
+-> (Connection, Opened)` where `Attach::{Existing, OrCreate { name }}` is what the caller
 permits and `Opened::{Attached, Created(SessionName)}` is what happened. `Existing`
 runs `tmux -C attach-session` and fails with a typed `NoSessions` error — tmux presents
 "no server on this socket" and "a server holding no sessions" identically (verified live
@@ -181,14 +181,17 @@ Closed(CloseReason)}` to the sink the caller gave `open`; `execute` correlates r
 off the same stream. The sink is the caller's, so the crate holds no queue on anyone's
 behalf: a caller that wants to react to notifications while idle forwards to a channel
 of its own and *waits on that*, optionally with a deadline; a caller that only executes
-passes `drop`. The heartbeat command and the poll interval disappear
+passes `drop`. The sink is only ever called from the reader thread. The heartbeat command and the poll interval disappear
 (`[LAW:no-ambient-temporal-coupling]`: the one owner of "when does a notification
 arrive" is the reader).
 
 **Typed targets.** `Target::{Session(SessionName), SessionId, Window(SessionName,
 WindowIndex), WindowId, Pane(PaneId)}` renders to tmux's target syntax in one place,
-exact-match (`=name:` — the trailing colon is what keeps a window- or pane-taking
-command from prefix-matching the session) where tmux allows it. `split-window`/`new-window` return the created id (`-P -F
+exact-match (`=name:` and `=name:=index` — the trailing colon is what keeps a window- or
+pane-taking command from prefix-matching the session, and the second `=` is what keeps an
+absent index from matching a window by name) where tmux allows it. `Connection::abort_handle()`
+ends the link from any thread, releasing a caller blocked in `execute` on a server that
+stopped answering. `split-window`/`new-window` return the created id (`-P -F
 '#{pane_id}'`, verified live) as a typed value.
 
 ---

@@ -19,7 +19,7 @@ pub mod transport;
 pub mod version;
 
 pub use client::{
-    Attach, Client, CloseReason, CommandOutput, Connection, ConnectionState, Event, Execute,
+    Abort, Attach, Client, CloseReason, CommandOutput, Connection, ConnectionState, Event, Execute,
     Opened, TmuxError,
 };
 pub use commands::{

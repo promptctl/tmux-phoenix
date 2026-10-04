@@ -218,6 +218,16 @@ impl Write for ChildWriter {
     }
 }
 
+impl ChildWriter {
+    /// A handle that can terminate the child from another thread — which
+    /// ends the output half for whoever is reading it.
+    pub fn kill_handle(&self) -> KillHandle {
+        KillHandle {
+            child: self.child.clone(),
+        }
+    }
+}
+
 impl Drop for ChildWriter {
     fn drop(&mut self) {
         terminate(&self.child);

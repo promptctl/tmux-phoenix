@@ -40,14 +40,25 @@ fn channel_sink() -> (impl FnMut(Event) + Send + 'static, Receiver<Event>) {
 fn connected() -> (Connection, Script, support::Sent, Receiver<Event>) {
     let (writer, reader, script, sent) = scripted(vec![GREETING]);
     let (sink, events) = channel_sink();
-    let connection = Connection::over(writer, reader, sink).expect("greeting settles");
+    let connection = over(writer, reader, &script, sink).expect("greeting settles");
     (connection, script, sent, events)
+}
+
+/// `Connection::over` on a scripted link, whose abort is the script's hangup.
+fn over(
+    writer: support::ScriptWriter,
+    reader: support::ScriptReader,
+    script: &Script,
+    sink: impl FnMut(Event) + Send + 'static,
+) -> Result<Connection, TmuxError> {
+    let hangup = script.clone();
+    Connection::over(writer, reader, sink, move || hangup.hangup())
 }
 
 /// A greeting-only `over`, for the tests about what the greeting means.
 fn over_scripted(chunks: Vec<&str>) -> Result<Connection, TmuxError> {
-    let (writer, reader, _script, _sent) = scripted(chunks);
-    Connection::over(writer, reader, drop::<Event>)
+    let (writer, reader, script, _sent) = scripted(chunks);
+    over(writer, reader, &script, drop::<Event>)
 }
 
 fn soon() -> Duration {
@@ -82,9 +93,9 @@ fn a_failed_greeting_delivers_nothing_to_the_sink() {
     // The `%exit` behind a refused attach belongs to a process that never
     // became the caller's connection; a daemon counting `Closed`s must not
     // see one here.
-    let (writer, reader, _script, _sent) = scripted(vec![NO_SESSIONS_GREETING]);
+    let (writer, reader, script, _sent) = scripted(vec![NO_SESSIONS_GREETING]);
     let (sink, events) = channel_sink();
-    let err = Connection::over(writer, reader, sink).unwrap_err();
+    let err = over(writer, reader, &script, sink).unwrap_err();
     assert!(matches!(err, TmuxError::NoSessions), "got {err:?}");
     assert_eq!(
         events.recv_timeout(Duration::from_millis(50)),
@@ -114,7 +125,7 @@ fn any_other_greeting_error_is_the_command_failure_it_is() {
 fn eof_before_the_greeting_is_transport_closed() {
     let (writer, reader, script, _sent) = scripted(vec![]);
     script.hangup();
-    let err = Connection::over(writer, reader, drop::<Event>).unwrap_err();
+    let err = over(writer, reader, &script, drop::<Event>).unwrap_err();
     assert!(matches!(err, TmuxError::TransportClosed), "got {err:?}");
 }
 
@@ -197,6 +208,54 @@ fn a_block_that_settles_with_nothing_in_flight_is_a_protocol_failure() {
         }
         other => panic!("expected TmuxError::UnsolicitedReply, got {other:?}"),
     }
+    // Correlation is gone for good, so the connection is too.
+    assert_eq!(
+        connection.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::Protocol
+        }
+    );
+    assert!(matches!(
+        connection.execute(&line("anything", NO_ARGS)),
+        Err(TmuxError::NotReady(ConnectionState::Closed { .. }))
+    ));
+}
+
+#[test]
+fn an_abort_from_another_thread_releases_a_blocked_execute_as_disposed() {
+    let (mut connection, _script, _sent, events) = connected();
+    let abort = connection.abort_handle();
+    let aborter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        abort.abort();
+    });
+
+    // Nothing is ever fed, so only the abort can return this.
+    let err = connection.execute(&line("anything", NO_ARGS)).unwrap_err();
+    aborter.join().unwrap();
+    assert!(matches!(err, TmuxError::TransportClosed), "got {err:?}");
+    assert_eq!(
+        connection.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::Disposed
+        }
+    );
+    assert_eq!(next(&events), Event::Closed(CloseReason::Disposed));
+}
+
+#[test]
+fn close_after_tmux_left_keeps_exit_as_the_reason() {
+    let (mut connection, script, _sent, events) = connected();
+    script.hangup();
+    assert_eq!(next(&events), Event::Closed(CloseReason::Exit));
+
+    connection.close();
+    assert_eq!(
+        connection.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::Exit
+        }
+    );
 }
 
 #[test]
@@ -252,10 +311,10 @@ fn pane_output_is_its_own_event() {
 fn events_behind_the_greeting_terminator_reach_the_sink() {
     // Whatever tmux wrote in the same read as the greeting's `%end` was
     // decoded before the sink existed; it is delivered, not dropped.
-    let (writer, reader, _script, _sent) =
+    let (writer, reader, script, _sent) =
         scripted(vec!["%begin 1 0 0\n%end 1 0 0\n%sessions-changed\n"]);
     let (sink, events) = channel_sink();
-    let _connection = Connection::over(writer, reader, sink).expect("greeting settles");
+    let _connection = over(writer, reader, &script, sink).expect("greeting settles");
     assert_eq!(
         next(&events),
         Event::Notification(ServerMessage::SessionsChanged)

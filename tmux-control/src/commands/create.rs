@@ -50,7 +50,7 @@ pub fn new_session<C: Execute>(
     })
 }
 
-/// `new-window -d -t =<session>:<index> [-n <name>] [-c <cwd>]`. An occupied
+/// `new-window -d -t =<session>:=<index> [-n <name>] [-c <cwd>]`. An occupied
 /// index is tmux's "index N in use" error, returned as the
 /// [`TmuxError::Command`] it is.
 pub fn new_window<C: Execute>(

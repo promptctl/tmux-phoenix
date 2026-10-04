@@ -41,7 +41,7 @@ mod demux;
 mod error;
 mod event;
 
-pub use connection::{Attach, Connection, EventSink, Opened};
+pub use connection::{Abort, Attach, Connection, EventSink, Opened};
 pub use connection_state::{CloseReason, ConnectionState};
 pub use error::TmuxError;
 pub use event::Event;
@@ -265,6 +265,7 @@ impl<T: Transport> Client<T> {
         // one-block-per-command rule; reported before a command is written
         // against it, as `Connection::idle` does (`[LAW:no-silent-failure]`).
         if let Some(stray) = self.replies.pop_front() {
+            self.state = self.state.closed(CloseReason::Protocol);
             return Err(TmuxError::UnsolicitedReply(Box::new(stray)));
         }
         self.send_or_close(command)?;

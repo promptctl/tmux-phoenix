@@ -6,7 +6,7 @@ use std::fmt;
 use std::io;
 
 /// Everything `Client::execute`/`connect`/`reconnect`,
-/// `Connection::open`/`execute`/`wait`, and the free functions in
+/// `Connection::open`/`execute`, and the free functions in
 /// [`crate::commands`] can fail with.
 #[derive(Debug)]
 pub enum TmuxError {

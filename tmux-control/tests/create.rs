@@ -72,7 +72,7 @@ fn new_window_targets_the_exact_session_and_index() {
     );
     assert_eq!(
         *state.sent.borrow(),
-        vec![r##"new-window -d -t =ab:5 -n five -P -F "#{window_id} #{pane_id}""##.to_owned()]
+        vec![r##"new-window -d -t =ab:=5 -n five -P -F "#{window_id} #{pane_id}""##.to_owned()]
     );
 }
 
