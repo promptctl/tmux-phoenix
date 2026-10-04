@@ -381,7 +381,9 @@ session out from under it.
 `phoenix-store` owns the save dir (`${XDG_DATA_HOME}/tmux-phoenix/`) and is its single
 writer (`[LAW:single-enforcer]`): `Store::save` takes an exclusive `flock` on
 `${store_dir}/.lock` before choosing a generation id and holds it through prune, so a
-manual `phoenix save` and the daemon's save run one at a time. How long a save waits
+manual `phoenix save` and the daemon's save run one at a time. Readers take no lock:
+a read lists the generation ids, reads, and lists again, and runs again if a save
+landed in between, so it sees one state of the store and never holds a save out. How long a save waits
 for the lock is a value its caller passes, not a mode: `phoenix save` waits up to 10 s,
 then fails naming the contention; the daemon does not wait, so a contended cycle fails
 without counting as a save and its next poll tries again. A generation's id is its

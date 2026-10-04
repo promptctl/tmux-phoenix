@@ -6,13 +6,14 @@
 //! *is* latest; there is no pointer to keep in step with it
 //! (`[LAW:one-source-of-truth]`).
 //!
-//! **One lock, two modes.** Every save runs under an exclusive `flock` on
-//! the store directory (entered through a turnstile, so readers cannot
-//! starve it), from the temp write through prune, so saves
-//! from separate processes (a manual `phoenix save`, the daemon) run one at
-//! a time. Every reader takes the same lock shared, so a listing is a
-//! consistent view and [`StoreError::NoLatest`] can only mean "no
-//! generation exists" — never "a prune ran between two reads".
+//! **Saves are serialized; reads take no lock.** Every save runs under an
+//! exclusive `flock` on `.lock` in the store dir, from the temp write
+//! through prune, so saves from separate processes (a manual `phoenix
+//! save`, the daemon) run one at a time. A read lists the generation ids,
+//! reads, and lists again: an unchanged id set means no save landed in
+//! between and the answer is of one state of the store, so
+//! [`StoreError::NoLatest`] can only mean "no generation exists" — never "a
+//! prune ran between two reads" (see `Store::read_consistent`).
 
 use std::fs;
 use std::io;
@@ -34,7 +35,7 @@ const GENERATION_SUFFIX: &str = ".phnx";
 /// first save, since nothing reads it any more.
 const RETIRED_LATEST_NAME: &str = "latest";
 const BLOBS_DIR: &str = "blobs";
-const TURNSTILE_NAME: &str = ".lock";
+const LOCK_NAME: &str = ".lock";
 /// How often a waiting save retries the lock. Granularity of the caller's
 /// `wait` only — correctness rests on the lock, never on this interval.
 const LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -100,12 +101,6 @@ pub struct GenerationInfo {
     pub tag: Option<Tag>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LockMode {
-    Shared,
-    Exclusive,
-}
-
 impl Store {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -159,7 +154,7 @@ impl Store {
         // [LAW:single-enforcer] the one place saves are serialized; held until
         // this function returns, so id choice, publish and prune are atomic
         // with respect to every other save and every reader.
-        let _lock = self.lock(LockMode::Exclusive, wait)?;
+        let _lock = self.lock(wait)?;
 
         // Everything that can refuse this save runs before anything is
         // published, so a save that returns `Err` has written no generation.
@@ -226,74 +221,67 @@ impl Store {
         }
     }
 
-    /// Takes this store's lock in `mode`, released when the returned handle
-    /// closes. The lock is on the store directory itself, and is entered
-    /// through a turnstile every locker passes one at a time.
-    ///
-    /// [LAW:no-ambient-temporal-coupling] The turnstile is what orders saves
-    /// against readers. `flock` grants a shared lock whenever no exclusive
-    /// one is *held*, so readers that overlap would keep a waiting save out
-    /// for as long as they kept arriving (seen live: four looping readers
-    /// starved eight saves past a 30s wait). A locker holds the turnstile
-    /// until it holds the directory, so a save waiting for the readers
-    /// already inside keeps every later reader queued behind it, and its
-    /// wait is bounded by reads in progress rather than by reads to come.
-    fn lock(&self, mode: LockMode, wait: Duration) -> Result<fs::File, StoreError> {
+    /// Takes this store's save lock, released when the returned file closes.
+    /// The lock file is never deleted: unlinking it while another holder
+    /// has or awaits the old inode would let two holders each lock a
+    /// different file.
+    fn lock(&self, wait: Duration) -> Result<fs::File, StoreError> {
+        let path = self.dir.join(LOCK_NAME);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
         let deadline = Instant::now() + wait;
-        let turnstile = self.open_turnstile()?;
-        let directory = fs::File::open(&self.dir)?;
-        let held = acquire(&turnstile, LockMode::Exclusive, deadline)?
-            && acquire(&directory, mode, deadline)?;
-        // `turnstile` closes on return either way: released once the
-        // directory is held, or when this locker gives up.
-        held.then_some(directory)
-            .ok_or_else(|| StoreError::Contended {
-                lock: self.dir.clone(),
-                waited: wait,
-            })
-    }
-
-    /// The turnstile file is opened for reading (a reader needs no write
-    /// access to a store it can list) and made only where it is missing. It
-    /// is never deleted: unlinking it while another locker holds or awaits
-    /// the old inode would let two lockers each pass a different turnstile.
-    fn open_turnstile(&self) -> io::Result<fs::File> {
-        let path = self.dir.join(TURNSTILE_NAME);
-        match fs::File::open(&path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path),
-            opened => opened,
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+                Err(fs::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(StoreError::Contended {
+                            lock: path,
+                            waited: wait,
+                        });
+                    }
+                    std::thread::sleep(remaining.min(LOCK_RETRY));
+                }
+            }
         }
     }
 
-    /// Readers wait for a save in progress rather than racing it. A save
-    /// holds the lock only for its own writes and prune, so this bounds the
-    /// wait by the slowest disk, not by anything a reader could choose.
-    const READ_WAIT: Duration = Duration::from_secs(30);
-
-    fn read_lock(&self) -> Result<fs::File, StoreError> {
-        fs::create_dir_all(&self.dir)?;
-        self.lock(LockMode::Shared, Self::READ_WAIT)
+    /// Runs `read` against one state of the store, with no lock.
+    ///
+    /// [LAW:no-ambient-temporal-coupling] A save changes the store in two
+    /// ways only: it publishes an immutable generation whose id is above
+    /// every other, and it removes generations. So the set of ids names the
+    /// store's state exactly: if it is the same after `read` as before,
+    /// nothing was published or pruned while `read` ran and its answer —
+    /// success or failure — is of that one state. If it moved, the answer
+    /// may be of no state at all, and the read runs again. A reader
+    /// therefore never holds a save out, never needs to write to the store,
+    /// and repeats only when a save completes during its read.
+    fn read_consistent<T>(
+        &self,
+        read: impl Fn(&[GenerationId]) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        loop {
+            let before = self.generation_ids_desc()?;
+            let answer = read(&before);
+            if self.generation_ids_desc()? == before {
+                return answer;
+            }
+        }
     }
 
-    /// The newest generation. Under the shared lock from listing through
-    /// reading, so a prune cannot take the file out from under it.
+    /// The newest generation.
     pub fn load_latest(&self) -> Result<Snapshot, StoreError> {
-        let _lock = self.read_lock()?;
-        let newest = self
-            .generation_ids_desc()?
-            .first()
-            .copied()
-            .ok_or(StoreError::NoLatest)?;
-        self.read_generation(newest)
+        self.read_consistent(|ids| self.read_generation(*ids.first().ok_or(StoreError::NoLatest)?))
     }
 
     pub fn load(&self, generation: GenerationId) -> Result<Snapshot, StoreError> {
-        let _lock = self.read_lock()?;
-        self.read_generation(generation)
+        self.read_consistent(|_| self.read_generation(generation))
     }
 
     fn read_generation(&self, generation: GenerationId) -> Result<Snapshot, StoreError> {
@@ -349,21 +337,17 @@ impl Store {
         }
     }
 
-    fn headers_desc(&self) -> Result<Vec<GenerationInfo>, StoreError> {
-        self.generation_ids_desc()?
-            .into_iter()
-            .map(|id| {
-                self.generation_info(id)
-                    .map_err(|unreadable| unreadable.error)
-            })
-            .collect()
-    }
-
     /// Header-only summary of every generation, newest first — doesn't
     /// decode any body. The first entry is latest.
     pub fn list(&self) -> Result<Vec<GenerationInfo>, StoreError> {
-        let _lock = self.read_lock()?;
-        self.headers_desc()
+        self.read_consistent(|ids| {
+            ids.iter()
+                .map(|&id| {
+                    self.generation_info(id)
+                        .map_err(|unreadable| unreadable.error)
+                })
+                .collect()
+        })
     }
 }
 
@@ -400,28 +384,6 @@ fn prune(retention: Retention, generations: impl Iterator<Item = GenerationInfo>
         }
     }
     (pruned, errors)
-}
-
-/// Polls `file`'s `flock` in `mode` until it is held (`true`) or `deadline`
-/// has passed (`false`).
-fn acquire(file: &fs::File, mode: LockMode, deadline: Instant) -> io::Result<bool> {
-    loop {
-        let attempt = match mode {
-            LockMode::Shared => file.try_lock_shared(),
-            LockMode::Exclusive => file.try_lock(),
-        };
-        match attempt {
-            Ok(()) => return Ok(true),
-            Err(fs::TryLockError::Error(e)) => return Err(e),
-            Err(fs::TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(false);
-                }
-                std::thread::sleep(remaining.min(LOCK_RETRY));
-            }
-        }
-    }
 }
 
 fn generation_id_from_file_name(name: &str) -> Option<GenerationId> {
@@ -677,38 +639,36 @@ mod tests {
     }
 
     #[test]
-    fn a_save_is_not_starved_by_readers_that_always_overlap() {
-        // Two readers hold the shared lock in alternation with overlap, so
-        // at no instant is the directory unlocked. Without the turnstile an
-        // exclusive poll never finds a gap however long it waits.
-        let dir = TestDir::new("starvation");
+    fn a_read_that_a_save_lands_in_the_middle_of_is_run_again() {
+        let dir = TestDir::new("read-retried");
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(5));
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            for offset in [0, 25] {
-                let stop = &stop;
-                let dir = &dir.0;
-                scope.spawn(move || {
-                    let store = Store::new(dir);
-                    std::thread::sleep(Duration::from_millis(offset));
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let held = store.lock(LockMode::Shared, Duration::from_secs(10));
-                        std::thread::sleep(Duration::from_millis(50));
-                        drop(held);
-                    }
-                });
-            }
-            std::thread::sleep(Duration::from_millis(200));
-            let outcome = store.save(
-                &sample_snapshot(1_700_000_100),
-                None,
-                keep(5),
-                Duration::from_secs(5),
-            );
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            outcome.expect("a save must get past overlapping readers");
-        });
+        let calls = std::cell::Cell::new(0);
+        let seen = store
+            .read_consistent(|ids| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    save(&store, 1_700_000_100, keep(5));
+                }
+                Ok(ids.len())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 2, "the first answer was of a store mid-save");
+        assert_eq!(seen, 2);
+    }
+
+    #[test]
+    fn a_reader_holds_no_lock_a_save_must_wait_for_and_needs_no_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("read-only-store");
+        let store = Store::new(&dir.0);
+        save(&store, 1_700_000_000, keep(5));
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o555)).unwrap();
+        let listed = store.list();
+        let loaded = store.load_latest();
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(listed.unwrap().len(), 1);
+        loaded.unwrap();
     }
 
     #[test]
@@ -717,7 +677,7 @@ mod tests {
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(5));
 
-        let holder = fs::File::open(&dir.0).unwrap();
+        let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
         holder.lock().unwrap();
         for wait in [Duration::ZERO, Duration::from_millis(50)] {
             let err = store
@@ -735,7 +695,7 @@ mod tests {
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(5));
 
-        let holder = fs::File::open(&dir.0).unwrap();
+        let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
         holder.lock().unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
