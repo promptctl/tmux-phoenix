@@ -284,14 +284,22 @@ group leader that exited between the two reads — is a loud, per-pane
 
 ---
 
-## 7. `phoenix-store` — one clock, readers inside the lock
+## 7. `phoenix-store` — one clock, reads of one state
 
 - **`latest` is derived, not stored.** The generation with the highest id *is* latest;
   the symlink was a second representation of that fact and is removed. `load_latest`
   is `list().first()`.
-- **Readers share the lock the writer holds exclusively**, so a listing is a
-  consistent view and `NoLatest` can only mean "no generation exists" (closes
-  `tmux-store-i22` by construction).
+- **A read is of one state of the store, and takes no lock.** A save only publishes an
+  immutable generation above every other id, or removes generations, so the id set
+  names the store's state: a read lists the ids, reads, and lists again, and an
+  unchanged set means no save landed in between; a changed one runs the read again.
+  A listing is a consistent view and `NoLatest` can only mean "no generation exists"
+  (closes `tmux-store-i22` by construction). The first build of this section had
+  readers share the save lock; `flock` grants a shared lock whenever no exclusive one
+  is held, so overlapping readers starved saves (seen live, 2026-10-04), and the lock
+  was removed rather than repaired with a second one. A blob sweep must delete a
+  generation's file before its blobs, so a read that loses a blob also sees the id
+  set move.
 - **The header is the generation's identity:** `format_version, header_len, origin:
   Origin, captured_at, tag: Option<Tag>, body_len, checksum`. The header carries its
   own length so `tag` can vary and `list` still reads headers without decoding a body.
