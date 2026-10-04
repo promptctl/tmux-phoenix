@@ -13,6 +13,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use tmux_control::{Client, CommandLine, PaneId, ServerMessage, TmuxError, Transport};
 
 /// For a command that takes no arguments.
@@ -55,6 +57,160 @@ impl Drop for IsolatedTmux {
         // run of these tests used to deposit one more in /tmp permanently.
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// An isolated socket path with *no* server on it, for tests about reaching
+/// a server that may not exist. Whatever a test leaves running there is torn
+/// down session by session on drop — only ever session-scoped kills, the one
+/// form of teardown this repository allows.
+pub struct EmptySocket {
+    pub socket: String,
+}
+
+impl EmptySocket {
+    pub fn new(name: &str) -> Self {
+        let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
+        let _ = std::fs::remove_file(&socket);
+        Self { socket }
+    }
+
+    /// Every session name on this socket, as plain `tmux` sees it; empty
+    /// when no server runs.
+    pub fn sessions(&self) -> Vec<String> {
+        let output = std::process::Command::new("tmux")
+            .args(["-S", &self.socket, "list-sessions", "-F", "#{session_name}"])
+            .output()
+            .expect("failed to run tmux list-sessions");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Drop for EmptySocket {
+    fn drop(&mut self) {
+        for session in self.sessions() {
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    &self.socket,
+                    "kill-session",
+                    "-t",
+                    &format!("={session}"),
+                ])
+                .status();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// What the scripted output half delivers next. `Hangup` is EOF as a value,
+/// so a test can end the stream at any moment — and so the writer's drop can
+/// end it too, which is the contract `Connection::over` relies on, without
+/// the test having to drop anything in a particular order.
+enum Feed {
+    Bytes(Vec<u8>),
+    Hangup,
+}
+
+/// The test's handle on a scripted link: feed tmux's side of the
+/// conversation, or end it.
+pub struct Script {
+    feed: Sender<Feed>,
+}
+
+impl Script {
+    pub fn send(&self, chunk: &str) {
+        self.feed
+            .send(Feed::Bytes(chunk.as_bytes().to_vec()))
+            .expect("the reader is still running");
+    }
+
+    /// The server went away: the next read returns EOF.
+    pub fn hangup(&self) {
+        let _ = self.feed.send(Feed::Hangup);
+    }
+}
+
+/// Every command line the `Connection` wrote, readable after the writer has
+/// been moved into it. Shared across threads because the type must be `Send`
+/// for `Connection::over`.
+#[derive(Clone, Default)]
+pub struct Sent(Arc<Mutex<Vec<String>>>);
+
+impl Sent {
+    pub fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("sent lines poisoned").clone()
+    }
+}
+
+/// The command half of a scripted link. Holds one feeder so that dropping
+/// it hangs the output half up, exactly as killing the child does for a
+/// spawned `tmux`.
+pub struct ScriptWriter {
+    sent: Sent,
+    feed: Sender<Feed>,
+}
+
+impl io::Write for ScriptWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let line = String::from_utf8_lossy(buf);
+        self.sent
+            .0
+            .lock()
+            .expect("sent lines poisoned")
+            .push(line.trim_end_matches('\n').to_owned());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ScriptWriter {
+    fn drop(&mut self) {
+        let _ = self.feed.send(Feed::Hangup);
+    }
+}
+
+/// The output half of a scripted link: blocks until fed, like a pipe.
+pub struct ScriptReader {
+    feed: Receiver<Feed>,
+}
+
+impl io::Read for ScriptReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.feed.recv() {
+            Ok(Feed::Bytes(chunk)) => {
+                assert!(
+                    chunk.len() <= buf.len(),
+                    "test chunk larger than read buffer"
+                );
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+            Ok(Feed::Hangup) | Err(mpsc::RecvError) => Ok(0),
+        }
+    }
+}
+
+/// A scripted link for `Connection::over`, with `chunks` already queued as
+/// tmux's opening bytes (a greeting, typically). More can be fed through the
+/// returned [`Script`] at any time.
+pub fn scripted(chunks: Vec<&str>) -> (ScriptWriter, ScriptReader, Script, Sent) {
+    let (feed, output) = mpsc::channel();
+    let script = Script { feed: feed.clone() };
+    for chunk in chunks {
+        script.send(chunk);
+    }
+    let sent = Sent::default();
+    let writer = ScriptWriter {
+        sent: sent.clone(),
+        feed,
+    };
+    (writer, ScriptReader { feed: output }, script, sent)
 }
 
 /// One dispatched `%output`/`%extended-output` delivery: which pane, what

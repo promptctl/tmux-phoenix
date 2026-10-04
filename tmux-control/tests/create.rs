@@ -1,0 +1,256 @@
+//! The pane-creating commands and the typed targets they address, scripted
+//! for the exact command lines and the reply parsing, live for what tmux
+//! actually does with them.
+
+use tmux_control::commands::{new_session, new_window, split_window, NewSession, NewWindow};
+use tmux_control::{PaneId, SessionId, SessionName, Target, TmuxError, WindowId, WindowIndex};
+
+mod support;
+use support::{collecting_client, line, IsolatedTmux, MockTransport};
+
+fn name(raw: &str) -> SessionName {
+    SessionName::parse(raw).expect("addressable")
+}
+
+fn reply(body: &str) -> String {
+    format!("%begin 1 1 1\n{body}\n%end 1 1 1\n")
+}
+
+// ---------------------------------------------------------------------------
+// Command lines and reply parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_session_is_detached_and_asks_for_its_ids() {
+    let (transport, state) = MockTransport::new(vec![&reply("$2 @4 %5")]);
+    let (mut client, _collected) = collecting_client(transport);
+
+    let created = new_session(&mut client, &name("zz"), Some("first"), Some("/tmp")).unwrap();
+
+    assert_eq!(
+        created,
+        NewSession {
+            session: SessionId(2),
+            window: WindowId(4),
+            pane: PaneId(5),
+        }
+    );
+    assert_eq!(
+        *state.sent.borrow(),
+        vec![r##"new-session -d -s zz -n first -c /tmp -P -F "#{session_id} #{window_id} #{pane_id}""##.to_owned()]
+    );
+}
+
+#[test]
+fn optional_flags_are_absent_when_not_given() {
+    let (transport, state) = MockTransport::new(vec![&reply("$0 @0 %0")]);
+    let (mut client, _collected) = collecting_client(transport);
+
+    new_session(&mut client, &name("bare"), None, None).unwrap();
+
+    assert_eq!(
+        *state.sent.borrow(),
+        vec![
+            r##"new-session -d -s bare -P -F "#{session_id} #{window_id} #{pane_id}""##.to_owned()
+        ]
+    );
+}
+
+#[test]
+fn new_window_targets_the_exact_session_and_index() {
+    let (transport, state) = MockTransport::new(vec![&reply("@2 %2")]);
+    let (mut client, _collected) = collecting_client(transport);
+
+    let created = new_window(&mut client, &name("ab"), WindowIndex(5), Some("five"), None).unwrap();
+
+    assert_eq!(
+        created,
+        NewWindow {
+            window: WindowId(2),
+            pane: PaneId(2),
+        }
+    );
+    assert_eq!(
+        *state.sent.borrow(),
+        vec![r##"new-window -d -t =ab:5 -n five -P -F "#{window_id} #{pane_id}""##.to_owned()]
+    );
+}
+
+#[test]
+fn split_window_targets_the_pane_by_id() {
+    let (transport, state) = MockTransport::new(vec![&reply("%4")]);
+    let (mut client, _collected) = collecting_client(transport);
+
+    let created = split_window(&mut client, PaneId(0), Some("/tmp")).unwrap();
+
+    assert_eq!(created, PaneId(4));
+    assert_eq!(
+        *state.sent.borrow(),
+        // `%` is special to tmux's lexer, so the encoder quotes the pane id.
+        vec![r##"split-window -d -t "%0" -c /tmp -P -F "#{pane_id}""##.to_owned()]
+    );
+}
+
+#[test]
+fn a_reply_without_the_asked_for_ids_is_unexpected_not_a_pane() {
+    for body in ["", "%4 extra", "not-an-id", "@4"] {
+        let (transport, _state) = MockTransport::new(vec![&reply(body)]);
+        let (mut client, _collected) = collecting_client(transport);
+        let err = split_window(&mut client, PaneId(0), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TmuxError::UnexpectedReply {
+                    expected: "#{pane_id}",
+                    ..
+                }
+            ),
+            "{body:?} gave {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live tmux integration
+// ---------------------------------------------------------------------------
+
+fn connect(harness: &IsolatedTmux) -> tmux_control::Connection {
+    let (connection, _) = tmux_control::Connection::open(
+        &tmux_control::SpawnOptions {
+            socket: Some(harness.socket.clone()),
+            ..Default::default()
+        },
+        tmux_control::Attach::Existing,
+    )
+    .expect("open");
+    connection
+}
+
+/// `list-panes -t <target> -F <format>`, one string per line.
+fn list_panes(
+    connection: &mut tmux_control::Connection,
+    target: &Target,
+    format: &str,
+) -> Vec<String> {
+    let output = connection
+        .execute(&line(
+            "list-panes",
+            ["-t", &target.to_string(), "-F", format],
+        ))
+        .unwrap_or_else(|e| panic!("list-panes -t {target}: {e}"));
+    output
+        .lines
+        .iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect()
+}
+
+#[test]
+fn live_new_window_lands_at_the_index_asked_for_and_reports_its_ids() {
+    let harness = IsolatedTmux::new("new-window-index");
+    let mut connection = connect(&harness);
+    let session = name(&harness.session);
+
+    let created = new_window(
+        &mut connection,
+        &session,
+        WindowIndex(7),
+        Some("seven"),
+        Some("/tmp"),
+    )
+    .expect("new-window");
+
+    let target = Target::Window(session.clone(), WindowIndex(7));
+    assert_eq!(
+        list_panes(
+            &mut connection,
+            &target,
+            "#{window_id} #{pane_id} #{window_name} #{pane_current_path}"
+        ),
+        vec![format!(
+            "@{} %{} seven /private/tmp",
+            created.window.0, created.pane.0
+        )]
+        .into_iter()
+        .map(|s| s.replace(
+            "/private/tmp",
+            &std::fs::canonicalize("/tmp").unwrap().display().to_string()
+        ))
+        .collect::<Vec<_>>()
+    );
+
+    // The same index again is tmux's refusal, carried as the command error
+    // it is — not a silent relocation.
+    let err = new_window(&mut connection, &session, WindowIndex(7), None, None).unwrap_err();
+    match err {
+        TmuxError::Command { lines, .. } => {
+            assert_eq!(
+                lines,
+                vec![b"create window failed: index 7 in use".to_vec()]
+            )
+        }
+        other => panic!("expected TmuxError::Command, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_new_session_reports_the_ids_of_what_it_made() {
+    let harness = IsolatedTmux::new("new-session-ids");
+    let mut connection = connect(&harness);
+    let name = name(&format!("{}-second", harness.session));
+
+    let created = new_session(&mut connection, &name, Some("first"), None).expect("new-session");
+
+    assert_eq!(
+        list_panes(
+            &mut connection,
+            &Target::Session(name.clone()),
+            "#{session_id} #{window_id} #{pane_id} #{window_name}"
+        ),
+        vec![format!(
+            "${} @{} %{} first",
+            created.session.0, created.window.0, created.pane.0
+        )]
+    );
+    connection
+        .execute(&line(
+            "kill-session",
+            ["-t", &Target::Session(name).to_string()],
+        ))
+        .expect("kill-session");
+}
+
+#[test]
+fn live_an_exact_session_target_does_not_match_a_longer_name() {
+    let harness = IsolatedTmux::new("exact-target");
+    let mut connection = connect(&harness);
+    let longer = name(&format!("{}-x", harness.session));
+    new_session(&mut connection, &longer, None, None).expect("new-session");
+
+    let exact = Target::Session(name(&harness.session));
+    assert_eq!(
+        list_panes(&mut connection, &exact, "#{session_name}"),
+        vec![harness.session.clone()]
+    );
+
+    connection
+        .execute(&line(
+            "kill-session",
+            ["-t", &Target::Session(longer).to_string()],
+        ))
+        .expect("kill-session");
+}
+
+#[test]
+fn live_a_missing_exact_target_is_a_command_error() {
+    let harness = IsolatedTmux::new("missing-target");
+    let mut connection = connect(&harness);
+
+    let err = connection
+        .execute(&line(
+            "list-panes",
+            ["-t", &Target::Session(name("no-such-session")).to_string()],
+        ))
+        .unwrap_err();
+    assert!(matches!(err, TmuxError::Command { .. }), "got {err:?}");
+}

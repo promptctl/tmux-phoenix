@@ -213,10 +213,11 @@ fn query_tmux_version_fails_loudly_on_unparseable_reply() {
     let (mut client, _collected) = collecting_client(transport);
     let err = query_tmux_version(&mut client).unwrap_err();
     match err {
-        TmuxError::VersionProbeFailed { output } => {
+        TmuxError::UnexpectedReply { expected, output } => {
+            assert_eq!(expected, "#{version}");
             assert_eq!(output, vec![b"not a version".to_vec()]);
         }
-        other => panic!("expected VersionProbeFailed, got {other:?}"),
+        other => panic!("expected UnexpectedReply, got {other:?}"),
     }
 }
 

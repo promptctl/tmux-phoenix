@@ -148,7 +148,10 @@ fn is_connection_dead(e: &TmuxError) -> bool {
         | TmuxError::Command { .. }
         | TmuxError::Protocol { .. }
         | TmuxError::UnsupportedTmuxVersion { .. }
-        | TmuxError::VersionProbeFailed { .. } => false,
+        | TmuxError::UnexpectedReply { .. } => false,
+        // Only `Connection::open` returns these; no command this loop
+        // executes can.
+        TmuxError::Spawn(_) | TmuxError::NoSessions => false,
     }
 }
 

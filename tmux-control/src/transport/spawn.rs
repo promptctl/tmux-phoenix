@@ -119,37 +119,68 @@ fn build_argv(socket: Option<&str>, user_args: &[&str]) -> Vec<String> {
     argv
 }
 
+/// Spawn `tmux -C <socket-selector> <args>` with piped stdin/stdout — the
+/// one `Command` this module builds (`[LAW:one-source-of-truth]`), whichever
+/// shape its pipes are then handed out in. stderr is inherited: control-mode
+/// traffic is all on stdout, and a startup failure (a bad socket path, a
+/// missing binary) is printed by tmux before any control connection exists.
+fn spawn_child(
+    args: &[&str],
+    options: &SpawnOptions,
+) -> io::Result<(Child, ChildStdin, ChildStdout)> {
+    let tmux_path = options.tmux_path.as_deref().unwrap_or("tmux");
+    let argv = build_argv(options.socket.as_deref(), args);
+
+    let mut command = Command::new(tmux_path);
+    command
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    for (key, value) in &options.env {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn()?;
+    // Guaranteed `Some` by `Stdio::piped()` above on a successful spawn
+    // — an invariant of `std::process::Command`, not a runtime guess.
+    let stdin = child
+        .stdin
+        .take()
+        .expect("child.stdin missing despite Stdio::piped()");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child.stdout missing despite Stdio::piped()");
+    Ok((child, stdin, stdout))
+}
+
+/// Kill and reap the child in `slot`, exactly once. Taking the child is what
+/// makes this idempotent, and what a [`KillHandle`] racing it observes: one
+/// of them empties the slot, and the loser finds nothing to signal
+/// (`[LAW:single-enforcer]`).
+///
+/// The take is its own statement so the guard dies at its semicolon: the
+/// lock covers the handoff and nothing else. Written as the scrutinee of
+/// the `if let` below, the guard would live to the closing brace and a
+/// racing handle would block through `wait()` — an extent chosen by the
+/// language's temporary-scope rule rather than by us
+/// (`[LAW:no-ambient-temporal-coupling]`).
+fn terminate(slot: &ChildSlot) {
+    let taken = lock(slot).take();
+    if let Some(mut child) = taken {
+        // `kill()` fails harmlessly on a child that already exited; `wait()`
+        // reaps it either way, which `std::process::Child` never does on drop.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl SpawnTransport {
     /// Spawn `tmux -C <socket-selector> <args>` and take ownership of its
-    /// stdin/stdout pipes. stderr is inherited: control-mode traffic is all on
-    /// stdout, and a startup failure (no server, a bad socket) is printed by
-    /// tmux before any control connection exists.
+    /// stdin/stdout pipes.
     pub fn spawn(args: &[&str], options: &SpawnOptions) -> io::Result<Self> {
-        let tmux_path = options.tmux_path.as_deref().unwrap_or("tmux");
-        let argv = build_argv(options.socket.as_deref(), args);
-
-        let mut command = Command::new(tmux_path);
-        command
-            .args(&argv)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        for (key, value) in &options.env {
-            command.env(key, value);
-        }
-
-        let mut child = command.spawn()?;
-        // Guaranteed `Some` by `Stdio::piped()` above on a successful spawn
-        // — an invariant of `std::process::Command`, not a runtime guess.
-        let stdin = child
-            .stdin
-            .take()
-            .expect("child.stdin missing despite Stdio::piped()");
-        let stdout = child
-            .stdout
-            .take()
-            .expect("child.stdout missing despite Stdio::piped()");
-
+        let (child, stdin, stdout) = spawn_child(args, options)?;
         Ok(Self {
             child: Arc::new(Mutex::new(Some(child))),
             pipes: Pipes::Open { stdin, stdout },
@@ -165,6 +196,46 @@ impl SpawnTransport {
             child: self.child.clone(),
         }
     }
+}
+
+/// The command-writing half of a control-mode child whose output half has
+/// been given to a reader on another thread ([`crate::Connection`]).
+/// Dropping it kills and reaps the child, which closes the output pipe and
+/// returns that reader from `read()` with EOF — the one way to end a read
+/// nobody can interrupt from its own thread.
+pub struct ChildWriter {
+    stdin: ChildStdin,
+    child: ChildSlot,
+}
+
+impl Write for ChildWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stdin.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stdin.flush()
+    }
+}
+
+impl Drop for ChildWriter {
+    fn drop(&mut self) {
+        terminate(&self.child);
+    }
+}
+
+/// Spawn `tmux -C <socket-selector> <args>` as two halves: the writer that
+/// owns the child, and the raw output pipe to hand to a reader thread.
+pub fn spawn_halves(
+    args: &[&str],
+    options: &SpawnOptions,
+) -> io::Result<(ChildWriter, ChildStdout)> {
+    let (child, stdin, stdout) = spawn_child(args, options)?;
+    let writer = ChildWriter {
+        stdin,
+        child: Arc::new(Mutex::new(Some(child))),
+    };
+    Ok((writer, stdout))
 }
 
 fn closed_err() -> io::Error {
@@ -188,23 +259,7 @@ impl Transport for SpawnTransport {
 
     fn close(&mut self) {
         self.pipes = Pipes::Closed;
-        // Taking the child is what makes this idempotent, and what a
-        // [`KillHandle`] racing us observes: one of us empties the slot, and
-        // the loser finds nothing to signal (`[LAW:single-enforcer]`).
-        //
-        // The take is its own statement so the guard dies at its semicolon:
-        // the lock covers the handoff and nothing else. Written as the
-        // scrutinee of the `if let` below, the guard would live to the closing
-        // brace and a racing handle would block through `wait()` — an extent
-        // chosen by the language's temporary-scope rule rather than by us
-        // (`[LAW:no-ambient-temporal-coupling]`).
-        let taken = lock(&self.child).take();
-        if let Some(mut child) = taken {
-            // `kill()` fails harmlessly on a child that already exited; `wait()`
-            // reaps it either way, which `std::process::Child` never does on drop.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        terminate(&self.child);
     }
 }
 

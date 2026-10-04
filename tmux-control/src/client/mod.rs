@@ -1,8 +1,9 @@
-//! The correlation client (DESIGN.md §3.3): `execute()` is the single
-//! command-dispatch path every typed operation (a later ticket) delegates
-//! to. Correlation is by FIFO — tmux processes commands serially and emits
-//! exactly one guard block per command, in order — not by the guard's
-//! command-number, which is informational only.
+//! The correlation layer (DESIGN.md §3.3). Two drivers share one
+//! demultiplexer ([`demux`]): [`Connection`], whose reader thread owns the
+//! transport's read side and delivers events on a channel, and [`Client`],
+//! which reads only from inside a blocking call. Both expose the same
+//! `execute` through the [`Execute`] seam, so every typed command in
+//! [`crate::commands`] is written once.
 //!
 //! [`ConnectionState`] is owned and explicit (DESIGN.md §3.3, "no timing
 //! folklore"): on attach tmux emits an unsolicited `%begin…%end`/`%error`
@@ -12,52 +13,45 @@
 //! before `execute()` will run at all.
 //!
 //! Two ways to build a `Client`, for two different needs:
-//! - [`Client::connect`] is what real usage against a live tmux should call
-//!   — it performs the greeting handshake synchronously and only returns a
-//!   `Ready` client (or an error if the handshake itself failed).
+//! - [`Client::connect`] performs the greeting handshake synchronously and
+//!   only returns a `Ready` client (or an error if the handshake itself
+//!   failed).
 //! - [`Client::new`] skips the handshake and starts `Ready` immediately. It
 //!   exists for tests and any other case where the byte stream is already
-//!   known to be positioned past a greeting (e.g. a transport that isn't
-//!   actually tmux at all). Using it against a real, freshly-attached tmux
-//!   transport reintroduces the exact off-by-one this module exists to
-//!   prevent — `connect()` is the safe default.
+//!   known to be positioned past a greeting. Using it against a real,
+//!   freshly-attached tmux transport reintroduces the exact off-by-one this
+//!   module exists to prevent — `connect()` is the safe default.
 //!
-//! Notifications dispatch as typed [`ServerMessage`] events to the
-//! notification sink. Pane output (`%output`/`%extended-output`) never goes
-//! through that path — it is high-volume and mixing it into the
-//! notification stream is how you get head-of-line blocking — it routes
-//! through a separate byte sink instead. Both sinks are supplied at
-//! construction and neither is optional, so a parsed message with nowhere
-//! to go is not a state this client can be in.
+//! A `Client`'s notifications dispatch as typed [`ServerMessage`] events to
+//! the notification sink, and pane output (`%output`/`%extended-output`) to a
+//! separate byte sink. Both sinks are supplied at construction and neither
+//! is optional, so a parsed message with nowhere to go is not a state this
+//! client can be in; [`Client::connect`] dispatches whatever tmux wrote
+//! behind the greeting terminator, which is strictly before any caller
+//! could have registered a sink afterwards.
 //!
-//! That requirement is load-bearing rather than ceremonial: [`Client::connect`]
-//! dispatches whatever tmux wrote behind the greeting terminator, which is
-//! strictly before any caller could have registered a sink afterwards. The
-//! crate used to cover that one-handshake window with unbounded queues that
-//! then retained for the entire connection — paying a connection-lifetime
-//! price for a startup guarantee. Requiring the sinks removes the window
-//! instead of paying for it, and leaves this crate holding no queue at all.
-//! A caller wanting a stream discarded says so with a discarding closure; a
-//! caller wanting it buffered owns that buffer, which is where this module
-//! already places the polling policy it declines to own.
-//!
-//! A sink only fires while some blocking call
-//! (`execute`/`connect`/`reconnect`) is actively reading — this client has
-//! no background thread of its own, so "dispatch" here means "synchronously
-//! invoked the moment a message is parsed during one of those calls," not
-//! "delivered independently of any call in progress." A caller that wants
-//! to react to notifications while otherwise idle needs to poll (e.g. call
-//! `execute` on some interval, or a later layer that owns a dedicated
-//! read thread) — that policy belongs above this crate, not in it.
+//! A sink only fires while some blocking call (`execute`/`connect`/
+//! `reconnect`) is actively reading — a `Client` has no thread of its own.
+//! A caller that wants to react to notifications while otherwise idle wants
+//! a [`Connection`], whose reader is exactly that thread.
 
+mod connection;
 mod connection_state;
+mod demux;
 mod error;
+mod event;
 
+pub use connection::{Attach, Connection, Opened, Wake};
 pub use connection_state::{CloseReason, ConnectionState};
 pub use error::TmuxError;
+pub use event::Event;
+
+use std::collections::VecDeque;
 
 use crate::protocol::{Codec, CommandLine, Guard, PaneId, ServerMessage};
 use crate::transport::Transport;
+use connection::ReadEnd;
+use demux::{Demux, Routed};
 
 /// A completed command's guard-framed output.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,13 +61,26 @@ pub struct CommandOutput {
     pub lines: Vec<Vec<u8>>,
 }
 
+/// The seam every typed command is written against (`[LAW:locality-or-seam]`):
+/// anything that can send one command line and return the block that
+/// answers it.
+pub trait Execute {
+    fn execute(&mut self, command: &CommandLine) -> Result<CommandOutput, TmuxError>;
+}
+
 type NotificationSink = Box<dyn FnMut(ServerMessage)>;
 type PaneOutputSink = Box<dyn FnMut(PaneId, Vec<u8>)>;
 
-/// Correlates commands to replies over a [`Transport`] + [`Codec`] pair.
+/// Correlates commands to replies over a [`Transport`] + [`Codec`] pair,
+/// reading from inside each blocking call.
 pub struct Client<T: Transport> {
     transport: T,
     codec: Codec,
+    demux: Demux,
+    /// Settled blocks not yet handed to a caller, oldest first. tmux answers
+    /// one block per command, so this holds at most the reply of the one
+    /// command in flight.
+    replies: VecDeque<Result<CommandOutput, TmuxError>>,
     /// Every dispatched message's destination. Not `Option`
     /// (`[LAW:types-are-the-program]`): "a message with nowhere to go" was
     /// the illegal state whose only cover was an unbounded queue per sink.
@@ -82,7 +89,7 @@ pub struct Client<T: Transport> {
     state: ConnectionState,
 }
 
-const READ_CHUNK: usize = 8192;
+pub(crate) const READ_CHUNK: usize = 8192;
 
 impl<T: Transport> Client<T> {
     /// The one place a fresh `Client`'s fields are named
@@ -98,6 +105,8 @@ impl<T: Transport> Client<T> {
         Self {
             transport,
             codec: Codec::new(),
+            demux: Demux::default(),
+            replies: VecDeque::new(),
             notification_sink: Box::new(on_notification),
             pane_output_sink: Box::new(on_pane_output),
             state,
@@ -127,8 +136,7 @@ impl<T: Transport> Client<T> {
     /// Build a client against a freshly-attached transport: synchronously
     /// consumes tmux's unsolicited startup greeting block before returning,
     /// so the result is guaranteed `Ready` (or the handshake's own failure
-    /// is returned instead of a half-initialized client). This is the
-    /// entry point real usage against a live tmux should call.
+    /// is returned instead of a half-initialized client).
     ///
     /// The sinks are taken here, rather than registered on the returned
     /// client, because the handshake itself dispatches: anything tmux wrote
@@ -163,6 +171,8 @@ impl<T: Transport> Client<T> {
     pub fn reconnect(&mut self, transport: T, attempt: u32) -> Result<(), TmuxError> {
         self.transport = transport;
         self.codec = Codec::new();
+        self.demux = Demux::default();
+        self.replies.clear();
         self.state = ConnectionState::Reconnecting { attempt };
         self.consume_greeting()
     }
@@ -187,20 +197,14 @@ impl<T: Transport> Client<T> {
         }
     }
 
-    /// A clean EOF and a failed read are different endings — `Exit` versus
-    /// `TransportError` — so the distinction is carried, not collapsed.
     fn read_or_close(&mut self, buf: &mut [u8]) -> Result<usize, TmuxError> {
-        match self.transport.read(buf) {
-            Ok(0) => {
-                self.state = self.state.closed(CloseReason::Exit);
-                Err(TmuxError::TransportClosed)
-            }
-            Ok(n) => Ok(n),
-            Err(err) => {
-                self.state = self.state.closed(CloseReason::TransportError);
-                Err(TmuxError::Read(err))
-            }
-        }
+        let end = match self.transport.read(buf) {
+            Ok(0) => ReadEnd::Eof,
+            Ok(n) => return Ok(n),
+            Err(err) => ReadEnd::Failed(err),
+        };
+        self.state = self.state.closed(end.reason());
+        Err(end.error())
     }
 
     /// Block, reading and feeding the codec, until the first guard block
@@ -211,67 +215,40 @@ impl<T: Transport> Client<T> {
     /// reference client's `awaitingGreeting` handling). Only a transport
     /// failure before the terminator arrives is a genuine handshake error.
     fn consume_greeting(&mut self) -> Result<(), TmuxError> {
-        let mut buf = [0u8; READ_CHUNK];
-        let mut settled = false;
-
-        while !settled {
-            let n = self.read_or_close(&mut buf)?;
-            // Same reasoning as execute()'s identically-shaped loop: one
-            // read() can return a chunk whose codec.feed() batch contains
-            // both the greeting's terminator *and* trailing bytes after it
-            // (a notification tmux wrote right behind it). Returning the
-            // instant the terminator is seen would drop the rest of that
-            // batch, so draining continues — dispatching anything past the
-            // terminator — until the whole batch is consumed.
-            for msg in self.codec.feed(&buf[..n]) {
-                if settled {
-                    self.dispatch(msg);
-                    continue;
-                }
-                match msg {
-                    ServerMessage::GuardBegin(_) | ServerMessage::CommandOutput { .. } => {
-                        // Framing and body of the greeting block — no
-                        // caller is waiting on it, so its output (if any) is
-                        // intentionally dropped rather than dispatched as a
-                        // notification the caller would have to recognize
-                        // and ignore.
-                    }
-                    ServerMessage::GuardEnd(_)
-                    | ServerMessage::GuardError(_)
-                    | ServerMessage::ProtocolError { .. } => {
-                        self.state = ConnectionState::Ready;
-                        settled = true;
-                    }
-                    other => self.dispatch(other),
-                }
-            }
-        }
-
+        let _settled = self.next_reply()?;
+        self.state = ConnectionState::Ready;
         Ok(())
     }
 
-    /// Route a parsed message to its sink (`[LAW:single-enforcer]` — the one
-    /// place that decides notification vs. pane-output). The only branch left
-    /// is the domain's own discriminator: with both sinks required, "is there
-    /// somewhere to put this" is no longer a question the code can ask
-    /// (`[LAW:dataflow-not-control-flow]`). Only ever called with messages
-    /// that are neither guard framing nor command output — those are handled
-    /// by their own callers before reaching here.
-    fn dispatch(&mut self, msg: ServerMessage) {
-        match msg {
-            ServerMessage::Output { pane, data }
-            | ServerMessage::ExtendedOutput { pane, data, .. } => {
-                (self.pane_output_sink)(pane, data)
+    /// The oldest settled block, reading until one has. Everything that is
+    /// not a block — notifications, pane output — is dispatched to its sink
+    /// on the way, including anything that arrived in the same read as the
+    /// block's terminator: the codec hands back every message in a chunk,
+    /// and stopping at the terminator would drop the rest for good.
+    ///
+    /// The outer `Err` is the transport failing; the inner `Result` is the
+    /// block's own outcome.
+    fn next_reply(&mut self) -> Result<Result<CommandOutput, TmuxError>, TmuxError> {
+        let mut buf = [0u8; READ_CHUNK];
+        loop {
+            if let Some(reply) = self.replies.pop_front() {
+                return Ok(reply);
             }
-            other => (self.notification_sink)(other),
+            let n = self.read_or_close(&mut buf)?;
+            for msg in self.codec.feed(&buf[..n]) {
+                match self.demux.route(msg) {
+                    None => {}
+                    Some(Routed::Reply(reply)) => self.replies.push_back(reply),
+                    Some(Routed::Notification(msg)) => (self.notification_sink)(msg),
+                    Some(Routed::PaneOutput(pane, data)) => (self.pane_output_sink)(pane, data),
+                }
+            }
         }
     }
 
     /// The single command-dispatch path (`[LAW:single-enforcer]`). Sends
-    /// `command`, then blocks reading from the transport — feeding every
-    /// chunk to the codec — until the guard block that positionally
-    /// follows (the codec only ever has one block open at a time) settles
-    /// with `%end` or `%error`.
+    /// `command`, then blocks reading from the transport until the guard
+    /// block that positionally follows settles with `%end` or `%error`.
     ///
     /// Refuses with `TmuxError::NotReady` unless [`Client::state`] is
     /// `Ready` — a command sent while still `Connecting` would correlate
@@ -284,61 +261,8 @@ impl<T: Transport> Client<T> {
         if self.state != ConnectionState::Ready {
             return Err(TmuxError::NotReady(self.state));
         }
-
         self.send_or_close(command)?;
-
-        let mut lines: Vec<Vec<u8>> = Vec::new();
-        let mut buf = [0u8; READ_CHUNK];
-        let mut outcome = None;
-
-        while outcome.is_none() {
-            let n = self.read_or_close(&mut buf)?;
-            // A single read() can return a chunk containing our reply's
-            // GuardEnd/GuardError *and* trailing bytes after it (tmux wrote
-            // them in one burst, e.g. a notification right behind the
-            // block). codec.feed() hands back every message in that chunk
-            // as one Vec — stopping at the first settling message here
-            // would silently drop everything after it in the same batch, so
-            // once `outcome` is set the loop keeps draining, dispatching
-            // anything further instead of returning early.
-            for msg in self.codec.feed(&buf[..n]) {
-                if outcome.is_some() {
-                    self.dispatch(msg);
-                    continue;
-                }
-                match msg {
-                    // Framing only — GuardEnd/GuardError below carry their
-                    // own complete Guard, so nothing needs to be remembered
-                    // from GuardBegin.
-                    ServerMessage::GuardBegin(_) => {}
-                    ServerMessage::CommandOutput { line, .. } => lines.push(line),
-                    ServerMessage::GuardEnd(guard) => {
-                        outcome = Some(Ok(CommandOutput {
-                            guard,
-                            lines: std::mem::take(&mut lines),
-                        }));
-                    }
-                    ServerMessage::GuardError(guard) => {
-                        outcome = Some(Err(TmuxError::Command {
-                            guard,
-                            lines: std::mem::take(&mut lines),
-                        }));
-                    }
-                    ServerMessage::ProtocolError {
-                        command_number,
-                        line,
-                    } => {
-                        outcome = Some(Err(TmuxError::Protocol {
-                            command_number,
-                            line,
-                        }));
-                    }
-                    other => self.dispatch(other),
-                }
-            }
-        }
-
-        outcome.expect("loop only exits once outcome is Some")
+        self.next_reply()?
     }
 
     /// The wire-level detach signal: a bare `\n` (SPEC §4.1). Deliberately
@@ -355,5 +279,11 @@ impl<T: Transport> Client<T> {
     pub fn close(&mut self) {
         self.transport.close();
         self.state = self.state.closed(CloseReason::Disposed);
+    }
+}
+
+impl<T: Transport> Execute for Client<T> {
+    fn execute(&mut self, command: &CommandLine) -> Result<CommandOutput, TmuxError> {
+        Client::execute(self, command)
     }
 }
