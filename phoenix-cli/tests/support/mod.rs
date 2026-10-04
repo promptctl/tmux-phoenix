@@ -33,21 +33,33 @@ impl IsolatedTmux {
     }
 
     /// Blocks until a save would come back clean: every pane reports a
-    /// working directory, and every pane's process holds its terminal's
-    /// foreground (`ps` STAT carries `+`), which is what argv recovery keys
-    /// on. A pane just created is neither yet, and under a loaded test run
-    /// that window is wide enough for `save` to exit 3.
+    /// working directory, every pane's process holds its terminal's
+    /// foreground (`ps` STAT carries `+`), and no pane has produced output
+    /// across three consecutive reads. A pane just created is none of
+    /// these — its shell is still running its startup files, which briefly
+    /// hand the terminal to their own children — and under a loaded test
+    /// run that window is wide enough for `save` to exit 3.
     pub fn wait_until_settled(&self) {
-        for _ in 0..50 {
-            if self.panes_settled() {
+        let mut last = None;
+        let mut stable_reads = 0;
+        for _ in 0..100 {
+            let now = self.pane_listing();
+            stable_reads = if Some(&now) == last.as_ref() {
+                stable_reads + 1
+            } else {
+                0
+            };
+            if stable_reads >= 3 && panes_settled(&now) {
                 return;
             }
+            last = Some(now);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        panic!("panes on {} never settled within 5s", self.socket);
+        panic!("panes on {} never settled within 10s", self.socket);
     }
 
-    fn panes_settled(&self) -> bool {
+    /// One row per pane: pid, history indicator, cwd.
+    fn pane_listing(&self) -> Vec<String> {
         let out = std::process::Command::new("tmux")
             .args([
                 "-S",
@@ -55,17 +67,26 @@ impl IsolatedTmux {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{pane_pid} #{pane_current_path}",
+                "#{pane_pid} #{history_size} #{history_bytes} #{pane_current_path}",
             ])
             .output()
             .expect("failed to run tmux list-panes");
-        let listing = String::from_utf8_lossy(&out.stdout);
-        out.status.success()
-            && listing.lines().all(|row| match row.split_once(' ') {
-                Some((pid, cwd)) => !cwd.is_empty() && in_foreground(pid),
-                None => false,
-            })
+        assert!(out.status.success(), "list-panes failed on {}", self.socket);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
+}
+
+fn panes_settled(listing: &[String]) -> bool {
+    !listing.is_empty()
+        && listing.iter().all(|row| {
+            let mut fields = row.splitn(4, ' ');
+            let pid = fields.next().unwrap_or("");
+            let cwd = fields.nth(2).unwrap_or("");
+            !cwd.is_empty() && in_foreground(pid)
+        })
 }
 
 fn in_foreground(pid: &str) -> bool {
