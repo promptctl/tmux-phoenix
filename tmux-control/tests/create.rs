@@ -3,7 +3,8 @@
 //! actually does with them.
 
 use tmux_control::commands::{
-    move_window, new_session, new_window, split_window, Moved, NewSession, NewWindow,
+    move_window, new_session, new_window, split_window, switch_client, Moved, NewSession,
+    NewWindow, Switched,
 };
 use tmux_control::{PaneId, SessionId, SessionName, Target, TmuxError, WindowId, WindowIndex};
 
@@ -140,6 +141,26 @@ fn move_window_names_the_window_by_id_and_reads_same_index_as_already_there() {
     assert_eq!(
         state.sent.borrow()[0],
         "move-window -d -s @9 -t =zz:=3".to_owned()
+    );
+}
+
+#[test]
+fn switch_client_reads_a_client_that_detached_as_gone() {
+    let (transport, state) = MockTransport::new(vec![
+        "%begin 1 1 1\n%end 1 1 1\n",
+        "%begin 2 2 1\ncan't find client: /dev/ttys004\n%error 2 2 1\n",
+        "%begin 3 3 1\ncan't find session: zz\n%error 3 3 1\n",
+    ]);
+    let (mut client, _collected) = collecting_client(transport);
+    let mut switched = || switch_client(&mut client, "/dev/ttys004", &name("zz"));
+
+    assert_eq!(switched().unwrap(), Switched::Switched);
+    assert_eq!(switched().unwrap(), Switched::Gone);
+    // Only the client being gone is an answer; a missing session is an error.
+    assert!(matches!(switched(), Err(TmuxError::Command { .. })));
+    assert_eq!(
+        state.sent.borrow()[0],
+        "switch-client -c /dev/ttys004 -t =zz:".to_owned()
     );
 }
 

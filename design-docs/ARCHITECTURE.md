@@ -33,7 +33,7 @@ Applied to the four facts that matter:
 | Whether **phoenix has touched this server** | the save that lands or the restore that finishes | a tmux server option (`@phoenix-generation`), read as `Touched` at connect | the entire boot-decision state machine |
 | Which **server incarnation** a snapshot came from | the capture, from tmux's `#{pid}:#{start_time}` | the generation header (`origin: Origin`) | nothing yet — it is provenance for `list`, `status` and import |
 | Which **live window is a saved window** | the plan step that finishes building it | a tmux window option (`@phoenix-window`), read into `live` | matching by name or index, which is a guess |
-| Which **session phoenix made in order to attach** | `Connection::open`'s reply | `Opened::Created(name)`, a value the restore plan ends by removing | the bootstrap heuristic, scaffolding retire/put-back, the post-restore reconnect |
+| Which **session phoenix made in order to attach** | `Connection::open`'s reply | `Opened::Created(name)`, a value the restore plan removes | the bootstrap heuristic, scaffolding retire/put-back, the post-restore reconnect |
 | What a **pane's foreground** is | the capture, from the OS: the pane terminal's foreground process group, then that process's exact argv | a closed `Foreground` enum on `Pane` | `Foreground` re-derived on every read via a shell-name list over `ps` output |
 | Where a **restored pane** is | the `split-window -P` reply at apply time | a bound `PaneRef` in the plan | "the current pane, if you issue this step immediately" |
 
@@ -146,7 +146,7 @@ state machine distinguishes.
 The question "may I remove this session?" is no longer asked of tmux. The only session
 phoenix ever removes is the one `Connection::open` reports it created in order to
 attach (§4), and that fact travels as a value — `Opened::Created(name)` — into the plan,
-which ends by moving the clients attached to it onto a restored session and killing it
+which moves the clients attached to it onto a restored session and kills it
 by that name. A login terminal's session `0`, or anything else the user built, is never
 phoenix's to kill; whether a stray disappears is the user's tmux configuration
 (`destroy-unattached`), not phoenix's guess. The scaffolding `Created/Renamed`,
@@ -340,9 +340,14 @@ human-readable diff the toolbox roadmap asks for. Selective restore (one session
 window) is a filter on `snapshot` before planning — data, not a mode.
 
 Clients are moved by name, never by implication: when the connection made `scratch`
-the plan ends with `SwitchClients { from: scratch, to }` and then `KillSession {
-scratch }`; otherwise no client is moved, because every client is on a session the
-user chose. Which clients sit on the scratch is read when that step runs
+the plan follows the first session it restores with `SwitchClients { from: scratch,
+to }` and then `KillSession { scratch }`; otherwise no client is moved, because every
+client is on a session the user chose. The scratch goes that early, not at the plan's
+end, because only the plan whose connection made it knows it is a scratch: a restore
+cut short later would leave it for a next plan that attaches to a server with sessions
+and has no account of who made it, and the daemon would save it as the user's. A
+client that detaches between the listing and its move is gone, which is not a failure
+(`commands::switch_client -> Switched::{Switched, Gone}`). Which clients sit on the scratch is read when that step runs
 (`list-clients -t`), not from `live`: the fact is born then — a terminal can attach
 while the plan applies, and a client whose session is killed is detached — and a dry
 run onto no server has no client to name yet. The ops layer chooses `name` free of every session name in the
@@ -380,13 +385,17 @@ replies bind `PaneRef`s and `WindowRef`s; `--dry-run` renders the same steps wit
 symbolic names. The plan is the
 single place that knows the order constraints tmux imposes (`move-window` after
 `new-session`, layout after all panes exist), and it encodes them as sequence in
-*data*, not as a contract between functions.
+*data*, not as a contract between functions. One of them is room: a split halves the
+pane it splits and tmux refuses when none is left — the fifth pane of a detached 80x24
+window — so each `SplitPane` is followed by `SelectLayout { tiled }`, which spreads the
+panes before the next split, and the saved layout is applied once they all exist.
 
 **Connecting is not restore's job.** `connect_and_apply` is gone. Restore is handed a
 connection and the `Opened` that came with it, captures `live`, plans, and applies —
 all over that one connection, with no reconnect. Moving clients off and removing the
-session phoenix created to attach with, and marking the server, are the plan's last
-steps, so `--dry-run` shows them and nothing outside the plan ever kills a session.
+session phoenix created to attach with are steps of the plan, and marking the server
+is its last, so `--dry-run` shows them and nothing outside the plan ever kills a
+session.
 
 ---
 

@@ -4,15 +4,16 @@
 //! [`Execute`] seam so the same function serves a [`crate::Client`] and a
 //! [`crate::Connection`] alike. Here: subscriptions (SPEC §14), pane flow
 //! control (SPEC §13), client flags (SPEC §9), and version gating (IMPL.md
-//! §2.2). [`create`] holds the pane-creating commands, [`place`] the one
-//! that moves a window, and [`target`] the typed targets they address.
+//! §2.2). [`create`] holds the pane-creating commands, [`place`] the ones
+//! that move a window or a client, and [`target`] the typed targets they
+//! address.
 
 mod create;
 mod place;
 mod target;
 
 pub use create::{new_session, new_window, split_window, NewSession, NewWindow};
-pub use place::{move_window, Moved};
+pub use place::{move_window, switch_client, Moved, Switched};
 pub use target::{SessionName, Target, UnaddressableSessionName, WindowIndex};
 
 use crate::client::{CommandOutput, Execute, TmuxError};

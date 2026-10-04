@@ -257,8 +257,8 @@ fn restore_dry_run_prints_the_plan_and_touches_nothing() {
         String::from_utf8(out.stdout).unwrap()
     };
 
-    // Onto no server: everything is built in a session made to attach
-    // with, which the plan ends by moving its clients off and removing.
+    // Onto no server: a session is made to attach with, and the plan moves
+    // its clients off and removes it once the first restored session exists.
     let target = empty_socket("dry-run-target");
     let plan = dry_run(&target);
     let lines: Vec<&str> = plan.lines().collect();
@@ -271,7 +271,7 @@ fn restore_dry_run_prints_the_plan_and_touches_nothing() {
         "{plan}"
     );
     assert_eq!(
-        lines[lines.len() - 3..],
+        lines[2..4],
         [
             format!(
                 "switch-client every client on phoenix-scratch-0 to {}",
@@ -279,7 +279,6 @@ fn restore_dry_run_prints_the_plan_and_touches_nothing() {
             )
             .as_str(),
             "kill-session phoenix-scratch-0",
-            lines[lines.len() - 1],
         ],
         "{plan}"
     );

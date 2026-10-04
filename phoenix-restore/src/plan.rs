@@ -21,8 +21,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use phoenix_core::{
-    Content, Foreground, GenerationId, Made, Origin, Session, Snapshot, Touched, WinLink, Window,
-    WindowId, WindowIndex,
+    Content, Foreground, GenerationId, Layout, Made, Origin, Session, Snapshot, Touched, WinLink,
+    Window, WindowId, WindowIndex,
 };
 use tmux_control::{Opened, SessionName, UnaddressableSessionName};
 
@@ -42,8 +42,8 @@ pub enum Onto<'a> {
     /// is a capture taken over it.
     Server { live: &'a Snapshot },
     /// No session existed, so the connection made `scratch` to attach with;
-    /// `live` is a capture taken over it. The plan ends by removing
-    /// `scratch`.
+    /// `live` is a capture taken over it. The plan removes `scratch` as
+    /// soon as a restored session exists to hold its clients.
     Scratch {
         scratch: &'a SessionName,
         live: &'a Snapshot,
@@ -186,32 +186,17 @@ pub fn plan(generation: GenerationId, snapshot: &Snapshot, onto: Onto<'_>) -> Pl
         // The server mark is the last step of a restore that finished, so a
         // server not carrying this generation's mark has not been finished.
         unfinished: live.map_or(Touched::Never, |live| live.touched) != Touched::By(generation),
+        scratch: onto.scratch(),
         steps: Vec::new(),
         notes: Vec::new(),
         built: HashMap::new(),
         refs: 0,
     };
 
-    let restored: Vec<SessionName> = snapshot
+    snapshot
         .sessions()
         .iter()
-        .filter_map(|session| draft.session(session))
-        .collect();
-
-    // The scratch goes once there is a restored session to move its clients
-    // onto; a snapshot with no restorable session leaves it standing.
-    let closing = onto.scratch().zip(restored.first()).map(|(scratch, to)| {
-        [
-            Step::SwitchClients {
-                from: scratch.clone(),
-                to: to.clone(),
-            },
-            Step::KillSession {
-                name: scratch.clone(),
-            },
-        ]
-    });
-    draft.steps.extend(closing.into_iter().flatten());
+        .for_each(|session| draft.session(session));
     if draft.unfinished {
         draft.steps.push(Step::SetOption {
             scope: OptionScope::Server,
@@ -231,6 +216,9 @@ struct Draft<'a> {
     snapshot: &'a Snapshot,
     live: Option<&'a Snapshot>,
     unfinished: bool,
+    /// The session the connection made to attach with, until a step removes
+    /// it.
+    scratch: Option<&'a SessionName>,
     steps: Vec<Step>,
     notes: Vec<Note>,
     /// Saved windows this plan has built so far.
@@ -362,15 +350,36 @@ impl<'a> Draft<'a> {
         missing
     }
 
-    /// Every step for one saved session, and the name it is addressed by.
-    fn session(&mut self, saved: &'a Session) -> Option<SessionName> {
+    /// Moves the scratch's clients onto `to` and removes it. It goes with
+    /// the first restored session rather than at the plan's end: a later
+    /// plan attaches to a server that already has sessions, so it has no
+    /// account of who made the scratch, and one a restore cut short left
+    /// behind would stay — and be saved — as if the user had built it. A
+    /// snapshot with no restorable session leaves it standing.
+    fn close_scratch(&mut self, to: &SessionName) {
+        let closing = self.scratch.take().map(|scratch| {
+            [
+                Step::SwitchClients {
+                    from: scratch.clone(),
+                    to: to.clone(),
+                },
+                Step::KillSession {
+                    name: scratch.clone(),
+                },
+            ]
+        });
+        self.steps.extend(closing.into_iter().flatten());
+    }
+
+    /// Every step for one saved session.
+    fn session(&mut self, saved: &'a Session) {
         // [LAW:parse-dont-validate] the one crossing from a saved name to a
         // name tmux can target; every step below holds the proven type.
         let name = match SessionName::parse(saved.name().as_str()) {
             Ok(name) => name,
             Err(unaddressable) => {
                 self.notes.push(Note::Unaddressable(unaddressable));
-                return None;
+                return;
             }
         };
         let first_step = self.steps.len();
@@ -394,8 +403,7 @@ impl<'a> Draft<'a> {
         // or, when every window it links exists already, one made only so
         // the session can exist, put where the first link goes for that link
         // to replace.
-        let mut placeholder = None;
-        if live_session.is_none() {
+        let made = live_session.is_none().then(|| {
             let (window, pane) = self.fresh();
             let seed = missing
                 .iter()
@@ -416,6 +424,11 @@ impl<'a> Draft<'a> {
                     .map(|(index, _)| index)
                     .expect("a session links at least one window, and this one has none yet"),
             });
+            (window, pane, seed)
+        });
+        self.close_scratch(&name);
+        let mut placeholder = None;
+        if let Some((window, pane, seed)) = made {
             match seed {
                 Some((_, saved)) => self.furnish(saved, window, pane),
                 None => placeholder = Some(window),
@@ -460,7 +473,6 @@ impl<'a> Draft<'a> {
                 value: self.generation.to_string(),
             });
         }
-        Some(name)
     }
 
     /// Everything inside a window just created with its first pane: the
@@ -479,6 +491,14 @@ impl<'a> Draft<'a> {
                 pane: made,
             });
             panes.push(made);
+            // A split halves the pane it splits, and tmux refuses one with
+            // no room left to halve — the fifth pane of a detached 80x24
+            // window. Spreading the panes after each split keeps room for
+            // the next; the saved layout below is what they end up in.
+            self.steps.push(Step::SelectLayout {
+                window,
+                layout: Layout::parse("tiled").expect("a layout name is not empty"),
+            });
         }
         self.steps.push(Step::SelectLayout {
             window,
@@ -716,22 +736,30 @@ mod tests {
     }
 
     #[test]
-    fn onto_no_server_everything_is_built_and_the_scratch_goes_last_but_for_the_mark() {
-        let snapshot = saved(vec![window(3)], vec![session("main", &[(4, 3)])]);
+    fn onto_no_server_the_scratch_goes_once_a_session_exists_and_the_mark_comes_last() {
+        let snapshot = saved(
+            vec![window(3), window(4)],
+            vec![session("main", &[(4, 3)]), session("side", &[(0, 4)])],
+        );
         let scratch = name("phoenix-scratch-0");
         let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
 
+        // Nothing that can fail in the middle of a restore runs while the
+        // scratch still stands, bar making the first session.
         let mut expected = new_session("main", 4, 0, 3);
-        expected.extend([
-            select_window("main", 4),
-            restored("main"),
-            Step::SwitchClients {
-                from: scratch.clone(),
-                to: name("main"),
-            },
-            Step::KillSession { name: scratch },
-            server_mark(),
-        ]);
+        expected.splice(
+            2..2,
+            [
+                Step::SwitchClients {
+                    from: scratch.clone(),
+                    to: name("main"),
+                },
+                Step::KillSession { name: scratch },
+            ],
+        );
+        expected.extend([select_window("main", 4), restored("main")]);
+        expected.extend(new_session("side", 0, 1, 4));
+        expected.extend([select_window("side", 0), restored("side"), server_mark()]);
         assert_eq!(plan.steps(), expected);
         assert_eq!(plan.notes(), []);
     }
@@ -784,21 +812,28 @@ mod tests {
         );
         let plan = plan(GEN, &snapshot, Onto::Server { live: &other });
 
-        // Every pane exists before the layout, the layout before anything is
+        let spread = Step::SelectLayout {
+            window: WindowRef(0),
+            layout: Layout::parse("tiled").unwrap(),
+        };
+        // The panes are spread after each split so the next has room. Every
+        // pane exists before the saved layout, the layout before anything is
         // printed into a pane, and the stamp after all of it.
         assert_eq!(
-            plan.steps()[2..9],
+            plan.steps()[2..11],
             [
                 Step::SplitPane {
                     from: PaneRef(0),
                     cwd: cwd(1),
                     pane: PaneRef(1),
                 },
+                spread.clone(),
                 Step::SplitPane {
                     from: PaneRef(1),
                     cwd: cwd(2),
                     pane: PaneRef(2),
                 },
+                spread,
                 layout(0, 3),
                 Step::ReplayContent {
                     pane: PaneRef(0),
@@ -966,7 +1001,8 @@ mod tests {
             select_window("b", 0),
             restored("b"),
         ]);
-        let a_len = new_session("a", 0, 0, 3).len() + 2;
+        // `a`, the scratch's removal inside it, and its two closing steps.
+        let a_len = new_session("a", 0, 0, 3).len() + 2 + 2;
         assert_eq!(plan.steps()[a_len..a_len + b.len()], b);
     }
 
@@ -982,7 +1018,8 @@ mod tests {
         let scratch = name("phoenix-scratch-0");
         let plan = plan(GEN, &snapshot, Onto::NoServer { scratch: &scratch });
 
-        let a_len = new_session("a", 0, 0, 3).len() + new_window("a", 1, 1, 4).len() + 2;
+        // `a`, the scratch's removal inside it, and its two closing steps.
+        let a_len = new_session("a", 0, 0, 3).len() + new_window("a", 1, 1, 4).len() + 2 + 2;
         assert_eq!(
             plan.steps()[a_len..a_len + 6],
             [
@@ -1102,15 +1139,16 @@ mod tests {
             [
                 "w0 p0 = new-session -s main -n win3 -c /p0",
                 "move-window w0 to main:2",
+                "switch-client every client on phoenix-scratch-0 to main",
+                "kill-session phoenix-scratch-0",
                 "p1 = split-window p0 -c /p1",
+                "select-layout w0 tiled",
                 "select-layout w0 layout3",
                 r"send-keys p1 'vim' 'it'\''s'",
                 "select-pane p1",
                 "set-option w0 @phoenix-window 7:@3",
                 "select-window main:2",
                 "set-option session main @phoenix-restored 7",
-                "switch-client every client on phoenix-scratch-0 to main",
-                "kill-session phoenix-scratch-0",
                 "set-option server @phoenix-generation 7",
             ]
         );

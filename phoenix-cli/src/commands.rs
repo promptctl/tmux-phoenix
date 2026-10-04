@@ -170,7 +170,8 @@ fn load_snapshot(file: Option<&str>) -> Result<(GenerationId, Snapshot), String>
     };
     let generation = phoenix_store::generation_of(path).ok_or_else(|| {
         format!(
-            "{} is not named snapshot-<id>.phnx, so the windows restored from it could not be              marked as that generation's",
+            "{} is not named snapshot-<id>.phnx, so the windows restored from it could not be \
+             marked as that generation's",
             path.display()
         )
     })?;

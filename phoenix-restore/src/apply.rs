@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use phoenix_core::{Utf8PathBuf, WindowIndex};
-use tmux_control::commands::{move_window, new_session, new_window, split_window};
+use tmux_control::commands::{move_window, new_session, new_window, split_window, switch_client};
 use tmux_control::{CommandLine, Execute, PaneId, Target, TmuxError, WindowId};
 
 use crate::plan::Plan;
@@ -24,7 +24,8 @@ use crate::step::{relaunch_line, shell_quote, LinkSource, OptionScope, PaneRef, 
 pub struct ApplyError {
     /// Which step of the plan failed (0-indexed). Every step before it ran,
     /// so the server is partially restored; a window whose group this cut
-    /// short carries no stamp, and the next plan builds it whole.
+    /// short carries no stamp, so the next plan leaves it standing as a
+    /// window that is not the snapshot's and builds the saved one whole.
     pub step: usize,
     pub source: ApplyErrorSource,
 }
@@ -182,11 +183,18 @@ fn run<C: Execute>(client: &mut C, bound: &mut Bound, step: &Step) -> Result<(),
             // keystrokes remove it.
             let file = write_replay_temp_file(lines).map_err(ApplyErrorSource::TempFile)?;
             let quoted = shell_quote(&file.to_string_lossy());
-            type_line(
+            let typed = type_line(
                 client,
                 bound.pane(*pane),
                 &format!("cat {quoted}; rm -f {quoted}"),
-            )?;
+            );
+            // Nothing was typed, so no shell will remove it. The step
+            // reports the typing failure; a removal that fails too has
+            // nothing to add to it.
+            if typed.is_err() {
+                let _ = fs::remove_file(&file);
+            }
+            typed?;
         }
         Step::Relaunch { pane, argv } => {
             type_line(client, bound.pane(*pane), &relaunch_line(argv))?;
@@ -224,7 +232,6 @@ fn run<C: Execute>(client: &mut C, bound: &mut Bound, step: &Step) -> Result<(),
         Step::SwitchClients { from, to } => {
             const FORMAT: &str = "#{client_name}";
             let from = Target::Session(from.clone()).to_string();
-            let to = Target::Session(to.clone()).to_string();
             let listed = send(client, "list-clients", &["-t", &from, "-F", FORMAT])?;
             let clients: Vec<String> = listed
                 .iter()
@@ -234,8 +241,9 @@ fn run<C: Execute>(client: &mut C, bound: &mut Bound, step: &Step) -> Result<(),
                     expected: FORMAT,
                     output: listed.clone(),
                 })?;
+            // Either answer leaves the client off `from`.
             for client_name in &clients {
-                send(client, "switch-client", &["-c", client_name, "-t", &to])?;
+                switch_client(client, client_name, to)?;
             }
         }
         Step::KillSession { name } => {
@@ -394,14 +402,16 @@ mod tests {
             Ok(vec!["$1 @5 %9"]),
             // The window landed on its saved index by itself.
             Err("same index: 2"),
+            Ok(vec!["client-1", "/dev/ttys004"]),
+            Ok(vec![]),
+            // The terminal closed after it was listed.
+            Err("can't find client: /dev/ttys004"),
+            Ok(vec![]),
             Ok(vec!["%10"]),
             Ok(vec![]),
             Ok(vec![]),
             Ok(vec![]),
             Ok(vec![]),
-            Ok(vec![]),
-            Ok(vec![]),
-            Ok(vec!["client-1", "/dev/ttys004"]),
             Ok(vec![]),
             Ok(vec![]),
             Ok(vec![]),
@@ -415,17 +425,18 @@ mod tests {
             [
                 r##"new-session -d -s main -n editor -c /p0 -P -F "#{session_id} #{window_id} #{pane_id}""##,
                 "move-window -d -s @5 -t =main:=2",
+                r##"list-clients -t =scratch: -F "#{client_name}""##,
+                "switch-client -c client-1 -t =main:",
+                "switch-client -c /dev/ttys004 -t =main:",
+                "kill-session -t =scratch:",
                 r##"split-window -d -t "%9" -c /p1 -P -F "#{pane_id}""##,
+                "select-layout -t @5 tiled",
                 "select-layout -t @5 layout",
                 r#"send-keys -t "%10" "'vim'" Enter"#,
                 r#"select-pane -t "%10""#,
                 "set-option -w -t @5 @phoenix-window 7:@3",
                 "select-window -t =main:=2",
                 "set-option -t =main: @phoenix-restored 7",
-                r##"list-clients -t =scratch: -F "#{client_name}""##,
-                "switch-client -c client-1 -t =main:",
-                "switch-client -c /dev/ttys004 -t =main:",
-                "kill-session -t =scratch:",
                 "set-option -s @phoenix-generation 7",
             ]
         );
@@ -436,17 +447,19 @@ mod tests {
         let mut tmux = Scripted::new(vec![
             Ok(vec!["$1 @5 %9"]),
             Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
             Err("no space for new pane"),
         ]);
 
         let err = apply(&mut tmux, &onto_no_server()).unwrap_err();
 
-        assert_eq!(err.step, 2);
+        assert_eq!(err.step, 4);
         assert!(matches!(
             err.source,
             ApplyErrorSource::Tmux(TmuxError::Command { .. })
         ));
-        assert_eq!(tmux.sent.len(), 3, "nothing runs past the failure");
+        assert_eq!(tmux.sent.len(), 5, "nothing runs past the failure");
     }
 
     #[test]

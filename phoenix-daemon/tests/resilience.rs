@@ -149,7 +149,8 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
         "expected the session to be boot-restored with 2 panes after the outage; log: {log:#?}"
     );
     assert!(
-        log.iter().any(|l| l.contains("restored 1 session")),
+        log.iter()
+            .any(|l| l.contains("restored the latest snapshot")),
         "expected a boot-restore log line; log: {log:#?}"
     );
     assert!(
@@ -315,7 +316,9 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
     );
     assert!(
         log.iter().any(|l| l.contains("booting again"))
-            && log.iter().any(|l| l.contains("restored 1 session")),
+            && log
+                .iter()
+                .any(|l| l.contains("restored the latest snapshot")),
         "the declined save should have led to a restore; log: {log:#?}"
     );
 }
@@ -438,7 +441,8 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
         "expected the saved session back beside the terminal's; sessions: {names:?}; log: {log:#?}"
     );
     assert!(
-        log.iter().any(|l| l.contains("restored 1 session")),
+        log.iter()
+            .any(|l| l.contains("restored the latest snapshot")),
         "expected a boot-restore log line; log: {log:#?}"
     );
     assert!(

@@ -328,8 +328,9 @@ saved active window; a session that was already there keeps showing what it show
 Steps name what they act on by reference (`WindowRef`, `PaneRef`). `apply` binds each
 reference to the id tmux reports (`new-session`/`new-window`/`split-window -P -F`) and
 every later step addresses that id, so no step depends on what tmux considers current.
-Panes are split in saved order, each from the one before it, the layout is applied once
-they all exist, and the saved active pane is selected by id. `phoenix restore --dry-run`
+Panes are split in saved order, each from the one before it and spread (`select-layout
+tiled`) so the next split has room, the saved layout is applied once they all exist,
+and the saved active pane is selected by id. `phoenix restore --dry-run`
 prints the same steps with the references in place of ids, and runs none of them.
 
 A restored pane comes back **at its captured cwd, running the program it was running**.
@@ -342,8 +343,9 @@ whose foreground was not recovered has no command line to run.
 **Connecting is not restore's job.** The caller opens the connection
 (`tmux_control::Connection::open`), captures the live server over it, and hands both to
 `plan` and `apply`. When the server held no session, `open` made one in order to attach
-and reports its name; the plan ends by moving every client on that session onto a
-restored one and killing it — the only session phoenix ever removes. Last of all the
+and reports its name; as soon as the first restored session exists the plan moves every
+client on that session onto it and kills it — the only session phoenix ever removes —
+so a restore cut short after that leaves no such session behind. Last of all the
 plan sets the server option `@phoenix-generation`, the mark of a restore that finished.
 
 Two tmux facts the plan encodes, both found by running it against a real server:

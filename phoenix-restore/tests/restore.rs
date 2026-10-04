@@ -352,3 +352,28 @@ fn content_and_program_come_back_in_the_pane_they_were_saved_from() {
     );
     assert_eq!(GEN.to_string(), "7");
 }
+
+#[test]
+fn a_window_of_more_panes_than_halving_one_pane_allows_comes_back_whole() {
+    // No session exists, so the restored one is made detached at tmux's
+    // default 80x24, where halving the newest pane runs out at the fifth.
+    let server = Server::new("many");
+    let saved = snapshot(
+        vec![panes(
+            1,
+            "grid",
+            "tiled",
+            (0..8).map(|index| pane(index, "/")).collect(),
+            3,
+        )],
+        vec![session("restored", &[(0, 1)])],
+    );
+
+    server.restore(&saved);
+
+    assert_eq!(
+        server.lines(&["list-panes", "-t", "=restored:=0", "-F", "#{pane_active}"]),
+        ["0", "0", "0", "1", "0", "0", "0", "0"],
+        "all eight panes, the fourth active as saved"
+    );
+}

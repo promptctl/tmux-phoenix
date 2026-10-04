@@ -217,7 +217,8 @@ fn boots_over_a_lone_bootstrap_session_by_adding_the_snapshot_into_it() {
     assert_eq!(boot, phoenix_daemon::Boot::Settled);
 
     assert!(
-        log.iter().any(|l| l.contains("restored 1 session")),
+        log.iter()
+            .any(|l| l.contains("restored the latest snapshot")),
         "{log:?}"
     );
     assert_eq!(
@@ -304,7 +305,9 @@ fn boots_with_no_sessions_and_a_snapshot_restores_and_removes_the_session_it_att
     .expect("connect_and_boot failed")
     .expect("a server with sessions, or a snapshot to restore, yields a client");
 
-    assert!(log.iter().any(|l| l.contains("restored 1 session")));
+    assert!(log
+        .iter()
+        .any(|l| l.contains("restored the latest snapshot")));
     assert_eq!(boot, phoenix_daemon::Boot::Settled);
 
     let sessions = server.session_names();

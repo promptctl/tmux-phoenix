@@ -11,7 +11,7 @@
 
 use phoenix_capture::{capture, CaptureError, Previous};
 use phoenix_core::{GenerationId, NonEmpty, Origin, SessionName, Shells, Snapshot};
-use phoenix_restore::{apply, plan, scratch_name, ApplyError, Onto};
+use phoenix_restore::{apply, plan, scratch_name, ApplyError, Onto, Plan};
 use phoenix_store::{Store, StoreError};
 use tmux_control::{
     Attach, Client, Connection, ServerMessage, SpawnOptions, SpawnTransport, TmuxError,
@@ -197,11 +197,17 @@ pub fn connect_and_boot(
             (attach(&options, on_notification)?, Decided { server, boot })
         }
         (_, None, Ok((generation, snapshot))) => {
-            let server = restore(&options, generation, &snapshot)?;
+            let (server, restored) = restore(&options, generation, &snapshot)?;
             on_log(&format!(
-                "restored {} session(s) from the latest snapshot",
-                snapshot.sessions().len()
+                "restored the latest snapshot: {} step(s) applied",
+                restored.steps().len()
             ));
+            // What the plan left alone or could not restore is the other
+            // half of what happened.
+            restored
+                .notes()
+                .iter()
+                .for_each(|note| on_log(&note.to_string()));
             let boot = Boot::Settled;
             (attach(&options, on_notification)?, Decided { server, boot })
         }
@@ -223,14 +229,14 @@ pub fn connect_and_boot(
 
 /// Adds what the server lacks of `snapshot` over a connection of its own,
 /// making a session to attach to where the server has none, and says which
-/// server incarnation that was. The run loop still drives a `Client`, so the
+/// server incarnation that was and what was done to it. The run loop still drives a `Client`, so the
 /// caller attaches one afterwards; `tmux-laws-a4x.9xh` keeps this one
 /// connection for the run instead.
 fn restore(
     options: &SpawnOptions,
     generation: GenerationId,
     snapshot: &Snapshot,
-) -> Result<Origin, BootError> {
+) -> Result<(Origin, Plan), BootError> {
     let attach = Attach::OrCreate {
         name: scratch_name(snapshot),
     };
@@ -240,7 +246,7 @@ fn restore(
         .map_err(BootError::Probe)?;
     let restore_plan = plan(generation, snapshot, Onto::opened(&opened, &live));
     apply(&mut connection, &restore_plan).map_err(BootError::Apply)?;
-    Ok(live.origin)
+    Ok((live.origin, restore_plan))
 }
 
 fn joined(names: &NonEmpty<SessionName>) -> String {
