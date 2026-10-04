@@ -296,7 +296,7 @@ fn eof_is_delivered_last_as_closed_and_the_next_call_reports_it() {
 
 #[test]
 fn close_ends_the_reader_and_reports_disposed() {
-    let (mut connection, _script, _sent, _events) = connected();
+    let (mut connection, _script, _sent, events) = connected();
     // The reader is blocked in read() with nothing fed. close() must return
     // anyway — the writer's drop is what hangs the output half up — and this
     // test finishing is the proof that the join did not wait forever.
@@ -307,6 +307,8 @@ fn close_ends_the_reader_and_reports_disposed() {
             reason: CloseReason::Disposed
         }
     );
+    // The sink is told the same thing: this side ended the link, not tmux.
+    assert_eq!(next(&events), Event::Closed(CloseReason::Disposed));
     connection.close();
     assert_eq!(
         connection.state(),

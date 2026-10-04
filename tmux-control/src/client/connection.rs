@@ -24,7 +24,9 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use super::connection_state::{CloseReason, ConnectionState};
@@ -73,14 +75,15 @@ enum Reply {
     Ended(ReadEnd),
 }
 
-/// How a read side ended. The two endings differ for every caller — a clean
-/// EOF is tmux's own `%exit` or exit, a failed read is a broken transport —
-/// so the distinction is carried, and the pairing of each with its
-/// [`CloseReason`] and its [`TmuxError`] is written once
-/// (`[LAW:one-source-of-truth]`).
+/// How a read side ended. The endings differ for every caller — a clean
+/// EOF is tmux's own `%exit` or exit, a failed read is a broken transport,
+/// and an EOF this side caused by [`Connection::close`] is neither — so the
+/// distinction is carried, and the pairing of each with its [`CloseReason`]
+/// and its [`TmuxError`] is written once (`[LAW:one-source-of-truth]`).
 pub(crate) enum ReadEnd {
     Eof,
     Failed(io::Error),
+    Disposed,
 }
 
 impl ReadEnd {
@@ -88,12 +91,13 @@ impl ReadEnd {
         match self {
             ReadEnd::Eof => CloseReason::Exit,
             ReadEnd::Failed(_) => CloseReason::TransportError,
+            ReadEnd::Disposed => CloseReason::Disposed,
         }
     }
 
     pub(crate) fn error(self) -> TmuxError {
         match self {
-            ReadEnd::Eof => TmuxError::TransportClosed,
+            ReadEnd::Eof | ReadEnd::Disposed => TmuxError::TransportClosed,
             ReadEnd::Failed(err) => TmuxError::Read(err),
         }
     }
@@ -106,6 +110,11 @@ enum Side {
     Open {
         commands: Box<dyn Write + Send>,
         reader: JoinHandle<()>,
+        /// Set by [`Connection::close`] before it drops `commands`: the one
+        /// writer of "this side ended the link", read by the reader when
+        /// it classifies the EOF that follows. Without it a local close
+        /// would reach the sink as tmux exiting.
+        disposed: Arc<AtomicBool>,
     },
     Closed,
 }
@@ -200,11 +209,16 @@ impl Connection {
         for routed in behind_greeting {
             deliver(routed, &reply_tx, &mut events);
         }
-        let reader = thread::spawn(move || pump(output, codec, demux, reply_tx, events));
+        let disposed = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let disposed = disposed.clone();
+            thread::spawn(move || pump(output, codec, demux, reply_tx, events, disposed))
+        };
         Self {
             side: Side::Open {
                 commands: Box::new(commands),
                 reader,
+                disposed,
             },
             replies,
             state: ConnectionState::Ready,
@@ -245,7 +259,8 @@ impl Connection {
 
     /// A write that fails after the reader has reported its ending is that
     /// ending — tmux left, and the dead pipe is how the writer found out —
-    /// so the reported reason wins over the write error.
+    /// so the reported reason wins over the write error; and a block that
+    /// settled in between is reported, not lost with the write.
     fn send(&mut self, command: &CommandLine) -> Result<(), TmuxError> {
         let Side::Open { commands, .. } = &mut self.side else {
             return Err(TmuxError::NotReady(self.state));
@@ -253,16 +268,20 @@ impl Connection {
         let written = commands
             .write_all(command.wire())
             .and_then(|()| commands.flush());
-        match written {
-            Ok(()) => Ok(()),
-            Err(err) => match self.replies.try_recv() {
-                Ok(Reply::Ended(end)) => Err(self.ended(end)),
-                _ => {
-                    self.state = self.state.closed(CloseReason::TransportError);
-                    Err(TmuxError::Send(err))
-                }
-            },
-        }
+        let Err(err) = written else {
+            return Ok(());
+        };
+        Err(match self.replies.try_recv() {
+            Ok(Reply::Ended(end)) => self.ended(end),
+            Ok(Reply::Settled(reply)) => {
+                self.state = self.state.closed(CloseReason::TransportError);
+                TmuxError::UnsolicitedReply(Box::new(reply))
+            }
+            Err(_) => {
+                self.state = self.state.closed(CloseReason::TransportError);
+                TmuxError::Send(err)
+            }
+        })
     }
 
     /// The oldest reply not yet taken, waiting for the reader if none has
@@ -294,7 +313,13 @@ impl Connection {
     /// Local-side teardown: drops the command writer — which ends the read
     /// side, see [`Connection::over`] — and joins the reader. Idempotent.
     pub fn close(&mut self) {
-        if let Side::Open { commands, reader } = std::mem::replace(&mut self.side, Side::Closed) {
+        if let Side::Open {
+            commands,
+            reader,
+            disposed,
+        } = std::mem::replace(&mut self.side, Side::Closed)
+        {
+            disposed.store(true, Ordering::SeqCst);
             drop(commands);
             // A panic on the reader thread has already been raised louder
             // than here, and the thread is gone either way.
@@ -415,13 +440,16 @@ fn deliver(routed: Routed, replies: &Sender<Reply>, events: &mut EventSink) -> b
 }
 
 /// The reader thread: read, decode, route, until the read side ends; then
-/// report the ending to both the reply channel and the sink and stop.
+/// report the ending — to the reply channel first, so a caller whose sink
+/// wakes it finds the ending waiting on its next call rather than a dead
+/// pipe — and to the sink, and stop.
 fn pump(
     mut output: Box<dyn Read + Send>,
     mut codec: Codec,
     mut demux: Demux,
     replies: Sender<Reply>,
     mut events: EventSink,
+    disposed: Arc<AtomicBool>,
 ) {
     let end = loop {
         let mut connected = true;
@@ -435,8 +463,13 @@ fn pump(
             break end;
         }
     };
-    events(Event::Closed(end.reason()));
+    let end = match disposed.load(Ordering::SeqCst) {
+        true => ReadEnd::Disposed,
+        false => end,
+    };
+    let reason = end.reason();
     let _ = replies.send(Reply::Ended(end));
+    events(Event::Closed(reason));
 }
 
 #[cfg(test)]
