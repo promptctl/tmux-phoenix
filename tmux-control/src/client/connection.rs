@@ -197,13 +197,8 @@ impl Connection {
             demux,
             behind_greeting,
         } = link;
-        for item in behind_greeting {
-            match item {
-                Behind::Event(event) => events(event),
-                Behind::Settled(settled) => reply_tx
-                    .send(Reply::Settled(settled))
-                    .expect("the receiver is held right here"),
-            }
+        for routed in behind_greeting {
+            deliver(routed, &reply_tx, &mut events);
         }
         let reader = thread::spawn(move || pump(output, codec, demux, reply_tx, events));
         Self {
@@ -331,21 +326,16 @@ impl Execute for Connection {
     }
 }
 
-/// Something decoded from the same read as the greeting's terminator, in
-/// arrival order. Held rather than delivered because no sink exists until
-/// the greeting has succeeded — a failed attempt's `%exit` is not an event
-/// of any connection the caller has.
-enum Behind {
-    Event(Event),
-    Settled(Settled),
-}
-
-/// A read side past its greeting, with the decoder state that read it.
+/// A read side past its greeting, with the decoder state that read it and
+/// whatever was decoded from the same read as the greeting's terminator, in
+/// arrival order. That is held rather than delivered because no sink exists
+/// until the greeting has succeeded — a failed attempt's `%exit` is not an
+/// event of any connection the caller has.
 struct Link {
     output: Box<dyn Read + Send>,
     codec: Codec,
     demux: Demux,
-    behind_greeting: Vec<Behind>,
+    behind_greeting: VecDeque<Routed>,
 }
 
 impl Link {
@@ -375,19 +365,11 @@ impl Link {
             }
             Err(err) => return Err(err),
         }
-        let behind_greeting = routed
-            .into_iter()
-            .map(|r| match r {
-                Routed::Reply(settled) => Behind::Settled(settled),
-                Routed::Notification(msg) => Behind::Event(Event::Notification(msg)),
-                Routed::PaneOutput(pane, data) => Behind::Event(Event::PaneOutput(pane, data)),
-            })
-            .collect();
         Ok(Self {
             output,
             codec,
             demux,
-            behind_greeting,
+            behind_greeting: routed,
         })
     }
 }
@@ -415,10 +397,25 @@ fn read_routed(
     Ok(())
 }
 
+/// One routed message to its destination: a reply to the channel, anything
+/// else to the sink. `false` once the channel's receiver — the
+/// [`Connection`] — is gone, and with it anyone to report to.
+fn deliver(routed: Routed, replies: &Sender<Reply>, events: &mut EventSink) -> bool {
+    match routed {
+        Routed::Reply(reply) => replies.send(Reply::Settled(reply)).is_ok(),
+        Routed::Notification(msg) => {
+            events(Event::Notification(msg));
+            true
+        }
+        Routed::PaneOutput(pane, data) => {
+            events(Event::PaneOutput(pane, data));
+            true
+        }
+    }
+}
+
 /// The reader thread: read, decode, route, until the read side ends; then
-/// report the ending to both the reply channel and the sink and stop. A reply
-/// send that fails means the [`Connection`] is gone, and with it anyone to
-/// report to.
+/// report the ending to both the reply channel and the sink and stop.
 fn pump(
     mut output: Box<dyn Read + Send>,
     mut codec: Codec,
@@ -427,13 +424,11 @@ fn pump(
     mut events: EventSink,
 ) {
     let end = loop {
-        let mut gone = false;
-        let read = read_routed(&mut output, &mut codec, &mut demux, |r| match r {
-            Routed::Reply(reply) => gone |= replies.send(Reply::Settled(reply)).is_err(),
-            Routed::Notification(msg) => events(Event::Notification(msg)),
-            Routed::PaneOutput(pane, data) => events(Event::PaneOutput(pane, data)),
+        let mut connected = true;
+        let read = read_routed(&mut output, &mut codec, &mut demux, |r| {
+            connected &= deliver(r, &replies, &mut events)
         });
-        if gone {
+        if !connected {
             return;
         }
         if let Err(end) = read {
