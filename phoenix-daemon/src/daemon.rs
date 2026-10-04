@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use phoenix_capture::Previous;
 use phoenix_core::{Shells, Snapshot};
-use phoenix_store::{Retention, Store, StoreError};
+use phoenix_store::{Retention, Store, StoreError, Unreadable};
 use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
 };
@@ -63,6 +63,9 @@ pub enum DaemonError {
     Tmux(TmuxError),
     Capture(phoenix_capture::CaptureError),
     Store(StoreError),
+    /// A save succeeded beside a generation file the store could not read;
+    /// that file was kept. Reported by every save until it is gone.
+    UnreadableGeneration(Unreadable),
     /// Every session on the server is a bootstrap session (one window, one
     /// pane idle at its shell); saving it would make the newest generation
     /// name a server a login terminal just started, in place of the real
@@ -77,6 +80,7 @@ impl std::fmt::Display for DaemonError {
             DaemonError::Tmux(e) => write!(f, "{e}"),
             DaemonError::Capture(e) => write!(f, "{e}"),
             DaemonError::Store(e) => write!(f, "{e}"),
+            DaemonError::UnreadableGeneration(kept) => write!(f, "{kept}"),
             DaemonError::BootstrapOnly => write!(
                 f,
                 "not saved: every session on the server is an untouched bootstrap session \
@@ -95,7 +99,9 @@ const SAVE_WAIT: Duration = Duration::ZERO;
 /// What one save cycle came to. Refusing a bootstrap-only capture is an
 /// answer about the server, not a failed save, so it is a value here.
 enum Cycle {
-    Saved(Snapshot),
+    /// The snapshot, and the generations the store kept without being able
+    /// to read them.
+    Saved(Snapshot, Vec<Unreadable>),
     Refused(Snapshot),
 }
 
@@ -116,10 +122,10 @@ fn capture_and_save<T: Transport>(
     let retention = Retention {
         keep_untagged: keep_generations,
     };
-    store
+    let outcome = store
         .save(&snapshot, None, retention, SAVE_WAIT)
         .map_err(DaemonError::Store)?;
-    Ok(Cycle::Saved(snapshot))
+    Ok(Cycle::Saved(snapshot, outcome.unreadable))
 }
 
 /// Whether `e` means the connection itself is gone (tmux exited, the pipe
@@ -226,7 +232,10 @@ pub fn run<T: Transport>(
 
         if state.should_save(&config.policy, Instant::now()) {
             match capture_and_save(client, store, &previous_content, config.keep_generations) {
-                Ok(Cycle::Saved(snapshot)) => {
+                Ok(Cycle::Saved(snapshot, unreadable)) => {
+                    for kept in unreadable {
+                        on_error(&DaemonError::UnreadableGeneration(kept));
+                    }
                     previous_content = Previous::from_snapshot(&snapshot);
                     state.record_save(Instant::now());
                     *boot = Boot::Settled;

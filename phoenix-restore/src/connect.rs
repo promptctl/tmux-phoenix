@@ -241,8 +241,10 @@ pub fn probe(socket: Option<&str>) -> Result<ServerState, ConnectApplyError> {
     Ok(ServerState::of(&capture_server(socket)?))
 }
 
-/// Every session on a populated server, structure and foreground programs
-/// only, over a short-lived control connection.
+/// Every session on a populated server over a short-lived control
+/// connection. A full capture, pane content included: content is not a mode,
+/// and this probe goes away with the bootstrap heuristic that needs it
+/// (tmux-laws-a4x.kdi).
 fn capture_server(socket: Option<&str>) -> Result<Snapshot, ConnectApplyError> {
     let mut client = attach(socket.map(str::to_string), None, drop)?;
     let live = capture(&mut client, &Previous::default(), &Shells::default());

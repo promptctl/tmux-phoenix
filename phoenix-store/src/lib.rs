@@ -15,7 +15,7 @@ mod version;
 
 pub use error::StoreError;
 pub use json::to_json;
-pub use store::{GenerationInfo, Retention, SaveOutcome, Store};
+pub use store::{GenerationInfo, Retention, SaveOutcome, Store, Unreadable};
 pub use tag::Tag;
 pub use version::FormatVersion;
 

@@ -9,26 +9,33 @@ pub struct IsolatedTmux {
     pub session: String,
 }
 
+/// Every pane on a test server runs this: a shell with no startup files is
+/// idle at its prompt and stays there. The developer's own interactive
+/// shell is not — its rc files and prompt hooks hand the terminal to
+/// short-lived children at any moment, and a save that lands on one reads a
+/// foreground it cannot recover and exits 3 (seen live as a one-in-four
+/// failure of this suite).
+const IDLE_SHELL: &str = "bash --norc --noprofile";
+
 impl IsolatedTmux {
+    /// One session, one window, one idle shell — what `save` calls a
+    /// bootstrap session until [`IsolatedTmux::build`] splits it.
     pub fn new(name: &str) -> Self {
-        Self::spawn(name, &[])
-    }
-
-    /// A server whose one pane is a shell with no startup files, so it is
-    /// idle at its prompt from its first instant: the shape of a bootstrap
-    /// session with nothing left to settle. The user's own shell under a
-    /// loaded test run can still be handing the terminal to its rc files'
-    /// children when a save reads the foreground.
-    pub fn idle_shell(name: &str) -> Self {
-        Self::spawn(name, &["bash", "--norc", "--noprofile"])
-    }
-
-    fn spawn(name: &str, command: &[&str]) -> Self {
         let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
         let session = format!("phoenix-test-{name}");
+        // One invocation: the option is set by the same command list that
+        // makes the session, so no pane ever starts under another default.
         let status = std::process::Command::new("tmux")
-            .args(["-S", &socket, "new-session", "-d", "-s", &session])
-            .args(command)
+            .args([
+                "-S",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                IDLE_SHELL,
+            ])
+            .args([";", "set-option", "-g", "default-command", IDLE_SHELL])
             .status()
             .expect("failed to run tmux new-session");
         assert!(status.success(), "tmux new-session failed");

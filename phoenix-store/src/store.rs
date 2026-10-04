@@ -63,6 +63,28 @@ pub struct SaveOutcome {
     /// are reported rather than failing the whole operation (crash-safety
     /// is about the snapshot itself, not disk cleanup).
     pub prune_errors: Vec<(PathBuf, io::Error)>,
+    /// Generations whose header could not be read. Whether one is tagged is
+    /// unknowable, so none is ever pruned.
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// A generation file in the store whose header this build cannot read: a
+/// newer format, a torn or foreign file.
+#[derive(Debug)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    pub error: StoreError,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "generation {} is unreadable and was kept: {}",
+            self.path.display(),
+            self.error
+        )
+    }
 }
 
 /// One generation as its header describes it — no body decoded.
@@ -137,15 +159,23 @@ impl Store {
         // with respect to every other save and every reader.
         let _lock = self.lock(LockMode::Exclusive, wait)?;
 
-        // [LAW:no-silent-failure] every existing header is read before this
-        // generation is published: a file this build cannot read fails the
-        // save while nothing has been written, never after the new
-        // generation already exists.
-        let existing = self.headers_desc()?;
-        let generation = next_generation_id(
-            existing.first().map(|g| g.id),
-            snapshot.captured_at.unix_timestamp(),
-        )?;
+        // Everything that can refuse this save runs before anything is
+        // published, so a save that returns `Err` has written no generation.
+        let ids = self.generation_ids_desc()?;
+        let generation =
+            next_generation_id(ids.first().copied(), snapshot.captured_at.unix_timestamp())?;
+        self.retire_latest_pointer()?;
+        // [LAW:no-silent-failure] a generation whose header this build cannot
+        // read is neither a reason to stop saving nor something to prune on
+        // a guess: it is kept, and reported by every save until it is gone.
+        let mut existing = Vec::new();
+        let mut unreadable = Vec::new();
+        for id in ids {
+            match self.generation_info(id) {
+                Ok(info) => existing.push(info),
+                Err(kept) => unreadable.push(kept),
+            }
+        }
         let final_path = self.generation_path(generation);
         let tmp_path = self
             .dir
@@ -164,7 +194,6 @@ impl Store {
         if let Ok(dir_handle) = fs::File::open(&self.dir) {
             let _ = dir_handle.sync_all();
         }
-        self.retire_latest_pointer()?;
 
         let published = GenerationInfo {
             id: generation,
@@ -181,6 +210,7 @@ impl Store {
             path: final_path,
             pruned,
             prune_errors,
+            unreadable,
         })
     }
 
@@ -287,26 +317,30 @@ impl Store {
         Ok(ids)
     }
 
-    fn read_header(&self, generation: GenerationId) -> Result<(PathBuf, Header), StoreError> {
-        let path = self.generation_path(generation);
-        let bytes = fs::read(&path)?;
-        let header = decode_header(&bytes)?;
-        Ok((path, header))
+    fn generation_info(&self, id: GenerationId) -> Result<GenerationInfo, Unreadable> {
+        let path = self.generation_path(id);
+        let header: Result<Header, StoreError> = fs::read(&path)
+            .map_err(StoreError::Io)
+            .and_then(|bytes| decode_header(&bytes));
+        match header {
+            Ok(header) => Ok(GenerationInfo {
+                id,
+                path,
+                format_version: header.format_version,
+                origin: header.origin,
+                captured_at: header.captured_at,
+                tag: header.tag,
+            }),
+            Err(error) => Err(Unreadable { path, error }),
+        }
     }
 
     fn headers_desc(&self) -> Result<Vec<GenerationInfo>, StoreError> {
         self.generation_ids_desc()?
             .into_iter()
             .map(|id| {
-                let (path, header) = self.read_header(id)?;
-                Ok(GenerationInfo {
-                    id,
-                    path,
-                    format_version: header.format_version,
-                    origin: header.origin,
-                    captured_at: header.captured_at,
-                    tag: header.tag,
-                })
+                self.generation_info(id)
+                    .map_err(|unreadable| unreadable.error)
             })
             .collect()
     }
@@ -673,11 +707,29 @@ mod tests {
     }
 
     #[test]
-    fn a_save_beside_an_unreadable_generation_fails_before_publishing_anything() {
+    fn a_save_beside_an_unreadable_generation_succeeds_keeps_it_and_reports_it() {
         let dir = TestDir::new("unreadable-neighbour");
         let store = Store::new(&dir.0);
-        save(&store, 1_700_000_000, keep(5));
-        fs::write(store.generation_path(GenerationId(1_700_000_050)), b"stray").unwrap();
+        save(&store, 1_700_000_000, keep(1));
+        let stray = store.generation_path(GenerationId(1_700_000_050));
+        fs::write(&stray, b"stray").unwrap();
+
+        let outcome = save(&store, 1_700_000_100, keep(1));
+        assert!(outcome.path.exists());
+        assert_eq!(outcome.pruned.len(), 1, "the readable older one is pruned");
+        assert!(
+            stray.exists(),
+            "an unclassifiable generation is never pruned"
+        );
+        assert_eq!(outcome.unreadable.len(), 1);
+        assert_eq!(outcome.unreadable[0].path, stray);
+    }
+
+    #[test]
+    fn a_save_that_cannot_retire_the_old_latest_pointer_publishes_nothing() {
+        let dir = TestDir::new("latest-is-a-directory");
+        let store = Store::new(&dir.0);
+        fs::create_dir_all(dir.0.join(RETIRED_LATEST_NAME).join("occupied")).unwrap();
 
         let err = store
             .save(
@@ -687,10 +739,7 @@ mod tests {
                 Duration::ZERO,
             )
             .unwrap_err();
-        assert!(
-            matches!(err, StoreError::BadMagic | StoreError::Truncated),
-            "{err}"
-        );
+        assert!(matches!(err, StoreError::Io(_)), "{err}");
         assert!(
             !store.generation_path(GenerationId(1_700_000_100)).exists(),
             "a save that fails must not have published a generation"

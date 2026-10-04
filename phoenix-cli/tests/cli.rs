@@ -122,7 +122,7 @@ fn save_refuses_a_server_holding_only_a_bootstrap_session_and_writes_nothing() {
     // A fresh `tmux` from a login terminal: one session, one window, one
     // idle shell. Publishing it would replace the generation it is about to
     // be restored from.
-    let harness = IsolatedTmux::idle_shell("cli-bootstrap-refused");
+    let harness = IsolatedTmux::new("cli-bootstrap-refused");
     let data_dir = TestDataDir::new("bootstrap-refused");
 
     harness.wait_until_settled();
@@ -273,7 +273,12 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         .env("XDG_DATA_HOME", &data_dir.0)
         .output()
         .expect("failed to run phoenix save");
-    assert!(save.status.success());
+    assert!(
+        save.status.success(),
+        "phoenix save: {:?} stderr={}",
+        save.status.code(),
+        String::from_utf8_lossy(&save.stderr)
+    );
 
     // This is the populated-server case (tmux-parity-ure.1 criterion 3): a
     // second, unrelated session survives, so restore attaches to the live

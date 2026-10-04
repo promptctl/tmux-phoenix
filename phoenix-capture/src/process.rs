@@ -145,18 +145,20 @@ mod os {
         parse_procargs2(&buf)
     }
 
-    /// `KERN_PROCARGS2` answers `EINVAL` both for a vanished pid and for a
-    /// live process of another user (verified live on Darwin 25: pid 1 and a
-    /// root `syslogd` read as EINVAL exactly like a dead pid); `ESRCH` is the
-    /// documented spelling for gone. `KERN_PROC_PID` tells the two apart —
-    /// zero bytes for a dead pid, a full `kinfo_proc` for a live one — so
-    /// the leader is gone only when it says so too.
+    /// `KERN_PROCARGS2` answers `EINVAL` for a vanished pid, for a process
+    /// of another user, and for one of our own that has no argv to give —
+    /// exiting, or not yet through `exec` (verified live on Darwin 25: pid 1
+    /// and a root `syslogd` read as EINVAL exactly like a dead pid, and so
+    /// does a shell's short-lived child caught at the wrong instant).
+    /// `ESRCH` is the documented spelling for gone. `KERN_PROC_PID` answers
+    /// zero bytes only for the vanished pid, so the leader is gone only
+    /// when it says so too.
     fn gone_or_os(pid: u32) -> ProcessError {
         let err = io::Error::last_os_error();
         match (err.raw_os_error(), terminal_group(pid)) {
             (Some(3), _) | (Some(22), Err(ProcessError::Gone)) => ProcessError::Gone,
             (Some(22), Ok(_)) => ProcessError::Os(format!(
-                "KERN_PROCARGS2 refused pid {pid}: it is alive but its argv is not readable by this user"
+                "KERN_PROCARGS2 refused pid {pid}, which exists: another user's process, or one exiting or not yet through exec"
             )),
             _ => ProcessError::Os(err.to_string()),
         }
@@ -228,14 +230,20 @@ mod os {
         let cmdline = read(&format!("/proc/{pid}/cmdline"))?;
         // A zombie has an empty cmdline: the leader is gone in every sense
         // that matters here.
-        let args = cmdline.strip_suffix(&[0]).ok_or(ProcessError::Gone)?;
+        if cmdline.is_empty() {
+            return Err(ProcessError::Gone);
+        }
         // argv is exact: an empty argument (`grep '' f`) is one of the
-        // NUL-terminated strings and stays one.
-        let args: Vec<String> = args
+        // NUL-terminated strings and stays one. Only the last terminator is
+        // not a separator — and a process that rewrote its title may have
+        // left none.
+        let args: Vec<String> = cmdline
+            .strip_suffix(&[0])
+            .unwrap_or(&cmdline)
             .split(|&b| b == 0)
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        NonEmpty::from_vec(args).ok_or(ProcessError::Gone)
+        Ok(NonEmpty::from_vec(args).expect("split yields at least one piece"))
     }
 }
 

@@ -63,7 +63,7 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
     // The previous generation's indicators let an unchanged pane reuse its
     // scrollback; nothing saved yet is the normal first run. Any other
     // failure to read it is reported, and this save then recaptures every
-    // pane in full — the new generation is the way past an unreadable one.
+    // pane in full.
     let previous = match store.load_latest() {
         Ok(snapshot) => Previous::from_snapshot(&snapshot),
         Err(StoreError::NoLatest) => Previous::default(),
@@ -111,6 +111,10 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
             "phoenix save: warning: failed to prune {}: {err}",
             path.display()
         );
+    }
+
+    for unreadable in &outcome.unreadable {
+        eprintln!("phoenix save: warning: {unreadable}");
     }
 
     let degradations = snapshot.degradations();
