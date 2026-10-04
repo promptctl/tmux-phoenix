@@ -244,6 +244,22 @@ fn an_abort_from_another_thread_releases_a_blocked_execute_as_disposed() {
 }
 
 #[test]
+fn close_after_a_stray_block_and_an_exit_records_the_stray_first() {
+    let (mut connection, script, _sent, events) = connected();
+    script.send("%begin 1 9 1\nstray\n%end 1 9 1\n");
+    script.hangup();
+    assert_eq!(next(&events), Event::Closed(CloseReason::Exit));
+
+    connection.close();
+    assert_eq!(
+        connection.state(),
+        ConnectionState::Closed {
+            reason: CloseReason::Protocol
+        }
+    );
+}
+
+#[test]
 fn close_after_tmux_left_keeps_exit_as_the_reason() {
     let (mut connection, script, _sent, events) = connected();
     script.hangup();

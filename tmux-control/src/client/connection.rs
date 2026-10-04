@@ -346,8 +346,13 @@ impl Connection {
     /// close wins); only a link still up becomes `Disposed`.
     pub fn close(&mut self) {
         if let Side::Open { commands, reader } = std::mem::replace(&mut self.side, Side::Closed) {
-            if let Ok(Reply::Ended(end)) = self.replies.try_recv() {
-                self.ended(end);
+            // Whatever the reader already reported is the ending; the first
+            // one recorded wins, so draining in order is enough.
+            for reply in self.replies.try_iter().collect::<Vec<_>>() {
+                match reply {
+                    Reply::Settled(reply) => self.unsolicited(reply),
+                    Reply::Ended(end) => self.ended(end),
+                };
             }
             self.abort.disposed.store(true, Ordering::SeqCst);
             drop(commands);
