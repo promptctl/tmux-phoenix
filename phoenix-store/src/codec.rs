@@ -92,7 +92,7 @@ fn write_option<T>(w: &mut Writer, value: Option<&T>, write: impl FnOnce(&mut Wr
     }
 }
 
-fn read_option<T>(
+pub(crate) fn read_option<T>(
     r: &mut Reader,
     read: impl FnOnce(&mut Reader) -> Result<T, StoreError>,
 ) -> Result<Option<T>, StoreError> {

@@ -38,10 +38,12 @@ pub enum Touched {
 }
 
 /// Whether a live window is one phoenix built: the window option
-/// `@phoenix-window=<generation>:<saved window id>`, stamped by the restore
-/// plan as the last step of the window's group. A window option follows the
-/// window through `link-window` (verified live), so a shared window carries
-/// one stamp however many sessions link it.
+/// `@phoenix-window=<generation>:<saved window id>`, to be stamped by the
+/// restore plan as the last step of the window's group (tmux-laws-a4x.kdi;
+/// until that lands nothing writes it and every live window reads
+/// `NotByPhoenix`). A window option follows the window through
+/// `link-window` (verified live), so a shared window carries one stamp
+/// however many sessions link it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Made {
     ByPhoenix {

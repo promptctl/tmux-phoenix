@@ -118,6 +118,31 @@ fn save_exit_code_is_zero_when_a_pane_is_idle() {
 }
 
 #[test]
+fn save_refuses_a_server_holding_only_a_bootstrap_session_and_writes_nothing() {
+    // A fresh `tmux` from a login terminal: one session, one window, one
+    // idle shell. Publishing it would replace the generation it is about to
+    // be restored from.
+    let harness = IsolatedTmux::idle_shell("cli-bootstrap-refused");
+    let data_dir = TestDataDir::new("bootstrap-refused");
+
+    harness.wait_until_settled();
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+
+    assert_eq!(save.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&save.stderr);
+    assert!(stderr.contains("not saved"), "stderr: {stderr}");
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    assert!(
+        store.list().expect("an empty store lists").is_empty(),
+        "a refused save must leave no generation behind"
+    );
+}
+
+#[test]
 fn list_before_any_save_succeeds_with_empty_output() {
     let data_dir = TestDataDir::new("empty-list");
 

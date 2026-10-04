@@ -169,10 +169,12 @@ pub fn capture<C: Execute>(
         CaptureError::ListClients,
     )?;
     let touched = server_mark(client)?;
+    // Read before the panes: content reuse from `previous` is keyed on it.
+    let server = server_id(client)?;
 
     let folded = fold(rows, &mut |row| {
         let foreground = process::foreground(row.pane_pid, shells);
-        let content = capture_content(client, row.pane_id, row.indicator, previous)?;
+        let content = capture_content(client, server, row.pane_id, row.indicator, previous)?;
         Ok(PaneReads {
             foreground,
             content,
@@ -186,7 +188,7 @@ pub fn capture<C: Execute>(
         major: version.major,
         minor: version.minor,
     };
-    let origin = Origin::Recorded(server_id(client)?);
+    let origin = Origin::Recorded(server);
     let captured_at = OffsetDateTime::try_from(SystemTime::now()).map_err(CaptureError::Clock)?;
 
     Snapshot::new(

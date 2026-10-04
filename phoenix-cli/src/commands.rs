@@ -61,13 +61,15 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
     };
 
     // The previous generation's indicators let an unchanged pane reuse its
-    // scrollback; nothing saved yet is the normal first run.
+    // scrollback; nothing saved yet is the normal first run. Any other
+    // failure to read it is reported, and this save then recaptures every
+    // pane in full — the new generation is the way past an unreadable one.
     let previous = match store.load_latest() {
         Ok(snapshot) => Previous::from_snapshot(&snapshot),
         Err(StoreError::NoLatest) => Previous::default(),
         Err(e) => {
-            eprintln!("phoenix save: failed to load the latest snapshot: {e}");
-            return EXIT_FAIL;
+            eprintln!("phoenix save: warning: failed to load the latest snapshot: {e}");
+            Previous::default()
         }
     };
     let snapshot = match phoenix_capture::capture(&mut client, &previous, &Shells::default()) {
@@ -79,6 +81,18 @@ pub fn run_save(keep: std::num::NonZeroUsize, socket: Option<String>) -> i32 {
         }
     };
     client.close();
+
+    // Until the recorded provenance replaces it (tmux-laws-a4x.9xh), the
+    // bootstrap heuristic keeps a login terminal's fresh server from being
+    // published over the generation it is about to be restored from; the
+    // daemon makes the same refusal from the same `Snapshot` method.
+    if snapshot.is_bootstrap_only() {
+        eprintln!(
+            "phoenix save: not saved: every session on the server is an untouched bootstrap \
+             session (one window, one idle shell), and saving it would replace the latest snapshot"
+        );
+        return EXIT_FAIL;
+    }
 
     let retention = Retention {
         keep_untagged: keep,

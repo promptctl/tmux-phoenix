@@ -21,22 +21,8 @@ use phoenix_core::{
 
 use crate::binary::Reader;
 use crate::blob_store::BlobStore;
-use crate::codec::{read_content, read_name, read_non_empty};
+use crate::codec::{read_content, read_name, read_non_empty, read_option};
 use crate::error::StoreError;
-
-fn read_option<T>(
-    r: &mut Reader,
-    read: impl FnOnce(&mut Reader) -> Result<T, StoreError>,
-) -> Result<Option<T>, StoreError> {
-    match r.read_u8()? {
-        0 => Ok(None),
-        1 => read(r).map(Some),
-        value => Err(StoreError::InvalidTag {
-            what: "option",
-            value,
-        }),
-    }
-}
 
 pub fn decode_body(
     bytes: &[u8],

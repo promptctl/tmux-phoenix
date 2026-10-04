@@ -8,10 +8,8 @@
 //! `phoenix_restore::connect_and_apply`, which the CLI's `restore` shares.
 //! This module only decides whether to call it.
 
-use phoenix_core::{NonEmpty, SessionName, Snapshot};
-use phoenix_restore::{
-    connect_and_apply, plan, probe, server_id, ConnectApplyError, ServerId, ServerState,
-};
+use phoenix_core::{NonEmpty, ServerId, SessionName, Snapshot};
+use phoenix_restore::{connect_and_apply, plan, probe, server_id, ConnectApplyError, ServerState};
 use phoenix_store::{Store, StoreError};
 use tmux_control::{Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 

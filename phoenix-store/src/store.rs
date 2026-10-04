@@ -7,7 +7,7 @@
 //! (`[LAW:one-source-of-truth]`).
 //!
 //! **One lock, two modes.** Every save runs under an exclusive `flock` on
-//! `.lock` in the store dir, from the temp write through prune, so saves
+//! the store directory, from the temp write through prune, so saves
 //! from separate processes (a manual `phoenix save`, the daemon) run one at
 //! a time. Every reader takes the same lock shared, so a listing is a
 //! consistent view and [`StoreError::NoLatest`] can only mean "no
@@ -33,7 +33,6 @@ const GENERATION_SUFFIX: &str = ".phnx";
 /// first save, since nothing reads it any more.
 const RETIRED_LATEST_NAME: &str = "latest";
 const BLOBS_DIR: &str = "blobs";
-const LOCK_NAME: &str = ".lock";
 /// How often a waiting save retries the lock. Granularity of the caller's
 /// `wait` only — correctness rests on the lock, never on this interval.
 const LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -138,7 +137,15 @@ impl Store {
         // with respect to every other save and every reader.
         let _lock = self.lock(LockMode::Exclusive, wait)?;
 
-        let generation = self.next_generation_id(snapshot.captured_at.unix_timestamp())?;
+        // [LAW:no-silent-failure] every existing header is read before this
+        // generation is published: a file this build cannot read fails the
+        // save while nothing has been written, never after the new
+        // generation already exists.
+        let existing = self.headers_desc()?;
+        let generation = next_generation_id(
+            existing.first().map(|g| g.id),
+            snapshot.captured_at.unix_timestamp(),
+        )?;
         let final_path = self.generation_path(generation);
         let tmp_path = self
             .dir
@@ -159,7 +166,15 @@ impl Store {
         }
         self.retire_latest_pointer()?;
 
-        let (pruned, prune_errors) = self.prune(retention)?;
+        let published = GenerationInfo {
+            id: generation,
+            path: final_path.clone(),
+            format_version: FormatVersion::CURRENT,
+            origin: snapshot.origin,
+            captured_at: snapshot.captured_at,
+            tag: tag.cloned(),
+        };
+        let (pruned, prune_errors) = prune(retention, std::iter::once(published).chain(existing));
 
         Ok(SaveOutcome {
             generation,
@@ -179,17 +194,14 @@ impl Store {
         }
     }
 
-    /// Takes this store's lock in `mode`, released when the returned file
-    /// closes. The lock file is never deleted: unlinking it while another
-    /// holder has or awaits the old inode would let two holders each lock a
-    /// different file.
+    /// Takes this store's lock in `mode`, released when the returned handle
+    /// closes. The lock is on the store directory itself: it needs no file
+    /// that could be unlinked out from under a waiting holder, and a reader
+    /// needs only to open the directory, so a store it cannot write to is
+    /// still one it can list and load (verified live: `flock` on a directory
+    /// handle, shared and exclusive, on Darwin 25).
     fn lock(&self, mode: LockMode, wait: Duration) -> Result<fs::File, StoreError> {
-        let path = self.dir.join(LOCK_NAME);
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)?;
+        let file = fs::File::open(&self.dir)?;
         let deadline = Instant::now() + wait;
         loop {
             let attempt = match mode {
@@ -203,7 +215,7 @@ impl Store {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(StoreError::Contended {
-                            lock: path,
+                            lock: self.dir.clone(),
                             waited: wait,
                         });
                     }
@@ -221,25 +233,6 @@ impl Store {
     fn read_lock(&self) -> Result<fs::File, StoreError> {
         fs::create_dir_all(&self.dir)?;
         self.lock(LockMode::Shared, Self::READ_WAIT)
-    }
-
-    /// `captured_at`'s Unix timestamp, raised above the newest existing
-    /// generation when it isn't already. Ids must rise in save order:
-    /// the highest id is latest and pruning keeps the highest ids, so a
-    /// lower id — two captures in one second, an older capture saved after
-    /// a newer one, a clock stepped backwards — would be pruned out from
-    /// under the save that made it.
-    fn next_generation_id(&self, captured_at: i64) -> io::Result<GenerationId> {
-        match self.generation_ids_desc()?.first() {
-            None => Ok(GenerationId(captured_at)),
-            Some(newest) => newest
-                .0
-                .checked_add(1)
-                .map(|above_newest| GenerationId(captured_at.max(above_newest)))
-                .ok_or_else(|| {
-                    io::Error::other(format!("generation id {newest} leaves no id above it"))
-                }),
-        }
     }
 
     /// The newest generation. Under the shared lock from listing through
@@ -324,21 +317,41 @@ impl Store {
         let _lock = self.read_lock()?;
         self.headers_desc()
     }
+}
 
-    /// Deletes every untagged generation beyond the newest
-    /// `keep_untagged`. Runs under the exclusive lock the save holds.
-    fn prune(&self, retention: Retention) -> Result<PruneResult, StoreError> {
-        let mut pruned = Vec::new();
-        let mut errors = Vec::new();
-        let untagged = self.headers_desc()?.into_iter().filter(|g| g.tag.is_none());
-        for generation in untagged.skip(retention.keep_untagged.get()) {
-            match fs::remove_file(&generation.path) {
-                Ok(()) => pruned.push(generation.path),
-                Err(e) => errors.push((generation.path, e)),
-            }
-        }
-        Ok((pruned, errors))
+/// `captured_at`'s Unix timestamp, raised above the newest existing
+/// generation when it isn't already. Ids must rise in save order:
+/// the highest id is latest and pruning keeps the highest ids, so a
+/// lower id — two captures in one second, an older capture saved after
+/// a newer one, a clock stepped backwards — would be pruned out from
+/// under the save that made it.
+fn next_generation_id(newest: Option<GenerationId>, captured_at: i64) -> io::Result<GenerationId> {
+    match newest {
+        None => Ok(GenerationId(captured_at)),
+        Some(newest) => newest
+            .0
+            .checked_add(1)
+            .map(|above_newest| GenerationId(captured_at.max(above_newest)))
+            .ok_or_else(|| {
+                io::Error::other(format!("generation id {newest} leaves no id above it"))
+            }),
     }
+}
+
+/// Deletes every untagged generation beyond the newest `keep_untagged` of
+/// `generations`, which are newest first. Runs under the exclusive lock the
+/// save holds.
+fn prune(retention: Retention, generations: impl Iterator<Item = GenerationInfo>) -> PruneResult {
+    let mut pruned = Vec::new();
+    let mut errors = Vec::new();
+    let untagged = generations.filter(|g| g.tag.is_none());
+    for generation in untagged.skip(retention.keep_untagged.get()) {
+        match fs::remove_file(&generation.path) {
+            Ok(()) => pruned.push(generation.path),
+            Err(e) => errors.push((generation.path, e)),
+        }
+    }
+    (pruned, errors)
 }
 
 fn generation_id_from_file_name(name: &str) -> Option<GenerationId> {
@@ -590,7 +603,7 @@ mod tests {
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(5));
 
-        let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
+        let holder = fs::File::open(&dir.0).unwrap();
         holder.lock().unwrap();
         for wait in [Duration::ZERO, Duration::from_millis(50)] {
             let err = store
@@ -608,7 +621,7 @@ mod tests {
         let store = Store::new(&dir.0);
         save(&store, 1_700_000_000, keep(5));
 
-        let holder = fs::File::open(dir.0.join(LOCK_NAME)).unwrap();
+        let holder = fs::File::open(&dir.0).unwrap();
         holder.lock().unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
@@ -645,8 +658,8 @@ mod tests {
     fn a_save_with_no_id_above_the_newest_generation_fails_and_leaves_latest_alone() {
         let dir = TestDir::new("id-overflow");
         let store = Store::new(&dir.0);
-        save(&store, 1_700_000_000, keep(5));
-        fs::write(store.generation_path(GenerationId(i64::MAX)), b"stray").unwrap();
+        let first = save(&store, 1_700_000_000, keep(5));
+        fs::copy(&first.path, store.generation_path(GenerationId(i64::MAX))).unwrap();
 
         assert!(matches!(
             store.save(
@@ -657,6 +670,31 @@ mod tests {
             ),
             Err(StoreError::Io(_))
         ));
+    }
+
+    #[test]
+    fn a_save_beside_an_unreadable_generation_fails_before_publishing_anything() {
+        let dir = TestDir::new("unreadable-neighbour");
+        let store = Store::new(&dir.0);
+        save(&store, 1_700_000_000, keep(5));
+        fs::write(store.generation_path(GenerationId(1_700_000_050)), b"stray").unwrap();
+
+        let err = store
+            .save(
+                &sample_snapshot(1_700_000_100),
+                None,
+                keep(5),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::BadMagic | StoreError::Truncated),
+            "{err}"
+        );
+        assert!(
+            !store.generation_path(GenerationId(1_700_000_100)).exists(),
+            "a save that fails must not have published a generation"
+        );
     }
 
     #[test]

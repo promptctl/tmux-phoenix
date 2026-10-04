@@ -11,10 +11,24 @@ pub struct IsolatedTmux {
 
 impl IsolatedTmux {
     pub fn new(name: &str) -> Self {
+        Self::spawn(name, &[])
+    }
+
+    /// A server whose one pane is a shell with no startup files, so it is
+    /// idle at its prompt from its first instant: the shape of a bootstrap
+    /// session with nothing left to settle. The user's own shell under a
+    /// loaded test run can still be handing the terminal to its rc files'
+    /// children when a save reads the foreground.
+    pub fn idle_shell(name: &str) -> Self {
+        Self::spawn(name, &["bash", "--norc", "--noprofile"])
+    }
+
+    fn spawn(name: &str, command: &[&str]) -> Self {
         let socket = format!("/tmp/tmux-phoenix-test-{name}-{}", std::process::id());
         let session = format!("phoenix-test-{name}");
         let status = std::process::Command::new("tmux")
             .args(["-S", &socket, "new-session", "-d", "-s", &session])
+            .args(command)
             .status()
             .expect("failed to run tmux new-session");
         assert!(status.success(), "tmux new-session failed");

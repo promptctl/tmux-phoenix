@@ -51,7 +51,7 @@ use std::collections::HashSet;
 use std::process::Command;
 
 use phoenix_capture::{capture, CaptureError, Previous};
-use phoenix_core::{NonEmpty, SessionName, Shells, Snapshot};
+use phoenix_core::{NonEmpty, ServerId, SessionName, Shells, Snapshot};
 use tmux_control::{socket_args, Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 
 use crate::apply::{apply, ApplyError, ApplyOutcome};
@@ -188,17 +188,20 @@ pub fn count_sessions(socket: Option<&str>) -> Result<usize, ConnectApplyError> 
 /// the same socket reads as a different one. Verified live against tmux 3.6a:
 /// `#{pid}:#{start_time}` is the same on every session of one server and
 /// changes when the server restarts. `None` where no server runs, or one runs
-/// with no sessions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerId(String);
-
+/// with no sessions. The same [`ServerId`] a capture records as its origin
+/// (`[LAW:one-source-of-truth]`).
 pub fn server_id(socket: Option<&str>) -> Result<Option<ServerId>, ConnectApplyError> {
-    Ok(
-        session_lines(socket, "#{pid}:#{start_time}", "identify the tmux server")?
-            .into_iter()
-            .next()
-            .map(ServerId),
-    )
+    const ACTION: &str = "identify the tmux server";
+    session_lines(socket, "#{pid}:#{start_time}", ACTION)?
+        .into_iter()
+        .next()
+        .map(|line| {
+            ServerId::parse(&line).ok_or_else(|| ConnectApplyError::Tmux {
+                action: ACTION,
+                detail: format!("list-sessions answered {line:?}, not <pid>:<start_time>"),
+            })
+        })
+        .transpose()
 }
 
 /// One line per session on `socket`, in `format`, and none where no server

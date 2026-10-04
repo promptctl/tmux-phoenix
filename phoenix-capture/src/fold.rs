@@ -94,7 +94,7 @@ pub fn fold<E>(
     rows: Vec<PaneRow>,
     read: &mut impl FnMut(&PaneRow) -> Result<PaneReads, E>,
 ) -> Result<Folded, FoldError<E>> {
-    let sessions = group_by(rows.clone(), |r| r.session.clone())
+    let sessions = group_by(rows.iter().collect(), |r| r.session.clone())
         .into_iter()
         .map(|(_, rows)| fold_session(rows))
         .collect::<Result<Vec<_>, _>>()?;
@@ -111,7 +111,7 @@ pub fn fold<E>(
     Ok(Folded { windows, sessions })
 }
 
-fn fold_session<E>(rows: Vec<PaneRow>) -> Result<Session, FoldError<E>> {
+fn fold_session<E>(rows: Vec<&PaneRow>) -> Result<Session, FoldError<E>> {
     let name = rows[0].session.clone();
     let group = rows[0].group.clone();
     let mut active = None;
@@ -139,20 +139,21 @@ fn fold_session<E>(rows: Vec<PaneRow>) -> Result<Session, FoldError<E>> {
     Session::new(name, group, links, active, last).map_err(FoldError::Snapshot)
 }
 
-/// `rows` are every row for one window id: one per pane per session that
-/// links the window. The panes are the first session's; every other
-/// session must have listed exactly the same ones.
+/// `rows` are every row for one window id: one per pane per winlink, and a
+/// session may link one window more than once (verified live: `link-window
+/// -s a:1 -t a:5` lists each pane twice under `a`). The panes are the first
+/// winlink's; every other winlink must have listed exactly the same ones.
 fn fold_window<E>(
     rows: Vec<PaneRow>,
     read: &mut impl FnMut(&PaneRow) -> Result<PaneReads, E>,
 ) -> Result<Window, FoldError<E>> {
     let id = rows[0].window_id;
-    let sessions = group_by(rows.iter().map(|r| r.session.clone()).collect(), |s| {
-        s.clone()
+    let winlinks = group_by(rows.iter().collect(), |r| {
+        (r.session.clone(), r.window_index)
     })
     .len();
     let by_pane = group_by(rows, |r| r.pane_id);
-    if by_pane.iter().any(|(_, rows)| rows.len() != sessions) {
+    if by_pane.iter().any(|(_, rows)| rows.len() != winlinks) {
         return Err(FoldError::TornWindow { window: id });
     }
 
@@ -325,6 +326,27 @@ mod tests {
         }
         assert_eq!(folded.sessions.first().active_link().window, WindowId(0));
         assert_eq!(folded.sessions.last().active_link().window, WindowId(1));
+    }
+
+    #[test]
+    fn a_window_linked_twice_into_one_session_is_two_winlinks_to_one_window() {
+        // `link-window -s a:1 -t a:5` is legal and lists each pane of the
+        // window once per winlink (verified live on 3.7b).
+        let rows = vec![
+            simple("alpha", 1, 0, true, 0, 0, true),
+            simple("alpha", 5, 0, false, 0, 0, true),
+        ];
+        let mut reads = 0;
+        let folded = fold(rows, &mut |r| {
+            reads += 1;
+            shell(r)
+        })
+        .unwrap();
+        assert_eq!(folded.windows.len(), 1);
+        assert_eq!(reads, 1);
+        let links = folded.sessions.first().windows();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|l| l.window == WindowId(0)));
     }
 
     #[test]

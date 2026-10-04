@@ -7,7 +7,7 @@ mod support;
 use support::{line, IsolatedTmux};
 
 use phoenix_capture::{capture, Previous, PreviousContent};
-use phoenix_core::{Content, HistoryIndicator, Shells, Snapshot};
+use phoenix_core::{Content, HistoryIndicator, Origin, Shells, Snapshot};
 use tmux_control::{Client, SpawnOptions, SpawnTransport};
 
 fn connect(harness: &IsolatedTmux) -> Client<SpawnTransport> {
@@ -87,7 +87,13 @@ fn unchanged_pane_reuses_previous_scrollback_and_changed_pane_re_captures() {
     // same indicator the pane actually has right now — real capture-pane
     // output would never contain this literal marker, so seeing it in the
     // result proves reuse happened rather than a fresh pull.
-    let mut previous = Previous::default();
+    // Reuse is keyed on the server too, so the injected previous is of the
+    // server the first capture recorded.
+    let server = match first.origin {
+        Origin::Recorded(server) => server,
+        Origin::BeforeOriginWasRecorded => panic!("a live capture records its origin"),
+    };
+    let mut previous = Previous::of(server);
     previous.insert(
         pane_id,
         PreviousContent {

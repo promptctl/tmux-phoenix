@@ -15,16 +15,34 @@
 
 use std::collections::HashMap;
 
-use phoenix_core::{Content, ContentFailure, HistoryIndicator, PaneId, Snapshot};
+use phoenix_core::{Content, ContentFailure, HistoryIndicator, Origin, PaneId, ServerId, Snapshot};
 use tmux_control::{CommandLine, Execute, TmuxError};
 
-/// What content capture needs from the *previous* capture: per pane, the
-/// indicator its scrollback was captured at and that scrollback. The one
-/// bridge from a persisted `Snapshot` lives here, so every caller builds it
-/// the same way (`[LAW:one-source-of-truth]`); the crate still has no
-/// persistence dependency (`[LAW:one-way-deps]`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Previous(HashMap<PaneId, PreviousContent>);
+/// What content capture needs from the *previous* capture: which server
+/// incarnation it was of, and per pane the indicator its scrollback was
+/// captured at and that scrollback. The one bridge from a persisted
+/// `Snapshot` lives here, so every caller builds it the same way
+/// (`[LAW:one-source-of-truth]`); the crate still has no persistence
+/// dependency (`[LAW:one-way-deps]`).
+///
+/// Pane ids restart at `%0` with every tmux server, so an indicator match
+/// means "same scrollback" only on the server it was recorded from: reuse
+/// is keyed on the origin as well as the pane. A `Previous` of no recorded
+/// origin (the default, or a pre-origin generation) reuses nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Previous {
+    origin: Origin,
+    panes: HashMap<PaneId, PreviousContent>,
+}
+
+impl Default for Previous {
+    fn default() -> Self {
+        Self {
+            origin: Origin::BeforeOriginWasRecorded,
+            panes: HashMap::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviousContent {
@@ -34,8 +52,9 @@ pub struct PreviousContent {
 
 impl Previous {
     pub fn from_snapshot(snapshot: &Snapshot) -> Self {
-        Self(
-            snapshot
+        Self {
+            origin: snapshot.origin,
+            panes: snapshot
                 .panes()
                 .filter_map(|pane| match &pane.content {
                     Content::Captured {
@@ -52,19 +71,32 @@ impl Previous {
                     Content::NotCaptured { .. } => None,
                 })
                 .collect(),
-        )
+        }
+    }
+
+    /// A `Previous` of `server` holding nothing yet.
+    pub fn of(server: ServerId) -> Self {
+        Self {
+            origin: Origin::Recorded(server),
+            panes: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, pane: PaneId, content: PreviousContent) {
-        self.0.insert(pane, content);
+        self.panes.insert(pane, content);
     }
 
-    /// The scrollback `previous` holds for `pane` if it was captured at
-    /// exactly `indicator`.
-    fn reusable(&self, pane: PaneId, indicator: HistoryIndicator) -> Option<&[String]> {
-        self.0
+    /// The scrollback `previous` holds for `pane` on `server` if it was
+    /// captured there at exactly `indicator`.
+    fn reusable(
+        &self,
+        server: ServerId,
+        pane: PaneId,
+        indicator: HistoryIndicator,
+    ) -> Option<&[String]> {
+        self.panes
             .get(&pane)
-            .filter(|p| p.indicator == indicator)
+            .filter(|p| self.origin == Origin::Recorded(server) && p.indicator == indicator)
             .map(|p| p.scrollback.as_slice())
     }
 }
@@ -116,15 +148,16 @@ fn capture_pane_lines<C: Execute>(
 }
 
 /// `pane`'s content now, at `indicator` (read in the same `list-panes` row
-/// as the rest of the pane), reusing `previous`'s scrollback when the
-/// indicator has not moved.
+/// as the rest of the pane), reusing `previous`'s scrollback when it is of
+/// this `server` and the indicator has not moved.
 pub fn capture_content<C: Execute>(
     client: &mut C,
+    server: ServerId,
     pane: PaneId,
     indicator: HistoryIndicator,
     previous: &Previous,
 ) -> Result<Content, TmuxError> {
-    let scrollback = match previous.reusable(pane, indicator) {
+    let scrollback = match previous.reusable(server, pane, indicator) {
         Some(reused) => Ok(reused.to_vec()),
         None => capture_pane_lines(client, pane, Extent::FullScrollback)?,
     };
@@ -161,7 +194,8 @@ mod tests {
             history_size: 4,
             history_bytes: 400,
         };
-        let mut previous = Previous::default();
+        let server = ServerId::parse("4242:1700000000").unwrap();
+        let mut previous = Previous::of(server);
         previous.insert(
             PaneId(1),
             PreviousContent {
@@ -170,10 +204,33 @@ mod tests {
             },
         );
         assert_eq!(
-            previous.reusable(PaneId(1), at),
+            previous.reusable(server, PaneId(1), at),
             Some(&["old".to_string()][..])
         );
-        assert_eq!(previous.reusable(PaneId(1), moved), None);
-        assert_eq!(previous.reusable(PaneId(2), at), None);
+        assert_eq!(previous.reusable(server, PaneId(1), moved), None);
+        assert_eq!(previous.reusable(server, PaneId(2), at), None);
+    }
+
+    #[test]
+    fn previous_scrollback_is_never_reused_across_server_incarnations() {
+        // Pane ids restart at %0 per server: the same %1 at the same
+        // indicator on a restarted server is a different pane.
+        let at = HistoryIndicator {
+            history_size: 0,
+            history_bytes: 0,
+        };
+        let content = PreviousContent {
+            indicator: at,
+            scrollback: vec!["old".to_string()],
+        };
+        let first = ServerId::parse("4242:1700000000").unwrap();
+        let restarted = ServerId::parse("4243:1700000100").unwrap();
+        let mut previous = Previous::of(first);
+        previous.insert(PaneId(1), content.clone());
+        assert_eq!(previous.reusable(restarted, PaneId(1), at), None);
+
+        let mut unknown = Previous::default();
+        unknown.insert(PaneId(1), content);
+        assert_eq!(unknown.reusable(first, PaneId(1), at), None);
     }
 }
