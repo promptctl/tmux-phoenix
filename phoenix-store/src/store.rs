@@ -153,7 +153,8 @@ impl Store {
         fs::create_dir_all(&self.dir)?;
         // [LAW:single-enforcer] the one place saves are serialized; held until
         // this function returns, so id choice, publish and prune are atomic
-        // with respect to every other save and every reader.
+        // with respect to every other save. Readers take no lock and see a
+        // save through the id set moving (`read_consistent`).
         let _lock = self.lock(wait)?;
 
         // Everything that can refuse this save runs before anything is
