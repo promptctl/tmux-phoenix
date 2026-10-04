@@ -71,19 +71,20 @@ holds *now*.
   sideways for the only reader there was.
 
 **Root cause.** The fact that matters is *provenance*: which server incarnation a
-snapshot came from, and which sessions phoenix itself created. Both are knowable and
-recordable — tmux's `#{pid}:#{start_time}` (already used as `ServerId`) identifies a
-server incarnation, and tmux user options (`@phoenix-…`) on a session are a durable
-stamp. Phoenix records neither in the places that decide, so it infers an adjacent,
-weaker fact from timing-sensitive evidence instead. Once a generation carries the
+snapshot came from, and which session phoenix itself created in order to attach. Both
+are knowable at the moment they happen — tmux's `#{pid}:#{start_time}` (already used
+as `ServerId`) identifies a server incarnation, and the command that creates a session
+knows it did. Phoenix records neither in the places that decide, so it infers an
+adjacent, weaker fact from timing-sensitive evidence instead. Once a generation carries the
 `ServerId` it was captured from, the daemon's entire boot question collapses to a
 lookup: *have I ever saved from this server?* No process-table read, no provisional
 decision, no store refusal, no re-boot. See `ARCHITECTURE.md` §3.
 
 **Blast radius.** `boot.rs`, half of `daemon.rs`, `connect.rs` (800 lines), the
-`BootstrapOnly` store arm, `Foreground`, `is_bootstrap`, and ~1,100 lines of tests in
-`phoenix-daemon/tests/{boot,resilience}.rs` and `phoenix-restore/tests/bootstrap.rs`
-that exist to pin down the heuristic's edge cases. All of it deletes.
+`BootstrapOnly` store arm, `Foreground`, `is_bootstrap`, and 1,384 lines of tests in
+`phoenix-daemon/tests/{boot,resilience}.rs` (473 + 674) and
+`phoenix-restore/tests/bootstrap.rs` (237) that exist to pin down the heuristic's edge
+cases. All of it deletes.
 
 ---
 
@@ -99,12 +100,14 @@ place a process is spawned or a byte is read from the OS."
 operation: control mode for the plan, a fresh `tmux` subprocess per scaffolding step.
 `run_plain` has its own error type, its own stderr classifier (`reports_no_server`),
 and its own notion of "no server" that the control-mode side cannot see. The reason
-given is real — bare `tmux -C` cannot attach to an empty server — but it was solved by
-growing a second channel in the wrong crate rather than by giving the transport the one
-capability it lacked. Verified live on tmux 3.7b (2026-10-04): `tmux -C new-session -s
-<name>` opens a control connection *on an empty server*, and a control client can
-`switch-client` onto another session and survive the kill of the one it left. The
-whole reconnect-after-restore dance exists because this was not known.
+given is real — `tmux -C attach-session` fails on an empty server — but it was solved
+by growing a second channel in the wrong crate rather than by letting the control
+client open with a different command. `SpawnTransport::spawn` already takes any argv;
+the callers in restore and the daemon chose `attach-session` and then worked around
+its failure outside the connection. Verified live on tmux 3.7b (2026-10-04): `tmux -C
+new-session -s <name>` opens a control connection *on an empty server*, and a control
+client can `switch-client` onto another session and survive the kill of the one it
+left. The whole reconnect-after-restore dance exists because this was not known.
 
 **Laws.** `[LAW:one-source-of-truth]` (two ways to say "run this against the server",
 with two error vocabularies); `[LAW:effects-at-boundaries]` (process spawning leaked
@@ -208,23 +211,30 @@ Smaller, but each is a map that can drift from its territory
   Read, TransportClosed, NotReady}` mark the connection dead". That is a comment doing
   a type's job (`[LAW:comments-carry-meaning]`), and it drifts the moment the code
   moves; the §2 dependency graph has already drifted (Finding 2).
-- **argv recovery** parses `ps`'s space-joined output and silently returns an empty
-  map on any `ps` failure (`recover_argv`), so a broken `ps` reads as "every pane
-  unknown" with no error anywhere (`[LAW:no-silent-failure]`); and a space inside one
-  argument is indistinguishable from two arguments. The OS has the exact argv
-  (`/proc/<pid>/cmdline`; `sysctl KERN_PROCARGS2` on macOS) — the approximation is a
-  choice, not a constraint.
+- **argv recovery** runs one system-wide `ps`, walks from each pane's shell down the
+  children carrying the `+` (foreground process group) flag, and splits the winner's
+  space-joined command string; it silently returns an empty map on any `ps` failure
+  (`recover_argv`), so a broken `ps` reads as "every pane unknown" with no error
+  anywhere (`[LAW:no-silent-failure]`), and a space inside one argument is
+  indistinguishable from two arguments. Both facts `ps` is standing in for are
+  readable directly, per pid: the terminal's foreground process group (`tpgid` in
+  `/proc/<pid>/stat`; `e_tpgid` from `sysctl KERN_PROC_PID` on macOS) and that
+  process's exact argv (`/proc/<pid>/cmdline`; `KERN_PROCARGS2`). The approximation
+  is a choice, not a constraint.
 
 ---
 
 ## Finding 7 — the backlog encodes the wrong order
 
 The parity epic is a strict chain (each child "blocked: earlier sibling"), with
-`tmux-parity-ure.9` (hooks) orphaned in progress for 18 days at the top. Four of the
-next six tickets — idempotent restore (.2), one-shot content (.3), zoom (.4), alternate
-pointers (.5), grouped sessions (.6) — would be built *on* the shapes Findings 1, 3 and
-4 identify as the thing to replace: more arms in `connect_and_apply`'s scaffolding
-match, more `Option`s on `Pane`, a third caller of `ContentCapture`. Building parity
+`tmux-parity-ure.9` (hooks) at the top carrying an assignee from a session that never
+started it. Five of the next six tickets — idempotent restore (.2), one-shot content
+(.3), zoom (.4), alternate pointers (.5), grouped sessions (.6) — would be built *on*
+the shapes Findings 1, 3 and 4 identify as the thing to replace: more arms in
+`connect_and_apply`'s scaffolding match, more `Option`s on `Pane`, a third caller of
+`ContentCapture`. The hooks ticket itself (.9) and per-program strategies (.7) land as
+plan steps and a `Foreground -> Relaunch` function that only exist on the new shape, so
+they wait too. Building parity
 on the current foundation is paying carrying cost on a shape that is already scheduled
 to go (`[LAW:carrying-cost]`: "no matter how far you've gone down the wrong road, turn
 around"). The grooming that follows this audit puts the architecture epic ahead of

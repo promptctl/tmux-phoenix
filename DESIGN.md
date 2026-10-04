@@ -1,5 +1,10 @@
 # tmux-phoenix — design
 
+> This file describes the implementation as it is. The shape it is moving to, and why,
+> is [`design-docs/ARCHITECTURE.md`](design-docs/ARCHITECTURE.md); where the two
+> disagree, that document is the intent and this one is the current state, and each
+> section here is rewritten as the corresponding `tmux-laws` ticket lands.
+
 A single-binary Rust replacement for `tmux-resurrect` + `tmux-continuum`: capture the
 full state of a running tmux server, persist it durably, and reconstruct it later.
 

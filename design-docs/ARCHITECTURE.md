@@ -31,8 +31,8 @@ Applied to the four facts that matter:
 | Fact | Where it is born | Where it lives | What it replaces |
 | --- | --- | --- | --- |
 | Which **server incarnation** a snapshot came from | the capture, from tmux's `#{pid}:#{start_time}` | the generation header (`origin: ServerId`) | the entire boot-decision state machine |
-| Which **sessions phoenix created** | the restore plan that creates them | a tmux session user option (`@phoenix-created`) | the bootstrap heuristic and scaffolding retire/put-back |
-| What a **pane's foreground** is | the capture, from the OS's exact argv | a closed `Foreground` enum on `Pane` | `Foreground` re-derived on every read via a shell-name list |
+| Which **session phoenix made in order to attach** | `Connection::open`'s reply | `Opened::Created(name)`, a value the restore plan ends by removing | the bootstrap heuristic, scaffolding retire/put-back, the post-restore reconnect |
+| What a **pane's foreground** is | the capture, from the OS: the pane terminal's foreground process group, then that process's exact argv | a closed `Foreground` enum on `Pane` | `Foreground` re-derived on every read via a shell-name list over `ps` output |
 | Where a **restored pane** is | the `split-window -P` reply at apply time | a bound `PaneRef` in the plan | "the current pane, if you issue this step immediately" |
 
 Everything else in this document is consequence.
@@ -84,51 +84,73 @@ to recognise a reconnect; it belongs in the data.
 - **Every `Snapshot` carries `origin: ServerId`.** Capture reads it over the same
   connection it reads everything else. The store writes it into the generation header
   next to `captured_at`, so `list` can show it without decoding a body.
-- **Every session phoenix creates is stamped** with a session user option
-  `@phoenix-created=<generation id>` by the restore plan itself (a `SetOption` step —
+- **Every session a restore finishes is stamped** with a session user option
+  `@phoenix-restored=<generation id>` by the restore plan itself (a `SetOption` step —
   data in the plan, not a side channel). tmux stores user options durably for the
   session's life; verified live that a session option round-trips through
-  `display-message -p '#{@…}'`.
+  `display-message -p '#{@…}'`. Its reader is outside phoenix: a terminal integration
+  that waits for "restore finished" waits on this value (§10), not on a file or a sleep.
 
-With those two values, the daemon's boot question has a one-line answer:
+With `origin` recorded, the daemon's boot question has a one-line answer:
 
-> **Restore on boot if and only if the store holds no generation whose `origin` is
-> this server.**
+> **Restore on boot if and only if the store holds a generation and none of its
+> generations has `origin` equal to this server.**
 
-A server the daemon has never saved from is a fresh server; it gets the newest
-snapshot. A server it has saved from — including the one it just lost the connection
-to — is never restored over. No process table is read; no decision is provisional;
-nothing is re-checked after the first save; a reconnect is the same question with the
-same answer. The store's `BootstrapOnly` refusal goes away with the reason it existed:
-a near-empty capture from a fresh server is simply a generation from *that* server,
-and the generation picker/`restore --file` keep every older one reachable. If "the
-newest generation from a *previous* incarnation" is later wanted as the boot default
-instead of "the newest generation", that is one filter over the same header field —
-data, not a mode.
+A server the daemon has saved from — including the one it just lost the connection to
+— is never restored over. Any other server receives the newest snapshot *beside*
+whatever it already holds: `plan(snapshot, live)` is the difference (§8), so a
+same-named session is left as it is, nothing live is removed, and the attached client
+is switched onto a restored session. The current behaviour of restoring into a login
+terminal's untouched session `0` is kept this way without deciding whether the session
+is "untouched": it is simply a live session the plan does not touch. The cost, stated
+plainly: a daemon that was stopped while the user built sessions on a new server will,
+when started, add the previous incarnation's sessions beside them. That replaces the
+README's "into a server holding nothing you built" with "adds what the server lacks
+and removes nothing", and step 6 of §12 rewrites that line.
 
-The session stamp answers the only other question restore ever asks: *may I remove
-this session?* **Phoenix removes only sessions it created.** A login terminal's
-session `0` holding one idle shell is not phoenix's to kill; restore adds beside it
-and moves its attached clients onto a restored session (`switch-client`, which a
-control client can also do for itself). Whether the stray then disappears is the
-user's tmux configuration (`destroy-unattached`), not phoenix's guess. The scaffolding
-`Created/Renamed`, `retire`, `put_back`, and the post-restore re-capture all go.
+No process table is read; no decision is provisional; nothing is re-checked after the
+first save; a reconnect is the same question with the same answer. The store's
+`BootstrapOnly` refusal goes away with the reason it existed: a near-empty capture from
+a fresh server is simply a generation from *that* server, and the generation
+picker/`restore --file` keep every older one reachable. If "the newest generation from
+a *previous* incarnation" is later wanted as the boot default instead of "the newest
+generation", that is one filter over the same header field — data, not a mode.
+
+Generations written before `origin` existed have no origin, so the first daemon boot
+after upgrading against a still-running server takes the "any other server" arm: the
+newest generation, saved from that very server moments earlier, is planned against the
+live server and the difference is at most the sessions closed since that save. That is
+the accepted one-time cost of the format bump, not a case the state machine
+distinguishes.
+
+The question "may I remove this session?" is no longer asked of tmux. The only session
+phoenix ever removes is the one `Connection::open` reports it created in order to
+attach (§4), and that fact travels as a value — `Opened::Created(name)` — into the plan,
+which ends by switching the client off it and killing it by that name. A login
+terminal's session `0`, or anything else the user built, is never phoenix's to kill;
+whether a stray disappears is the user's tmux configuration (`destroy-unattached`), not
+phoenix's guess. The scaffolding `Created/Renamed`, `retire`, `put_back`, and the
+post-restore re-capture all go.
 
 ---
 
 ## 4. `tmux-control` — one channel, owned reader, typed events
 
-The codec, `ServerMessage`, `CommandLine`, `ConnectionState`, and `execute` stay as
-they are. Three additions make the layers above it pure:
+The codec, `ServerMessage`, `CommandLine`, `ConnectionState`, and `execute` are
+unchanged by this work. Three additions make the layers above it pure:
 
-**A connection opens on any server.** `Connection::open(socket, attach: Attach)`
-where `Attach::{Existing, OrCreate { name }}`. On a server with sessions it is `tmux
--C attach-session`; on an empty or absent server it is `tmux -C new-session -s
+**A connection opens on any server.** `Connection::open(socket, attach: Attach) ->
+(Connection, Opened)` where `Attach::{Existing, OrCreate { name }}` is what the caller
+permits and `Opened::{Attached, Created(SessionName)}` is what happened. `Existing`
+runs `tmux -C attach-session` and fails with a typed `NoServer`/`NoSessions` error.
+`OrCreate` runs the same command and, on exactly that error, `tmux -C new-session -s
 <name>`, which opens control mode and creates the session in one step (verified live
-on tmux 3.7b). The probe that decides between them ("does this server have sessions?")
-lives *here*, in the transport, as the one place a plain `tmux` is ever spawned. The
-two error vocabularies collapse to `TmuxError`. Nothing above this crate spawns `tmux`
-again.
+on tmux 3.7b). The failed attach *is* the signal; there is no prior "does this server
+have sessions?" probe to race against, and no plain `tmux` is spawned anywhere. Two
+callers, each with one reason: the daemon's idle loop passes `Existing`, because
+starting a server the user never asked for is not the daemon's call; a restore passes
+`OrCreate`, because it has something to put on the server. The two error vocabularies
+collapse to `TmuxError`. Nothing above this crate spawns `tmux` again.
 
 **The client owns its reader.** A reader thread (or task) owns the transport's read
 side and delivers `Event::{Notification(ServerMessage), PaneOutput(PaneId, Vec<u8>),
@@ -178,9 +200,16 @@ Content    = Captured { indicator: HistoryIndicator, scrollback: Blob, visible: 
            | NotCaptured { reason: ContentFailure }
 ```
 
-`Foreground` is decided **once, at capture**, from the OS's exact argv
-(`/proc/<pid>/cmdline` on Linux, `KERN_PROCARGS2` on macOS — NUL-separated, no
-whitespace splitting), and is the discriminator every consumer matches on
+`Foreground` is decided **once, at capture**, in two OS reads keyed by the pane's pid
+and nothing else. `pane_pid` is the pane's shell, so the first read asks the kernel
+which process group holds the pane's terminal: `tpgid` from `/proc/<pane_pid>/stat` on
+Linux, `kinfo_proc.kp_eproc.e_tpgid` from `sysctl KERN_PROC_PID` on macOS — the same
+fact `ps` renders as its `+` flag, read directly instead of walked (verified live on an
+isolated server, 2026-10-04: a pane running `sleep 300` reports the sleep's pid as the
+shell's `tpgid`, and the shell's own pid once the sleep is interrupted). When it equals
+the shell's own group the pane is `Shell`; otherwise the second read is that group
+leader's exact argv (`/proc/<pid>/cmdline`, `KERN_PROCARGS2` — NUL-separated, no
+whitespace splitting). The result is the discriminator every consumer matches on
 exhaustively. `AgentSession` is the hook the LLM-resume epic needs; per-program
 strategies (vim session files, mosh) are a pure function `Foreground -> Relaunch`
 inside restore, keyed on `argv[0]` — one type, N instances (`[LAW:one-type-per-behavior]`).
@@ -190,8 +219,9 @@ Vec<Degradation>` walks the variants and lists each pane's `Unreadable` /
 `Unrecovered` / `NotCaptured` with its reason. The CLI's exit code 3 and the daemon's
 log line both read it; neither reimplements it.
 
-The two `PaneId`/`TmuxVersion` twins between `phoenix-core` and `tmux-control` stay:
-the crates are independent foundations by design and capture converts at the seam.
+The two `PaneId`/`TmuxVersion` twins between `phoenix-core` and `tmux-control` are
+unchanged by this work: the crates are independent foundations and capture converts at
+the seam.
 
 ---
 
@@ -199,7 +229,7 @@ the crates are independent foundations by design and capture converts at the sea
 
 Capture is one fixed sequence: one `list-panes -a -F` for structure (now including
 `window_id`, `window_zoomed_flag`, `session_group`, the last-window flag, and the
-history indicator), one OS argv read per pane pid, one `capture-pane` per pane, one
+history indicator), the §5 foreground reads per pane, one `capture-pane` per pane, one
 version/`ServerId` read. **Content capture is not a mode.** It always runs
 (`[LAW:dataflow-not-control-flow]`); what varies is the `Previous: HashMap<PaneId,
 HistoryIndicator + Blob>` the caller passes — empty on a cold start, the last
@@ -208,8 +238,9 @@ generation's on every other call — and a pane whose indicator matches reuses i
 captured nothing.
 
 Capture's effects are confined to its edge function; the fold from rows + argv +
-content into a `Snapshot` stays pure. A failed `ps`/procfs read is a loud,
-per-pane `Unrecovered { reason }`, never an empty map.
+content into a `Snapshot` stays pure. A failed process read — the pane's shell gone, a
+group leader that exited between the two reads — is a loud, per-pane
+`Unrecovered { reason }`, never an empty map.
 
 ---
 
@@ -233,12 +264,17 @@ per-pane `Unrecovered { reason }`, never an empty map.
 
 ## 8. `phoenix-restore` — a plan is a small program; apply binds its variables
 
-`plan(snapshot: &Snapshot, live: &Snapshot) -> Plan` is pure and takes **both** the
-snapshot to restore and a capture of the target server. The plan is the *difference*:
-sessions that already exist on `live` are not created (idempotent restore falls out),
-and the same function with a renderer instead of an executor is the human-readable
-diff the toolbox roadmap asks for. Selective restore (one session, one window) is a
-filter on `snapshot` before planning — data, not a mode.
+`plan(snapshot: &Snapshot, live: &Snapshot, opened: Opened) -> Plan` is pure and
+takes the snapshot to restore, a capture of the target server, and §4's account of how
+the connection was opened. The plan is the *difference*: sessions that already exist
+on `live` are not created (idempotent restore falls out), and the same function with a
+renderer instead of an executor is the human-readable diff the toolbox roadmap asks
+for. Selective restore (one session, one window) is a filter on `snapshot` before
+planning — data, not a mode. When `opened` is `Created(name)` the plan ends with
+`SwitchClient` onto a restored session and `KillSession { name }`; when it is
+`Attached` it ends without them. The ops layer chooses `name` free of every session
+name in the snapshot before opening, so the difference can never mistake the scratch
+for a session to keep.
 
 Steps carry **symbolic references** bound at apply time, so no step depends on what
 "current" happens to be:
@@ -251,8 +287,9 @@ Step = CreateSession { name, first_window, cwd }            -> binds PaneRef
      | SelectLayout  { window, layout }
      | ReplayContent { pane: PaneRef, blob }
      | Relaunch      { pane: PaneRef, command: Relaunch }
-     | SetOption     { target, key, value }                 // e.g. @phoenix-created
+     | SetOption     { target, key, value }                 // e.g. @phoenix-restored
      | SelectWindow  { session, index } | Zoom { pane: PaneRef } | …
+     | SwitchClient  { to: SessionName } | KillSession { name }   // only from Opened::Created
      | Hook          { point: HookPoint }                   // pre/post, user-configured
 ```
 
@@ -263,9 +300,10 @@ single place that knows the order constraints tmux imposes (`move-window` after
 *data*, not as a contract between functions.
 
 **Connecting is not restore's job.** `connect_and_apply` is gone. The ops layer opens
-a connection (§4's `Attach::OrCreate` on an empty server), captures `live`, plans,
-applies, switches the connection onto a restored session, and removes only the session
-phoenix created to attach with — all over one connection, with no reconnect.
+a connection with `Attach::OrCreate`, captures `live`, plans with the `Opened` it got
+back, and applies — all over one connection, with no reconnect. Switching off and
+removing the session phoenix created to attach with are the plan's last two steps, so
+`--dry-run` shows them and nothing outside the plan ever kills a session.
 
 ---
 
@@ -274,19 +312,29 @@ phoenix created to attach with — all over one connection, with no reconnect.
 ```
 Daemon::step(&mut self, event: Event, now: Instant) -> Vec<Action>
 
-Event  = Connected { server: ServerId, has_generation_from_this_server: bool }
+Event  = Connected { server: ServerId, newest: Option<GenerationId>, saved_from_this_server: bool }
+       | NoServer  { newest: Option<GenerationId> }
        | StructureChanged | Tick | Disconnected
 Action = Restore(GenerationId) | Save | Log(String) | WaitThen(Duration)
 ```
 
-The decision logic — boot-restore-or-not, debounce, max-interval backstop, reconnect
-backoff — is a pure function of state and event, and `DebounceState` is already most
-of it. The loop around it is a dozen lines: open a connection (§4), subscribe once with
-an attached-session-scope format that loops every session
+The loop reads the store's header listing once per connection attempt and puts what
+`step` needs into the event, so `step` never touches the store: `Restore(g)` is only
+ever emitted with a `g` the event carried. The boot arms are the whole of §3's rule
+plus one refusal: `Connected { newest: Some(g), saved_from_this_server: false }` and
+`NoServer { newest: Some(g) }` both yield `Restore(g)`; `NoServer { newest: None }`
+yields `WaitThen(backoff)`, because a store with nothing in it gives the daemon no
+reason to start a server; every other `Connected` yields nothing and the daemon is
+simply attached. The rest — debounce, max-interval backstop, reconnect backoff — is a
+pure function of state and event, and `DebounceState` is already most of it. The loop
+around it is a dozen lines: open a connection with `Attach::Existing` (§4), subscribe
+once with an attached-session-scope format that loops every session
 (`#{S:#{W:#{window_layout}}}` — verified live to fire for a change in another
 session), then `select` on the event channel and a timer, feed `step`, perform the
-actions through `phoenix-ops`. No heartbeat, no poll interval, no `Boot`, no
-`Decided`, no `Cycle::Refused`, no "end the run so the outer loop boots again".
+actions through `phoenix-ops`. `Restore` is the one action that opens a connection of
+its own (§10) and hands it back for the loop to keep. No heartbeat, no poll interval,
+no `Boot`, no `Decided`, no `Cycle::Refused`, no "end the run so the outer loop boots
+again".
 
 The daemon's control client attaches wherever it attaches; because phoenix never kills
 a session it did not create and switches rather than reconnects, which session that is
@@ -297,15 +345,17 @@ no longer matters.
 ## 10. `phoenix-ops` — one implementation per operation
 
 ```
-save(conn, store, retention)        -> SaveReport   { generation, degradations }
-restore(conn, store, source, scope) -> RestoreReport{ applied, skipped, degradations }
-status(store, conn?)                -> Status       { last_save, origin, daemon_state }
+save(conn, store, retention)          -> SaveReport   { generation, degradations }
+restore(socket, store, source, scope) -> (Connection, RestoreReport { applied, skipped, degradations })
+status(store, conn?)                  -> Status       { last_save, origin, daemon_state }
 ```
 
 `save` is: read the previous generation's indicators from the store, capture with
-them, write. `restore` is §8's sequence. The CLI prints a report; the daemon logs one;
-neither composes the lower crates itself. The hooks ticket (`tmux-parity-ure.9`)
-lands here as `Step::Hook` edges in the plan plus a `SetOption` stamp
+them, write. `restore` is §8's sequence, beginning with `Connection::open(socket,
+Attach::OrCreate { name })` and returning the connection it opened so the daemon keeps
+it and the CLI drops it. The CLI prints a report; the daemon logs one; neither
+composes the lower crates itself. The hooks ticket (`tmux-parity-ure.9`) lands here as
+`Step::Hook` edges in the plan plus the `SetOption` stamp of §3
 (`@phoenix-restored=<generation>`) that is the one writer of "restore finished" a
 tmux-side integration can wait on — the completion signal is a value tmux holds, not
 a file or a sleep.
@@ -347,10 +397,12 @@ shippable at every step:
 5. **`phoenix-daemon`:** the state machine; delete `boot.rs`, the heuristic tests, and
    `is_bootstrap`/`Foreground::IdleShell` from core once nothing reads them.
 6. **`DESIGN.md`** rewritten section by section to describe the result at the altitude
-   of intent, and `PROJECT-GOALS.md` §3's gap table updated.
+   of intent, `PROJECT-GOALS.md` §3's gap table updated, and the README's promise about
+   boot restore reworded as §3 states it.
 
 Each step is its own ticket under the `tmux-laws` epic, each with the live-tmux
 verification it needs, and each leaves less code than it found
-(`[LAW:polishing-by-subtraction]`): the expected net is roughly 3,000 lines removed
-across `connect.rs`, `boot.rs`, half of `daemon.rs`, and the tests that pinned the
-heuristic, against a few hundred added in `tmux-control` and `phoenix-ops`.
+(`[LAW:polishing-by-subtraction]`): the expected net is roughly 2,600 lines removed —
+`connect.rs` (796), `boot.rs` (204), half of `daemon.rs` (~225), and the 1,384 lines
+of tests that pinned the heuristic — against a few hundred added in `tmux-control`
+and `phoenix-ops`.
