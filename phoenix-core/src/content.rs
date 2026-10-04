@@ -1,42 +1,54 @@
-//! Captured pane text (DESIGN.md §5). A `Pane`'s content is `Option<PaneContent>`
-//! — `None` when capture-pane failed for that pane (unresponsive pane,
-//! degrades that pane alone rather than the whole snapshot).
+//! Captured pane text (ARCHITECTURE.md §5). Content is captured on every
+//! capture — it is not a mode — so a pane without it holds the reason
+//! (`[LAW:types-are-the-program]`: absence with a cause, never a bare
+//! `None`).
 
-/// `history_size`/`history_bytes` are tmux's own scrollback change
-/// indicator (`#{history_size}`/`#{history_bytes}`, DESIGN.md §5): stable
-/// while a pane is idle, moves whenever it produces output — verified live
-/// against a real tmux server. Persisting them alongside the captured text
-/// (not just transiently during one capture pass) is what lets a *later*
-/// capture recognize "this pane hasn't changed since last time" and skip
-/// re-pulling its full scrollback.
-///
-/// `scrollback` and `visible` are captured differently: `scrollback` (the
-/// full history, `capture-pane -S -`) is only re-pulled when the indicator
-/// moved — otherwise the previous capture's `scrollback` is carried
-/// forward unchanged. `visible` (just the on-screen lines, no `-S`) is
-/// *always* re-pulled every capture regardless of the indicator, since an
-/// alt-screen TUI (a pager, an editor) can redraw its visible screen
-/// without ever touching scrollback at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaneContent {
+use std::fmt;
+
+/// tmux's own scrollback change indicator (`#{history_size}` /
+/// `#{history_bytes}`): stable while a pane is idle, moves whenever it
+/// produces output — verified live against a real tmux server. Persisted
+/// alongside the captured text so a *later* capture can recognize "this
+/// pane hasn't changed since last time" and reuse its scrollback instead of
+/// re-pulling it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoryIndicator {
     pub history_size: u64,
     pub history_bytes: u64,
-    pub scrollback: Vec<String>,
-    pub visible: Vec<String>,
 }
 
-impl PaneContent {
-    pub fn new(
-        history_size: u64,
-        history_bytes: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Content {
+    /// `scrollback` is the full history (`capture-pane -S -`), re-pulled only
+    /// when the indicator moved and otherwise carried forward from the
+    /// previous capture; `visible` is the on-screen lines, always fresh,
+    /// since an alt-screen TUI redraws its screen without touching scrollback.
+    Captured {
+        indicator: HistoryIndicator,
         scrollback: Vec<String>,
         visible: Vec<String>,
-    ) -> Self {
-        Self {
-            history_size,
-            history_bytes,
-            scrollback,
-            visible,
+    },
+    NotCaptured {
+        reason: ContentFailure,
+    },
+}
+
+/// Why a pane's content is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentFailure {
+    /// tmux refused `capture-pane` for this pane; `message` is its `%error`.
+    CapturePane { message: String },
+    /// The generation predates content being captured on every save.
+    NotRecorded,
+}
+
+impl fmt::Display for ContentFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContentFailure::CapturePane { message } => write!(f, "capture-pane failed: {message}"),
+            ContentFailure::NotRecorded => {
+                f.write_str("content was not recorded by this generation")
+            }
         }
     }
 }
@@ -46,21 +58,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn holds_captured_lines() {
-        let c = PaneContent::new(
-            10,
-            2048,
-            vec!["$ ls".to_string(), "DESIGN.md".to_string()],
-            vec!["$ ls".to_string()],
-        );
-        assert_eq!(c.scrollback.len(), 2);
-        assert_eq!(c.visible.len(), 1);
-    }
-
-    #[test]
-    fn blank_pane_is_representable_as_empty_lines() {
-        let c = PaneContent::new(0, 0, vec![], vec![]);
-        assert!(c.scrollback.is_empty());
-        assert!(c.visible.is_empty());
+    fn a_blank_pane_is_captured_with_empty_lines_not_absent() {
+        let c = Content::Captured {
+            indicator: HistoryIndicator {
+                history_size: 0,
+                history_bytes: 0,
+            },
+            scrollback: vec![],
+            visible: vec![],
+        };
+        assert!(matches!(c, Content::Captured { .. }));
     }
 }

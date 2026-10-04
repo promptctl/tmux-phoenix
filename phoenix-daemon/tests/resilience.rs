@@ -10,8 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use phoenix_core::{
+    Content, ContentFailure, Cwd, Foreground, Made, NonEmpty, Origin, Session, Snapshot, Touched,
+    WinLink, Window, WindowId, WindowIndex,
+};
 use phoenix_daemon::DebouncePolicy;
-use phoenix_store::Store;
+use phoenix_store::{Retention, Store};
 
 fn unique(name: &str) -> String {
     format!(
@@ -104,7 +108,7 @@ fn run_resilient_reconnects_and_boot_restores_after_the_server_disappears_and_co
     let mut pre_outage_saved = false;
     for _ in 0..40 {
         if let Ok(s) = store.load_latest() {
-            if s.sessions.first().active_window().panes().len() == 2 {
+            if s.active_window(s.sessions().first()).panes().len() == 2 {
                 pre_outage_saved = true;
                 break;
             }
@@ -174,36 +178,49 @@ fn run_resilient_restores_once_a_lone_pane_goes_idle() {
     let pane = phoenix_core::Pane {
         id: phoenix_core::PaneId(0),
         index: phoenix_core::PaneIndex(0),
-        cwd: None,
-        program: phoenix_core::CapturedProgram {
-            command: phoenix_core::ProgramName::parse("zsh").unwrap(),
-            argv: None,
+        cwd: Cwd::Unreadable,
+        foreground: Foreground::Shell,
+        content: Content::NotCaptured {
+            reason: ContentFailure::NotRecorded,
         },
-        content: None,
     };
-    let window = phoenix_core::Window::new(
-        phoenix_core::WindowIndex(0),
+    let window = Window::new(
+        WindowId(0),
+        Made::NotByPhoenix,
         phoenix_core::WindowName::parse("shell").unwrap(),
         phoenix_core::Layout::parse("b25d,80x24,0,0,0").unwrap(),
+        false,
         phoenix_core::NonEmpty::singleton(pane),
         phoenix_core::PaneIndex(0),
     )
     .unwrap();
-    let work = phoenix_core::Session::new(
+    let work = Session::new(
         phoenix_core::SessionName::parse("work").unwrap(),
-        phoenix_core::NonEmpty::singleton(window),
-        phoenix_core::WindowIndex(0),
+        None,
+        NonEmpty::singleton(WinLink {
+            index: WindowIndex(0),
+            window: WindowId(0),
+        }),
+        WindowIndex(0),
+        None,
     )
     .unwrap();
     store
         .save(
-            &phoenix_core::Snapshot {
-                format_version: phoenix_core::FormatVersion::CURRENT,
-                tmux_version: phoenix_core::TmuxVersion { major: 3, minor: 6 },
-                captured_at: phoenix_core::OffsetDateTime::from_unix_timestamp(1_700_000_000),
-                sessions: phoenix_core::NonEmpty::singleton(work),
+            &Snapshot::new(
+                Origin::BeforeOriginWasRecorded,
+                Touched::Never,
+                phoenix_core::OffsetDateTime::from_unix_timestamp(1_700_000_000),
+                phoenix_core::TmuxVersion { major: 3, minor: 6 },
+                NonEmpty::singleton(window),
+                phoenix_core::NonEmpty::singleton(work),
+                vec![],
+            )
+            .unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
             },
-            std::num::NonZeroUsize::new(5).unwrap(),
             Duration::ZERO,
         )
         .expect("failed to seed the snapshot to restore");
@@ -365,7 +382,7 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
     for _ in 0..40 {
         if store
             .load_latest()
-            .is_ok_and(|s| s.sessions.first().active_window().panes().len() == 2)
+            .is_ok_and(|s| s.active_window(s.sessions().first()).panes().len() == 2)
         {
             saved = true;
             break;
@@ -418,7 +435,7 @@ fn run_resilient_restores_over_a_terminal_that_reached_tmux_first() {
         "expected a boot-restore log line; log: {log:#?}"
     );
     let latest = store.load_latest().expect("latest should still load");
-    assert_eq!(latest.sessions.first().name().as_str(), session.as_str());
+    assert_eq!(latest.sessions().first().name().as_str(), session.as_str());
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
@@ -435,36 +452,49 @@ fn run_resilient_never_restores_over_the_server_it_reconnects_to() {
     let pane = phoenix_core::Pane {
         id: phoenix_core::PaneId(0),
         index: phoenix_core::PaneIndex(0),
-        cwd: None,
-        program: phoenix_core::CapturedProgram {
-            command: phoenix_core::ProgramName::parse("zsh").unwrap(),
-            argv: None,
+        cwd: Cwd::Unreadable,
+        foreground: Foreground::Shell,
+        content: Content::NotCaptured {
+            reason: ContentFailure::NotRecorded,
         },
-        content: None,
     };
-    let window = phoenix_core::Window::new(
-        phoenix_core::WindowIndex(0),
+    let window = Window::new(
+        WindowId(0),
+        Made::NotByPhoenix,
         phoenix_core::WindowName::parse("shell").unwrap(),
         phoenix_core::Layout::parse("b25d,80x24,0,0,0").unwrap(),
+        false,
         phoenix_core::NonEmpty::singleton(pane),
         phoenix_core::PaneIndex(0),
     )
     .unwrap();
-    let saved = phoenix_core::Session::new(
+    let saved = Session::new(
         phoenix_core::SessionName::parse("saved").unwrap(),
-        phoenix_core::NonEmpty::singleton(window),
-        phoenix_core::WindowIndex(0),
+        None,
+        NonEmpty::singleton(WinLink {
+            index: WindowIndex(0),
+            window: WindowId(0),
+        }),
+        WindowIndex(0),
+        None,
     )
     .unwrap();
     store
         .save(
-            &phoenix_core::Snapshot {
-                format_version: phoenix_core::FormatVersion::CURRENT,
-                tmux_version: phoenix_core::TmuxVersion { major: 3, minor: 6 },
-                captured_at: phoenix_core::OffsetDateTime::from_unix_timestamp(1_700_000_000),
-                sessions: phoenix_core::NonEmpty::singleton(saved),
+            &Snapshot::new(
+                Origin::BeforeOriginWasRecorded,
+                Touched::Never,
+                phoenix_core::OffsetDateTime::from_unix_timestamp(1_700_000_000),
+                phoenix_core::TmuxVersion { major: 3, minor: 6 },
+                NonEmpty::singleton(window),
+                phoenix_core::NonEmpty::singleton(saved),
+                vec![],
+            )
+            .unwrap(),
+            None,
+            Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
             },
-            std::num::NonZeroUsize::new(5).unwrap(),
             Duration::ZERO,
         )
         .expect("failed to seed a snapshot that must not come back");
@@ -628,7 +658,7 @@ fn run_resilient_keeps_the_boot_decision_of_the_server_it_reconnects_to() {
     let saved = eventually(&|| {
         store
             .load_latest()
-            .is_ok_and(|s| s.sessions.iter().any(|s| s.name().as_str() == "work"))
+            .is_ok_and(|s| s.sessions().iter().any(|s| s.name().as_str() == "work"))
     });
     tmux(&["kill-session", "-t", "=work"]);
     let reconnected = eventually(&|| {

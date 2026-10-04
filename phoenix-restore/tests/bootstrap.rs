@@ -4,8 +4,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phoenix_core::{
-    CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneId, PaneIndex,
-    ProgramName, Session, SessionName, Snapshot, TmuxVersion, Window, WindowIndex, WindowName,
+    Content, ContentFailure, Cwd, Foreground, Layout, Made, NonEmpty, OffsetDateTime, Origin, Pane,
+    PaneId, PaneIndex, Session, SessionName, Snapshot, TmuxVersion, Touched, WinLink, Window,
+    WindowId, WindowIndex, WindowName,
 };
 use phoenix_restore::{connect_and_apply, plan, probe, ServerState};
 
@@ -81,46 +82,85 @@ impl Drop for Server {
     }
 }
 
-fn session(name: &str, window_names: &[&str]) -> Session {
-    let windows = window_names
+fn session(name: &str, window_names: &[&str]) -> Tree {
+    let windows: Vec<(WindowIndex, Window)> = window_names
         .iter()
         .enumerate()
         .map(|(index, window_name)| {
             let pane = Pane {
                 id: PaneId(index as u32),
                 index: PaneIndex(0),
-                cwd: None,
-                program: CapturedProgram {
-                    command: ProgramName::parse("zsh").unwrap(),
-                    argv: None,
+                cwd: Cwd::Unreadable,
+                foreground: Foreground::Shell,
+                content: Content::NotCaptured {
+                    reason: ContentFailure::NotRecorded,
                 },
-                content: None,
             };
-            Window::new(
-                WindowIndex(index as u32),
+            let window = Window::new(
+                WindowId(next_window_id()),
+                Made::NotByPhoenix,
                 WindowName::parse(*window_name).unwrap(),
                 Layout::parse("b25d,80x24,0,0,0").unwrap(),
+                false,
                 NonEmpty::singleton(pane),
                 PaneIndex(0),
             )
-            .unwrap()
+            .unwrap();
+            (WindowIndex(index as u32), window)
         })
         .collect();
-    Session::new(
+    let links = windows
+        .iter()
+        .map(|(index, window)| WinLink {
+            index: *index,
+            window: window.id(),
+        })
+        .collect();
+    let session = Session::new(
         SessionName::parse(name).unwrap(),
-        NonEmpty::from_vec(windows).unwrap(),
+        None,
+        NonEmpty::from_vec(links).unwrap(),
         WindowIndex(0),
+        None,
     )
-    .unwrap()
+    .unwrap();
+    Tree {
+        session,
+        windows: windows.into_iter().map(|(_, w)| w).collect(),
+    }
 }
 
-fn snapshot(sessions: Vec<Session>) -> Snapshot {
-    Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 6 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::from_vec(sessions).unwrap(),
+/// Window ids are unique across the test binary, so sessions built apart
+/// can share a snapshot.
+fn next_window_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One session and the windows it links.
+struct Tree {
+    session: Session,
+    windows: Vec<Window>,
+}
+
+fn snapshot(trees: Vec<Tree>) -> Snapshot {
+    let mut windows = Vec::new();
+    let mut sessions = Vec::new();
+    for tree in trees {
+        windows.extend(tree.windows);
+        sessions.push(tree.session);
     }
+    Snapshot::new(
+        Origin::BeforeOriginWasRecorded,
+        Touched::Never,
+        OffsetDateTime::from_unix_timestamp(1_700_000_000),
+        TmuxVersion { major: 3, minor: 6 },
+        NonEmpty::from_vec(windows).unwrap(),
+        NonEmpty::from_vec(sessions).unwrap(),
+        vec![],
+    )
+    .unwrap()
 }
 
 /// Criterion 1 with a real client attached: the login session shares the

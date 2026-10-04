@@ -50,8 +50,8 @@
 use std::collections::HashSet;
 use std::process::Command;
 
-use phoenix_capture::{capture, CaptureError, ContentCapture};
-use phoenix_core::{NonEmpty, SessionName, Snapshot};
+use phoenix_capture::{capture, CaptureError, Previous};
+use phoenix_core::{NonEmpty, ServerId, SessionName, Shells, Snapshot};
 use tmux_control::{socket_args, Client, ServerMessage, SpawnOptions, SpawnTransport, TmuxError};
 
 use crate::apply::{apply, ApplyError, ApplyOutcome};
@@ -76,16 +76,16 @@ pub enum ServerState {
 impl ServerState {
     fn of(live: &Snapshot) -> Self {
         let built: Vec<SessionName> = live
-            .sessions
+            .sessions()
             .iter()
-            .filter(|session| !session.is_bootstrap())
+            .filter(|session| !live.is_bootstrap(session))
             .map(|session| session.name().clone())
             .collect();
         match NonEmpty::from_vec(built) {
             Some(built) => ServerState::Built(built),
             None => ServerState::BootstrapOnly(NonEmpty::new(
-                live.sessions.first().name().clone(),
-                live.sessions
+                live.sessions().first().name().clone(),
+                live.sessions()
                     .iter()
                     .skip(1)
                     .map(|session| session.name().clone())
@@ -188,17 +188,20 @@ pub fn count_sessions(socket: Option<&str>) -> Result<usize, ConnectApplyError> 
 /// the same socket reads as a different one. Verified live against tmux 3.6a:
 /// `#{pid}:#{start_time}` is the same on every session of one server and
 /// changes when the server restarts. `None` where no server runs, or one runs
-/// with no sessions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerId(String);
-
+/// with no sessions. The same [`ServerId`] a capture records as its origin
+/// (`[LAW:one-source-of-truth]`).
 pub fn server_id(socket: Option<&str>) -> Result<Option<ServerId>, ConnectApplyError> {
-    Ok(
-        session_lines(socket, "#{pid}:#{start_time}", "identify the tmux server")?
-            .into_iter()
-            .next()
-            .map(ServerId),
-    )
+    const ACTION: &str = "identify the tmux server";
+    session_lines(socket, "#{pid}:#{start_time}", ACTION)?
+        .into_iter()
+        .next()
+        .map(|line| {
+            ServerId::parse(&line).ok_or_else(|| ConnectApplyError::Tmux {
+                action: ACTION,
+                detail: format!("list-sessions answered {line:?}, not <pid>:<start_time>"),
+            })
+        })
+        .transpose()
 }
 
 /// One line per session on `socket`, in `format`, and none where no server
@@ -238,11 +241,13 @@ pub fn probe(socket: Option<&str>) -> Result<ServerState, ConnectApplyError> {
     Ok(ServerState::of(&capture_server(socket)?))
 }
 
-/// Every session on a populated server, structure and foreground programs
-/// only, over a short-lived control connection.
+/// Every session on a populated server over a short-lived control
+/// connection. A full capture, pane content included: content is not a mode,
+/// and this probe goes away with the bootstrap heuristic that needs it
+/// (tmux-laws-a4x.kdi).
 fn capture_server(socket: Option<&str>) -> Result<Snapshot, ConnectApplyError> {
     let mut client = attach(socket.map(str::to_string), None, drop)?;
-    let live = capture(&mut client, ContentCapture::Off);
+    let live = capture(&mut client, &Previous::default(), &Shells::default());
     client.close();
     live.map_err(ConnectApplyError::Probe)
 }
@@ -387,14 +392,14 @@ impl Scaffold {
         restored: &str,
     ) -> Result<(), ConnectApplyError> {
         let live = now
-            .sessions
+            .sessions()
             .iter()
             .find(|session| session.name().as_str() == self.name());
         match (self, live) {
             (_, None) => Ok(()),
-            (Scaffold::Renamed { from, .. }, Some(session)) if !session.is_bootstrap() => {
+            (Scaffold::Renamed { from, .. }, Some(session)) if !now.is_bootstrap(session) => {
                 let taken = snapshot
-                    .sessions
+                    .sessions()
                     .iter()
                     .any(|restored| restored.name().as_str() == from);
                 match taken {
@@ -454,7 +459,7 @@ fn kill_session(socket: Option<&str>, name: &str) -> Result<(), ConnectApplyErro
 /// the server's, and the ones already picked.
 fn scaffolding(server: &ServerState, snapshot: &Snapshot) -> Vec<Scaffold> {
     let mut taken: HashSet<String> = snapshot
-        .sessions
+        .sessions()
         .iter()
         .map(|session| session.name().as_str().to_string())
         .collect();
@@ -553,7 +558,7 @@ pub fn connect_and_apply(
         }
     }
 
-    let restored_name = snapshot.sessions.first().name().as_str();
+    let restored_name = snapshot.sessions().first().name().as_str();
     let attach_to = scaffolding.first().map(|s| exact(s.name()));
     let restored = restore_over(
         socket.clone(),
@@ -618,43 +623,67 @@ fn restore_over(
 mod tests {
     use super::*;
     use phoenix_core::{
-        CapturedProgram, FormatVersion, Layout, OffsetDateTime, Pane, PaneId, PaneIndex,
-        ProgramName, Session, TmuxVersion, Window, WindowIndex, WindowName,
+        Content, ContentFailure, Cwd, Foreground, Layout, Made, OffsetDateTime, Origin, Pane,
+        PaneId, PaneIndex, RecoveryFailure, Session, TmuxVersion, Touched, WinLink, Window,
+        WindowId, WindowIndex, WindowName,
     };
 
     fn snapshot_of(names: &[&str]) -> Snapshot {
-        let session = |name: &str| {
+        let window = |id: u32| {
+            // An unrecovered foreground, so every session here reads as
+            // built: the scaffolding tests decide bootstrap-ness through
+            // `ServerState`, never through these panes.
             let pane = Pane {
-                id: PaneId(0),
+                id: PaneId(id),
                 index: PaneIndex(0),
-                cwd: None,
-                program: CapturedProgram {
-                    command: ProgramName::parse("zsh").unwrap(),
-                    argv: None,
+                cwd: Cwd::Unreadable,
+                foreground: Foreground::Unrecovered {
+                    reason: RecoveryFailure::NotRecorded,
                 },
-                content: None,
+                content: Content::NotCaptured {
+                    reason: ContentFailure::NotRecorded,
+                },
             };
-            let window = Window::new(
-                WindowIndex(0),
+            Window::new(
+                WindowId(id),
+                Made::NotByPhoenix,
                 WindowName::parse("shell").unwrap(),
                 Layout::parse("b25d,80x24,0,0,0").unwrap(),
+                false,
                 NonEmpty::singleton(pane),
                 PaneIndex(0),
             )
-            .unwrap();
+            .unwrap()
+        };
+        let session = |name: &str, id: u32| {
             Session::new(
                 SessionName::parse(name).unwrap(),
-                NonEmpty::singleton(window),
+                None,
+                NonEmpty::singleton(WinLink {
+                    index: WindowIndex(0),
+                    window: WindowId(id),
+                }),
                 WindowIndex(0),
+                None,
             )
             .unwrap()
         };
-        Snapshot {
-            format_version: FormatVersion::CURRENT,
-            tmux_version: TmuxVersion { major: 3, minor: 5 },
-            captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-            sessions: NonEmpty::from_vec(names.iter().map(|n| session(n)).collect()).unwrap(),
-        }
+        let windows = (0..names.len() as u32).map(window).collect();
+        let sessions = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| session(n, i as u32))
+            .collect();
+        Snapshot::new(
+            Origin::BeforeOriginWasRecorded,
+            Touched::Never,
+            OffsetDateTime::from_unix_timestamp(1_700_000_000),
+            TmuxVersion { major: 3, minor: 5 },
+            NonEmpty::from_vec(windows).unwrap(),
+            NonEmpty::from_vec(sessions).unwrap(),
+            vec![],
+        )
+        .unwrap()
     }
 
     fn names(names: &[&str]) -> NonEmpty<SessionName> {
@@ -731,7 +760,7 @@ mod tests {
             from: "0".to_string(),
             to: "phoenix-boot-0".to_string(),
         };
-        // `snapshot_of` panes have no recovered argv, so the live
+        // `snapshot_of` panes have an unrecovered foreground, so the live
         // `phoenix-boot-0` reads as built; its old name `0` is the snapshot's.
         let result = login.retire(
             socket.to_str(),

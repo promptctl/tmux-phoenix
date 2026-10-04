@@ -3,14 +3,13 @@
 //! that touches a live connection — [`crate::debounce`] is pure.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use phoenix_capture::{ContentCapture, PreviousPaneContent};
-use phoenix_core::Snapshot;
-use phoenix_store::{Store, StoreError};
+use phoenix_capture::Previous;
+use phoenix_core::{Shells, Snapshot};
+use phoenix_store::{Retention, Store, StoreError, Unreadable};
 use tmux_control::{
     Client, CommandLine, ServerMessage, SubscriptionName, SubscriptionScope, TmuxError, Transport,
 };
@@ -64,6 +63,15 @@ pub enum DaemonError {
     Tmux(TmuxError),
     Capture(phoenix_capture::CaptureError),
     Store(StoreError),
+    /// A save succeeded beside a generation file the store could not read;
+    /// that file was kept. Reported by every save until it is gone.
+    UnreadableGeneration(Unreadable),
+    /// Every session on the server is a bootstrap session (one window, one
+    /// pane idle at its shell); saving it would make the newest generation
+    /// name a server a login terminal just started, in place of the real
+    /// state. Nothing was written. The boot heuristic's own refusal, which
+    /// `tmux-laws-a4x.9xh` deletes with the heuristic.
+    BootstrapOnly,
 }
 
 impl std::fmt::Display for DaemonError {
@@ -72,65 +80,52 @@ impl std::fmt::Display for DaemonError {
             DaemonError::Tmux(e) => write!(f, "{e}"),
             DaemonError::Capture(e) => write!(f, "{e}"),
             DaemonError::Store(e) => write!(f, "{e}"),
+            DaemonError::UnreadableGeneration(kept) => write!(f, "{kept}"),
+            DaemonError::BootstrapOnly => write!(
+                f,
+                "not saved: every session on the server is an untouched bootstrap session \
+                 (one window, one idle shell), and saving it would replace the latest snapshot"
+            ),
         }
     }
 }
 
 impl std::error::Error for DaemonError {}
 
-/// Walks a previously-captured `Snapshot` into the `previous` map
-/// `phoenix_capture::ContentCapture::On` needs, keyed by tmux pane id — the
-/// bridge `phoenix-capture`'s own doc comment says the caller owns, since
-/// that crate has no persistence dependency of its own.
-fn previous_content_from_snapshot(snapshot: &Snapshot) -> HashMap<u32, PreviousPaneContent> {
-    snapshot
-        .sessions
-        .iter()
-        .flat_map(|s| s.windows().iter())
-        .flat_map(|w| w.panes().iter())
-        .filter_map(|p| {
-            let content = p.content.as_ref()?;
-            Some((
-                p.id.0,
-                PreviousPaneContent {
-                    history_size: content.history_size,
-                    history_bytes: content.history_bytes,
-                    scrollback: content.scrollback.clone(),
-                },
-            ))
-        })
-        .collect()
-}
-
 /// The daemon never waits on another save: a contended save fails this
 /// cycle without recording a save, so [`run`]'s next poll tries again.
 const SAVE_WAIT: Duration = Duration::ZERO;
 
-/// What one save cycle came to. The store refusing a bootstrap-only capture
-/// is an answer about the server, not a failed save, so it is a value here.
+/// What one save cycle came to. Refusing a bootstrap-only capture is an
+/// answer about the server, not a failed save, so it is a value here.
 enum Cycle {
-    Saved(Snapshot),
+    /// The snapshot, and the generations the store kept without being able
+    /// to read them.
+    Saved(Snapshot, Vec<Unreadable>),
     Refused(Snapshot),
 }
 
 fn capture_and_save<T: Transport>(
     client: &mut Client<T>,
     store: &Store,
-    previous: &HashMap<u32, PreviousPaneContent>,
+    previous: &Previous,
     keep_generations: NonZeroUsize,
 ) -> Result<Cycle, DaemonError> {
-    let snapshot = phoenix_capture::capture(
-        client,
-        ContentCapture::On {
-            previous: previous.clone(),
-        },
-    )
-    .map_err(DaemonError::Capture)?;
-    match store.save(&snapshot, keep_generations, SAVE_WAIT) {
-        Ok(_) => Ok(Cycle::Saved(snapshot)),
-        Err(StoreError::BootstrapOnly) => Ok(Cycle::Refused(snapshot)),
-        Err(e) => Err(DaemonError::Store(e)),
+    let snapshot = phoenix_capture::capture(client, previous, &Shells::default())
+        .map_err(DaemonError::Capture)?;
+    // [LAW:single-enforcer] the boot heuristic's one refusal, here beside the
+    // decision that reads it rather than in the store, which knows nothing of
+    // what a session is for.
+    if snapshot.is_bootstrap_only() {
+        return Ok(Cycle::Refused(snapshot));
     }
+    let retention = Retention {
+        keep_untagged: keep_generations,
+    };
+    let outcome = store
+        .save(&snapshot, None, retention, SAVE_WAIT)
+        .map_err(DaemonError::Store)?;
+    Ok(Cycle::Saved(snapshot, outcome.unreadable))
 }
 
 /// Whether `e` means the connection itself is gone (tmux exited, the pipe
@@ -209,11 +204,11 @@ pub fn run<T: Transport>(
     // Nothing saved yet is the normal first run; any other failure is
     // reported, and the first save then recaptures every pane in full.
     let mut previous_content = match store.load_latest() {
-        Ok(snapshot) => previous_content_from_snapshot(&snapshot),
-        Err(StoreError::NoLatest) => HashMap::new(),
+        Ok(snapshot) => Previous::from_snapshot(&snapshot),
+        Err(StoreError::NoLatest) => Previous::default(),
         Err(e) => {
             on_error(&DaemonError::Store(e));
-            HashMap::new()
+            Previous::default()
         }
     };
 
@@ -237,8 +232,11 @@ pub fn run<T: Transport>(
 
         if state.should_save(&config.policy, Instant::now()) {
             match capture_and_save(client, store, &previous_content, config.keep_generations) {
-                Ok(Cycle::Saved(snapshot)) => {
-                    previous_content = previous_content_from_snapshot(&snapshot);
+                Ok(Cycle::Saved(snapshot, unreadable)) => {
+                    for kept in unreadable {
+                        on_error(&DaemonError::UnreadableGeneration(kept));
+                    }
+                    previous_content = Previous::from_snapshot(&snapshot);
                     state.record_save(Instant::now());
                     *boot = Boot::Settled;
                 }
@@ -247,7 +245,7 @@ pub fn run<T: Transport>(
                     // like a save does, so an idle bootstrap-only server is
                     // captured once per cycle rather than on every poll.
                     state.record_save(Instant::now());
-                    let refused = DaemonError::Store(StoreError::BootstrapOnly);
+                    let refused = DaemonError::BootstrapOnly;
                     // A boot that misread this server gets its decision back:
                     // `run_resilient` boots again, where that decision lives.
                     if boot.misread(&snapshot) {
@@ -323,7 +321,7 @@ pub fn run_resilient(
                 client.close();
                 last = match result {
                     Ok(()) => Some(decided),
-                    Err(DaemonError::Store(StoreError::BootstrapOnly)) => {
+                    Err(DaemonError::BootstrapOnly) => {
                         on_log(
                             "the server boot stayed out of holds only bootstrap sessions; booting again",
                         );

@@ -4,25 +4,38 @@
 //! themselves).
 
 mod support;
-use support::{line, IsolatedTmux};
+use support::{line, linked, snapshot, tree, IsolatedTmux};
 
 use phoenix_core::{
-    CapturedProgram, FormatVersion, Layout, NonEmpty, OffsetDateTime, Pane, PaneContent, PaneId,
-    PaneIndex, ProgramName, Session, SessionName, Snapshot, TmuxVersion, Utf8PathBuf, Window,
-    WindowIndex, WindowName,
+    Content, ContentFailure, Cwd, Foreground, HistoryIndicator, NonEmpty, Pane, PaneId, PaneIndex,
 };
 use phoenix_restore::{apply, plan, PlanStep, TmuxCommand};
+
+fn captured(
+    history_size: u64,
+    history_bytes: u64,
+    scrollback: Vec<String>,
+    visible: Vec<String>,
+) -> Content {
+    Content::Captured {
+        indicator: HistoryIndicator {
+            history_size,
+            history_bytes,
+        },
+        scrollback,
+        visible,
+    }
+}
 
 fn pane(index: u32, cwd: &str) -> Pane {
     Pane {
         id: PaneId(index),
         index: PaneIndex(index),
-        cwd: Utf8PathBuf::parse(cwd),
-        program: CapturedProgram {
-            command: ProgramName::parse("zsh").unwrap(),
-            argv: None,
+        cwd: Cwd::parse(cwd),
+        foreground: Foreground::Shell,
+        content: Content::NotCaptured {
+            reason: ContentFailure::NotRecorded,
         },
-        content: None,
     }
 }
 
@@ -43,30 +56,15 @@ fn apply_rebuilds_the_snapshot_into_a_new_session_on_a_live_connection() {
         pane(1, base.to_str().unwrap()),
     ])
     .unwrap();
-    let window = Window::new(
-        WindowIndex(0),
-        WindowName::parse("shell").unwrap(),
-        // A real 2-pane layout captured live — tmux validates the leading
-        // checksum against the rest of the string, so this can't be
-        // hand-typed (this window has 2 panes, so the plan does emit a
-        // select-layout for it).
-        Layout::parse("c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]").unwrap(),
+    let window = linked(
+        0,
+        "shell",
+        "c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]",
         panes,
-        PaneIndex(1),
-    )
-    .unwrap();
-    let session = Session::new(
-        SessionName::parse("restored-live").unwrap(),
-        NonEmpty::singleton(window),
-        WindowIndex(0),
-    )
-    .unwrap();
-    let snapshot = Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 5 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::singleton(session),
-    };
+        1,
+    );
+    let session = tree("restored-live", NonEmpty::singleton(window), 0);
+    let snapshot = snapshot(vec![session]);
 
     let restore_plan = plan(&snapshot);
     let outcome = apply(&mut client, &restore_plan).expect("apply failed");
@@ -107,41 +105,20 @@ fn apply_replays_each_panes_captured_content_distinctly() {
     let base = base.canonicalize().unwrap();
 
     let mut pane_a = pane(0, base.to_str().unwrap());
-    pane_a.content = Some(PaneContent::new(
-        1,
-        1,
-        vec!["DISTINCTIVE-CONTENT-PANE-A".to_string()],
-        vec![],
-    ));
+    pane_a.content = captured(1, 1, vec!["DISTINCTIVE-CONTENT-PANE-A".to_string()], vec![]);
     let mut pane_b = pane(1, base.to_str().unwrap());
-    pane_b.content = Some(PaneContent::new(
-        2,
-        2,
-        vec!["DISTINCTIVE-CONTENT-PANE-B".to_string()],
-        vec![],
-    ));
+    pane_b.content = captured(2, 2, vec!["DISTINCTIVE-CONTENT-PANE-B".to_string()], vec![]);
 
     let panes = NonEmpty::new(pane_a, vec![pane_b]);
-    let window = Window::new(
-        WindowIndex(0),
-        WindowName::parse("shell").unwrap(),
-        Layout::parse("c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]").unwrap(),
+    let window = linked(
+        0,
+        "shell",
+        "c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]",
         panes,
-        PaneIndex(1),
-    )
-    .unwrap();
-    let session = Session::new(
-        SessionName::parse("restored-content").unwrap(),
-        NonEmpty::singleton(window),
-        WindowIndex(0),
-    )
-    .unwrap();
-    let snapshot = Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 5 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::singleton(session),
-    };
+        1,
+    );
+    let session = tree("restored-content", NonEmpty::singleton(window), 0);
+    let snapshot = snapshot(vec![session]);
 
     let restore_plan = plan(&snapshot);
     apply(&mut client, &restore_plan).expect("apply failed");
@@ -205,36 +182,24 @@ fn apply_relaunches_each_pane_captured_program() {
     let base = base.canonicalize().unwrap();
 
     let mut pane_a = pane(0, base.to_str().unwrap());
-    pane_a.program = CapturedProgram {
-        command: ProgramName::parse("echo").unwrap(),
-        argv: Some(NonEmpty::new(
+    pane_a.foreground = Foreground::Program {
+        argv: NonEmpty::new(
             "echo".to_string(),
             vec!["DISTINCTIVE-RELAUNCH-MARKER".to_string()],
-        )),
+        ),
     };
     let pane_b = pane(1, base.to_str().unwrap());
 
     let panes = NonEmpty::new(pane_a, vec![pane_b]);
-    let window = Window::new(
-        WindowIndex(0),
-        WindowName::parse("shell").unwrap(),
-        Layout::parse("c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]").unwrap(),
+    let window = linked(
+        0,
+        "shell",
+        "c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]",
         panes,
-        PaneIndex(0),
-    )
-    .unwrap();
-    let session = Session::new(
-        SessionName::parse("restored-relaunch").unwrap(),
-        NonEmpty::singleton(window),
-        WindowIndex(0),
-    )
-    .unwrap();
-    let snapshot = Snapshot {
-        format_version: FormatVersion::CURRENT,
-        tmux_version: TmuxVersion { major: 3, minor: 5 },
-        captured_at: OffsetDateTime::from_unix_timestamp(1_700_000_000),
-        sessions: NonEmpty::singleton(session),
-    };
+        0,
+    );
+    let session = tree("restored-relaunch", NonEmpty::singleton(window), 0);
+    let snapshot = snapshot(vec![session]);
 
     // Pane 0 captured a real foreground program; pane 1 was idle at its
     // shell (`pane()`'s absent argv), so only pane 0 contributes a relaunch.

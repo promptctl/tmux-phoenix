@@ -1,89 +1,79 @@
-//! The pure fold from flat `list-panes -a` rows into a `phoenix-core`
-//! domain tree (DESIGN.md §5). No I/O — testable against fixture text with
-//! no tmux running.
+//! The fold from flat `list-panes -a` rows into the `phoenix-core` graph
+//! (ARCHITECTURE.md §6): every window once, every session's winlinks by
+//! window id. Pure over its inputs — the per-pane reads (foreground,
+//! content) come in as a function the fold calls exactly once per pane, so
+//! a test folds fixture rows with a pure one and capture folds live rows
+//! with the one that asks the OS and tmux. There is no map to miss a key
+//! in: a pane's reads are whatever the function returned for it.
 //!
-//! Structure capture is all-or-nothing: any row that can't be placed (an
-//! empty name, an active flag that points nowhere) fails the whole fold
-//! rather than silently dropping a session/window/pane, so a torn tree is
-//! never produced.
+//! Structure capture is all-or-nothing: a row that can't be placed (an
+//! active flag that points nowhere, a shared window whose rows disagree)
+//! fails the whole fold rather than producing a torn graph.
 
 use phoenix_core::{
-    CapturedProgram, Layout, NonEmpty, Pane, PaneContent, PaneId, PaneIndex, ProgramName, Session,
-    SessionName, SnapshotError, Utf8PathBuf, Window, WindowIndex, WindowName,
+    Content, Foreground, NonEmpty, Pane, Session, SnapshotError, WinLink, Window, WindowId,
+    WindowIndex,
 };
 
 use crate::row::PaneRow;
 
+/// What capture learned about one pane beyond its row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldError {
+pub struct PaneReads {
+    pub foreground: Foreground,
+    pub content: Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldError<E> {
     NoSessions,
-    EmptySessionName,
-    EmptyWindowName {
-        session: String,
-        window_index: u32,
-    },
-    EmptyLayout {
-        session: String,
-        window_index: u32,
-    },
-    EmptyCommand {
-        session: String,
-        window_index: u32,
-        pane_index: u32,
-    },
     NoActiveWindow {
         session: String,
     },
     NoActivePane {
-        session: String,
-        window_index: u32,
+        window: WindowId,
+    },
+    /// A window linked by several sessions did not list the same panes
+    /// under each — the listing changed between rows.
+    TornWindow {
+        window: WindowId,
     },
     Snapshot(SnapshotError),
+    /// The per-pane read function failed in a way that is not one pane's
+    /// degradation (the connection itself).
+    Read(E),
 }
 
-impl std::fmt::Display for FoldError {
+impl<E: std::fmt::Display> std::fmt::Display for FoldError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FoldError::NoSessions => write!(f, "the server has no sessions to capture"),
-            FoldError::EmptySessionName => write!(f, "a list-panes row had an empty session name"),
-            FoldError::EmptyWindowName {
-                session,
-                window_index,
-            } => write!(
-                f,
-                "session {session:?} window {window_index} had an empty name"
-            ),
-            FoldError::EmptyLayout {
-                session,
-                window_index,
-            } => write!(
-                f,
-                "session {session:?} window {window_index} had an empty layout"
-            ),
-            FoldError::EmptyCommand {
-                session,
-                window_index,
-                pane_index,
-            } => write!(
-                f,
-                "session {session:?} window {window_index} pane {pane_index} had an empty command"
-            ),
             FoldError::NoActiveWindow { session } => {
                 write!(f, "session {session:?} had no window flagged active")
             }
-            FoldError::NoActivePane {
-                session,
-                window_index,
-            } => write!(
-                f,
-                "session {session:?} window {window_index} had no pane flagged active"
-            ),
+            FoldError::NoActivePane { window } => {
+                write!(f, "window {window} had no pane flagged active")
+            }
+            FoldError::TornWindow { window } => {
+                write!(
+                    f,
+                    "window {window} listed different panes under different sessions"
+                )
+            }
             FoldError::Snapshot(e) => write!(f, "{e}"),
+            FoldError::Read(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for FoldError {}
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for FoldError<E> {}
+
+/// The graph's two halves, ready for `Snapshot::new`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folded {
+    pub windows: NonEmpty<Window>,
+    pub sessions: NonEmpty<Session>,
+}
 
 /// Groups `items` by a key derived from each, preserving the order each key
 /// was first seen — deterministic output regardless of `list-panes`'s
@@ -100,260 +90,343 @@ fn group_by<T, K: PartialEq>(items: Vec<T>, key_of: impl Fn(&T) -> K) -> Vec<(K,
     groups
 }
 
-pub fn fold(
+pub fn fold<E>(
     rows: Vec<PaneRow>,
-    argv_of: &impl Fn(u32) -> Option<NonEmpty<String>>,
-    content_of: &impl Fn(u32) -> Option<PaneContent>,
-) -> Result<NonEmpty<Session>, FoldError> {
-    let by_session = group_by(rows, |r| r.session.clone());
-    let sessions = by_session
+    read: &mut impl FnMut(&PaneRow) -> Result<PaneReads, E>,
+) -> Result<Folded, FoldError<E>> {
+    let sessions = group_by(rows.iter().collect(), |r| r.session.clone())
         .into_iter()
-        .map(|(_, rows)| fold_session(rows, argv_of, content_of))
+        .map(|(_, rows)| fold_session(rows))
         .collect::<Result<Vec<_>, _>>()?;
     // [LAW:parse-dont-validate] the one conversion that stamps NonEmpty also rejects the empty server
-    NonEmpty::from_vec(sessions).ok_or(FoldError::NoSessions)
-}
+    let sessions = NonEmpty::from_vec(sessions).ok_or(FoldError::NoSessions)?;
 
-fn fold_session(
-    rows: Vec<PaneRow>,
-    argv_of: &impl Fn(u32) -> Option<NonEmpty<String>>,
-    content_of: &impl Fn(u32) -> Option<PaneContent>,
-) -> Result<Session, FoldError> {
-    let session_name = rows[0].session.clone();
-    let name = SessionName::parse(session_name.clone()).ok_or(FoldError::EmptySessionName)?;
-
-    let by_window = group_by(rows, |r| r.window_index);
-    let mut active_window: Option<WindowIndex> = None;
-    let windows = by_window
+    let windows = group_by(rows, |r| r.window_id)
         .into_iter()
-        .map(|(index, rows)| {
-            if rows.iter().any(|r| r.window_active) {
-                active_window = Some(WindowIndex(index));
-            }
-            fold_window(&session_name, index, rows, argv_of, content_of)
-        })
+        .map(|(_, rows)| fold_window(rows, read))
         .collect::<Result<Vec<_>, _>>()?;
     let windows =
         NonEmpty::from_vec(windows).expect("group_by never drops non-empty input to zero groups");
-    let active = active_window.ok_or_else(|| FoldError::NoActiveWindow {
-        session: session_name.clone(),
-    })?;
 
-    Session::new(name, windows, active).map_err(FoldError::Snapshot)
+    Ok(Folded { windows, sessions })
 }
 
-fn fold_window(
-    session_name: &str,
-    window_index: u32,
+fn fold_session<E>(rows: Vec<&PaneRow>) -> Result<Session, FoldError<E>> {
+    let name = rows[0].session.clone();
+    let group = rows[0].group.clone();
+    let mut active = None;
+    let mut last = None;
+    let links: Vec<WinLink> = group_by(rows, |r| r.window_index)
+        .into_iter()
+        .map(|(index, rows)| {
+            if rows[0].window_active {
+                active = Some(index);
+            }
+            if rows[0].window_last {
+                last = Some(index);
+            }
+            WinLink {
+                index,
+                window: rows[0].window_id,
+            }
+        })
+        .collect();
+    let links =
+        NonEmpty::from_vec(links).expect("group_by never drops non-empty input to zero groups");
+    let active: WindowIndex = active.ok_or_else(|| FoldError::NoActiveWindow {
+        session: name.as_str().to_string(),
+    })?;
+    Session::new(name, group, links, active, last).map_err(FoldError::Snapshot)
+}
+
+/// `rows` are every row for one window id: one per pane per winlink, and a
+/// session may link one window more than once (verified live: `link-window
+/// -s a:1 -t a:5` lists each pane twice under `a`). The panes are the first
+/// winlink's; every other winlink must have listed exactly the same ones.
+fn fold_window<E>(
     rows: Vec<PaneRow>,
-    argv_of: &impl Fn(u32) -> Option<NonEmpty<String>>,
-    content_of: &impl Fn(u32) -> Option<PaneContent>,
-) -> Result<Window, FoldError> {
-    let window_name = rows[0].window_name.clone();
-    let layout = rows[0].window_layout.clone();
-
-    let name = WindowName::parse(window_name).ok_or_else(|| FoldError::EmptyWindowName {
-        session: session_name.to_string(),
-        window_index,
-    })?;
-    let layout = Layout::parse(layout).ok_or_else(|| FoldError::EmptyLayout {
-        session: session_name.to_string(),
-        window_index,
-    })?;
-
-    let mut active_pane: Option<PaneIndex> = None;
-    let mut panes = Vec::with_capacity(rows.len());
-    for row in rows {
-        if row.pane_active {
-            active_pane = Some(PaneIndex(row.pane_index));
-        }
-        let command =
-            ProgramName::parse(row.pane_command).ok_or_else(|| FoldError::EmptyCommand {
-                session: session_name.to_string(),
-                window_index,
-                pane_index: row.pane_index,
-            })?;
-        panes.push(Pane {
-            id: PaneId(row.pane_id),
-            index: PaneIndex(row.pane_index),
-            cwd: Utf8PathBuf::parse(row.pane_cwd),
-            program: CapturedProgram {
-                command,
-                argv: argv_of(row.pane_pid),
-            },
-            content: content_of(row.pane_id),
-        });
+    read: &mut impl FnMut(&PaneRow) -> Result<PaneReads, E>,
+) -> Result<Window, FoldError<E>> {
+    let id = rows[0].window_id;
+    let winlinks = group_by(rows.iter().collect(), |r| {
+        (r.session.clone(), r.window_index)
+    })
+    .len();
+    let by_pane = group_by(rows, |r| r.pane_id);
+    if by_pane.iter().any(|(_, rows)| rows.len() != winlinks) {
+        return Err(FoldError::TornWindow { window: id });
     }
+
+    let mut active = None;
+    let mut panes = Vec::with_capacity(by_pane.len());
+    let mut first: Option<PaneRow> = None;
+    for (_, rows) in by_pane {
+        let row = &rows[0];
+        if row.pane_active {
+            active = Some(row.pane_index);
+        }
+        let reads = read(row).map_err(FoldError::Read)?;
+        panes.push(Pane {
+            id: row.pane_id,
+            index: row.pane_index,
+            cwd: row.cwd.clone(),
+            foreground: reads.foreground,
+            content: reads.content,
+        });
+        first.get_or_insert_with(|| row.clone());
+    }
+    let first = first.expect("group_by never drops non-empty input to zero groups");
     let panes =
         NonEmpty::from_vec(panes).expect("group_by never drops non-empty input to zero groups");
-    let active = active_pane.ok_or_else(|| FoldError::NoActivePane {
-        session: session_name.to_string(),
-        window_index,
-    })?;
-
-    Window::new(WindowIndex(window_index), name, layout, panes, active).map_err(FoldError::Snapshot)
+    let active = active.ok_or(FoldError::NoActivePane { window: id })?;
+    Window::new(
+        id,
+        first.made,
+        first.window_name,
+        first.window_layout,
+        first.window_zoomed,
+        panes,
+        active,
+    )
+    .map_err(FoldError::Snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::{
+        ContentFailure, Cwd, HistoryIndicator, Layout, Made, PaneId, PaneIndex, SessionName,
+        WindowName,
+    };
+    use std::convert::Infallible;
 
-    #[allow(clippy::too_many_arguments)]
-    fn row(
-        session: &str,
+    struct Spec {
+        session: &'static str,
         window_index: u32,
-        window_name: &str,
+        window_id: u32,
         window_active: bool,
+        window_last: bool,
         pane_index: u32,
-        pane_active: bool,
-        pane_pid: u32,
         pane_id: u32,
-    ) -> PaneRow {
+        pane_active: bool,
+    }
+
+    fn row(spec: Spec) -> PaneRow {
         PaneRow {
-            session: session.to_string(),
-            window_index,
-            window_name: window_name.to_string(),
-            window_layout: "b25d,80x24,0,0,0".to_string(),
-            window_active,
-            pane_index,
-            pane_cwd: "/home/user".to_string(),
-            pane_command: "zsh".to_string(),
-            pane_active,
-            pane_pid,
-            pane_id,
+            session: SessionName::parse(spec.session).unwrap(),
+            group: None,
+            window_index: WindowIndex(spec.window_index),
+            window_id: WindowId(spec.window_id),
+            window_name: WindowName::parse("shell").unwrap(),
+            window_layout: Layout::parse("b25d,80x24,0,0,0").unwrap(),
+            window_active: spec.window_active,
+            window_last: spec.window_last,
+            window_zoomed: false,
+            made: Made::NotByPhoenix,
+            pane_index: PaneIndex(spec.pane_index),
+            pane_id: PaneId(spec.pane_id),
+            pane_pid: 100 + spec.pane_id,
+            cwd: Cwd::parse("/home/user"),
+            pane_active: spec.pane_active,
+            indicator: HistoryIndicator {
+                history_size: 0,
+                history_bytes: 0,
+            },
         }
     }
 
-    fn no_argv(_pid: u32) -> Option<NonEmpty<String>> {
-        None
+    fn simple(
+        session: &'static str,
+        window_index: u32,
+        window_id: u32,
+        window_active: bool,
+        pane_index: u32,
+        pane_id: u32,
+        pane_active: bool,
+    ) -> PaneRow {
+        row(Spec {
+            session,
+            window_index,
+            window_id,
+            window_active,
+            window_last: false,
+            pane_index,
+            pane_id,
+            pane_active,
+        })
     }
 
-    fn no_content(_pane_id: u32) -> Option<PaneContent> {
-        None
+    fn shell(_row: &PaneRow) -> Result<PaneReads, Infallible> {
+        Ok(PaneReads {
+            foreground: Foreground::Shell,
+            content: Content::NotCaptured {
+                reason: ContentFailure::NotRecorded,
+            },
+        })
     }
 
     #[test]
     fn folds_a_single_session_single_window_single_pane() {
-        let rows = vec![row("main", 0, "shell", true, 0, true, 100, 1)];
-        let sessions = fold(rows, &no_argv, &no_content).unwrap();
-        assert_eq!(sessions.len(), 1);
-        let session = sessions.first();
+        let rows = vec![simple("main", 0, 0, true, 0, 1, true)];
+        let folded = fold(rows, &mut shell).unwrap();
+        assert_eq!(folded.sessions.len(), 1);
+        assert_eq!(folded.windows.len(), 1);
+        let session = folded.sessions.first();
         assert_eq!(session.name().as_str(), "main");
-        assert_eq!(session.active_window().active_pane().index.0, 0);
+        assert_eq!(session.active_link().window, WindowId(0));
+        assert_eq!(folded.windows.first().active_pane().index.0, 0);
     }
 
     #[test]
     fn folding_no_rows_is_a_no_sessions_error() {
-        assert_eq!(
-            fold(vec![], &no_argv, &no_content).err(),
-            Some(FoldError::NoSessions)
-        );
+        assert_eq!(fold(vec![], &mut shell).err(), Some(FoldError::NoSessions));
     }
 
     #[test]
     fn groups_multiple_sessions_windows_and_panes() {
         let rows = vec![
-            row("main", 0, "shell", false, 0, true, 100, 1),
-            row("main", 1, "editor", true, 0, true, 101, 2),
-            row("other", 0, "shell", true, 0, false, 200, 3),
-            row("other", 0, "shell", true, 1, true, 201, 4),
+            simple("main", 0, 0, false, 0, 1, true),
+            simple("main", 1, 1, true, 0, 2, true),
+            simple("other", 0, 2, true, 0, 3, false),
+            simple("other", 0, 2, true, 1, 4, true),
         ];
-        let sessions = fold(rows, &no_argv, &no_content).unwrap();
-        assert_eq!(sessions.len(), 2);
-        let main = sessions.first();
+        let folded = fold(rows, &mut shell).unwrap();
+        assert_eq!(folded.sessions.len(), 2);
+        assert_eq!(folded.windows.len(), 3);
+        let main = folded.sessions.first();
         assert_eq!(main.windows().len(), 2);
         assert_eq!(main.active().0, 1);
-        let other = sessions.last();
-        assert_eq!(other.active_window().panes().len(), 2);
-        assert_eq!(other.active_window().active_pane().index.0, 1);
+        let other = folded.sessions.last();
+        assert_eq!(other.active_link().window, WindowId(2));
+        let w2 = folded.windows.last();
+        assert_eq!(w2.panes().len(), 2);
+        assert_eq!(w2.active_pane().index.0, 1);
     }
 
     #[test]
-    fn fails_when_no_window_is_flagged_active() {
-        let rows = vec![row("main", 0, "shell", false, 0, true, 100, 1)];
-        let err = fold(rows, &no_argv, &no_content).unwrap_err();
+    fn a_window_linked_by_two_sessions_is_folded_once_and_read_once_per_pane() {
+        // `list-panes -a` lists a shared window once per session that links
+        // it (verified live on 3.7b); the fold must not duplicate it.
+        let rows = vec![
+            simple("alpha", 1, 0, true, 0, 0, true),
+            simple("alpha", 2, 1, false, 0, 1, true),
+            simple("beta", 1, 0, false, 0, 0, true),
+            simple("beta", 2, 1, true, 0, 1, true),
+        ];
+        let mut reads = 0;
+        let folded = fold(rows, &mut |r| {
+            reads += 1;
+            shell(r)
+        })
+        .unwrap();
+        assert_eq!(folded.windows.len(), 2);
+        assert_eq!(reads, 2);
+        for session in folded.sessions.iter() {
+            assert_eq!(session.windows().len(), 2);
+        }
+        assert_eq!(folded.sessions.first().active_link().window, WindowId(0));
+        assert_eq!(folded.sessions.last().active_link().window, WindowId(1));
+    }
+
+    #[test]
+    fn a_window_linked_twice_into_one_session_is_two_winlinks_to_one_window() {
+        // `link-window -s a:1 -t a:5` is legal and lists each pane of the
+        // window once per winlink (verified live on 3.7b).
+        let rows = vec![
+            simple("alpha", 1, 0, true, 0, 0, true),
+            simple("alpha", 5, 0, false, 0, 0, true),
+        ];
+        let mut reads = 0;
+        let folded = fold(rows, &mut |r| {
+            reads += 1;
+            shell(r)
+        })
+        .unwrap();
+        assert_eq!(folded.windows.len(), 1);
+        assert_eq!(reads, 1);
+        let links = folded.sessions.first().windows();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|l| l.window == WindowId(0)));
+    }
+
+    #[test]
+    fn a_shared_window_whose_sessions_disagree_on_panes_is_torn() {
+        let rows = vec![
+            simple("alpha", 1, 0, true, 0, 0, true),
+            simple("beta", 1, 0, true, 0, 0, true),
+            simple("beta", 1, 0, true, 1, 9, false),
+        ];
         assert_eq!(
-            err,
+            fold(rows, &mut shell).unwrap_err(),
+            FoldError::TornWindow {
+                window: WindowId(0)
+            }
+        );
+    }
+
+    #[test]
+    fn last_window_and_group_are_carried() {
+        let mut rows = vec![
+            simple("main", 0, 0, false, 0, 1, true),
+            simple("main", 1, 1, true, 0, 2, true),
+        ];
+        rows[0].window_last = true;
+        rows[0].group = phoenix_core::GroupName::parse("g");
+        rows[1].group = phoenix_core::GroupName::parse("g");
+        let folded = fold(rows, &mut shell).unwrap();
+        let main = folded.sessions.first();
+        assert_eq!(main.last(), Some(WindowIndex(0)));
+        assert_eq!(main.group().unwrap().as_str(), "g");
+    }
+
+    #[test]
+    fn fails_when_no_window_or_pane_is_flagged_active() {
+        assert_eq!(
+            fold(vec![simple("main", 0, 0, false, 0, 1, true)], &mut shell).unwrap_err(),
             FoldError::NoActiveWindow {
                 session: "main".to_string()
             }
         );
-    }
-
-    #[test]
-    fn fails_when_no_pane_is_flagged_active() {
-        let rows = vec![row("main", 0, "shell", true, 0, false, 100, 1)];
-        let err = fold(rows, &no_argv, &no_content).unwrap_err();
         assert_eq!(
-            err,
+            fold(vec![simple("main", 0, 0, true, 0, 1, false)], &mut shell).unwrap_err(),
             FoldError::NoActivePane {
-                session: "main".to_string(),
-                window_index: 0
+                window: WindowId(0)
             }
         );
     }
 
     #[test]
-    fn passes_recovered_argv_through_to_captured_program() {
-        let rows = vec![row("main", 0, "shell", true, 0, true, 100, 1)];
-        let sessions = fold(
-            rows,
-            &|pid| {
-                assert_eq!(pid, 100);
-                Some(NonEmpty::new(
-                    "vim".to_string(),
-                    vec!["DESIGN.md".to_string()],
-                ))
-            },
-            &no_content,
-        )
-        .unwrap();
-        let pane = sessions.first().active_window().active_pane();
-        let argv: Vec<_> = pane.program.argv.clone().unwrap().into_iter().collect();
-        assert_eq!(argv, vec!["vim", "DESIGN.md"]);
+    fn a_read_failure_that_is_not_a_panes_fails_the_fold() {
+        let rows = vec![simple("main", 0, 0, true, 0, 1, true)];
+        let err = fold(rows, &mut |_: &PaneRow| Err::<PaneReads, _>("link down")).unwrap_err();
+        assert_eq!(err, FoldError::Read("link down"));
     }
 
     #[test]
-    fn an_empty_cwd_is_a_typed_absence_not_an_empty_path() {
-        let mut r = row("main", 0, "shell", true, 0, true, 100, 1);
-        r.pane_cwd = String::new();
-        let sessions = fold(vec![r], &no_argv, &no_content).unwrap();
-        assert_eq!(sessions.first().active_window().active_pane().cwd, None);
-    }
-
-    #[test]
-    fn an_empty_command_fails_the_fold() {
-        let mut r = row("main", 0, "shell", true, 0, true, 100, 1);
-        r.pane_command = String::new();
-        let err = fold(vec![r], &no_argv, &no_content).unwrap_err();
-        assert_eq!(
-            err,
-            FoldError::EmptyCommand {
-                session: "main".to_string(),
-                window_index: 0,
-                pane_index: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn passes_captured_content_through_keyed_by_pane_id_not_pane_pid() {
-        // pane_pid and pane_id are deliberately different values here, so a
-        // fold that mixed them up would fail this test.
-        let rows = vec![row("main", 0, "shell", true, 0, true, 100, 42)];
-        let sessions = fold(rows, &no_argv, &|pane_id| {
-            assert_eq!(pane_id, 42);
-            Some(PaneContent::new(
-                5,
-                512,
-                vec!["scrollback".to_string()],
-                vec!["visible".to_string()],
-            ))
+    fn the_reads_land_on_the_pane_they_were_made_for() {
+        let rows = vec![
+            simple("main", 0, 0, true, 0, 7, true),
+            simple("main", 0, 0, true, 1, 8, false),
+        ];
+        let folded = fold(rows, &mut |r: &PaneRow| {
+            Ok::<_, Infallible>(PaneReads {
+                foreground: Foreground::Program {
+                    argv: NonEmpty::singleton(format!("prog-{}", r.pane_id)),
+                },
+                content: Content::NotCaptured {
+                    reason: ContentFailure::NotRecorded,
+                },
+            })
         })
         .unwrap();
-        let pane = sessions.first().active_window().active_pane();
-        let content = pane.content.as_ref().unwrap();
-        assert_eq!(content.scrollback, vec!["scrollback"]);
-        assert_eq!(content.visible, vec!["visible"]);
+        let panes = folded.windows.first().panes();
+        for pane in panes.iter() {
+            assert_eq!(
+                pane.foreground,
+                Foreground::Program {
+                    argv: NonEmpty::singleton(format!("prog-{}", pane.id))
+                }
+            );
+        }
     }
 }

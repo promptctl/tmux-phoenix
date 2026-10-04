@@ -81,16 +81,19 @@ fn save_then_list_round_trips_through_the_real_binary() {
     let fields: Vec<&str> = lines[0].split('\t').collect();
     assert_eq!(
         fields.len(),
-        3,
-        "expected captured_at\\tformat_version\\tpath"
+        5,
+        "expected captured_at\\tformat_version\\torigin\\ttag\\tpath"
     );
-    assert_eq!(fields[2], saved_path);
+    assert_eq!(fields[1], "2");
+    assert_ne!(fields[2], "-", "a fresh save records its server's identity");
+    assert_eq!(fields[3], "-");
+    assert_eq!(fields[4], saved_path);
 
     let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
     let loaded = store
         .load_latest()
         .expect("saved snapshot should load back");
-    assert_eq!(loaded.sessions.first().name().as_str(), harness.session);
+    assert_eq!(loaded.sessions().first().name().as_str(), harness.session);
 }
 
 #[test]
@@ -111,6 +114,31 @@ fn save_exit_code_is_zero_when_a_pane_is_idle() {
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&save.stderr)
+    );
+}
+
+#[test]
+fn save_refuses_a_server_holding_only_a_bootstrap_session_and_writes_nothing() {
+    // A fresh `tmux` from a login terminal: one session, one window, one
+    // idle shell. Publishing it would replace the generation it is about to
+    // be restored from.
+    let harness = IsolatedTmux::new("cli-bootstrap-refused");
+    let data_dir = TestDataDir::new("bootstrap-refused");
+
+    harness.wait_until_settled();
+    let save = Command::new(phoenix_bin())
+        .args(["save", "--socket", &harness.socket])
+        .env("XDG_DATA_HOME", &data_dir.0)
+        .output()
+        .expect("failed to run phoenix save");
+
+    assert_eq!(save.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&save.stderr);
+    assert!(stderr.contains("not saved"), "stderr: {stderr}");
+    let store = phoenix_store::Store::new(data_dir.0.join("tmux-phoenix"));
+    assert!(
+        store.list().expect("an empty store lists").is_empty(),
+        "a refused save must leave no generation behind"
     );
 }
 
@@ -245,7 +273,12 @@ fn restore_rebuilds_a_killed_session_onto_the_same_server() {
         .env("XDG_DATA_HOME", &data_dir.0)
         .output()
         .expect("failed to run phoenix save");
-    assert!(save.status.success());
+    assert!(
+        save.status.success(),
+        "phoenix save: {:?} stderr={}",
+        save.status.code(),
+        String::from_utf8_lossy(&save.stderr)
+    );
 
     // This is the populated-server case (tmux-parity-ure.1 criterion 3): a
     // second, unrelated session survives, so restore attaches to the live
@@ -479,7 +512,7 @@ fn daemon_saves_after_a_structural_change_through_the_real_binary() {
 
     let saved = saved.expect("expected the daemon to have saved after the debounce settled");
     assert_eq!(
-        saved.sessions.first().active_window().panes().len(),
+        saved.active_window(saved.sessions().first()).panes().len(),
         2,
         "the save should reflect the split that triggered it"
     );

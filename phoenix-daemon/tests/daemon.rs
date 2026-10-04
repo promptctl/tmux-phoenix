@@ -111,7 +111,7 @@ fn daemon_saves_after_a_structural_change_settles() {
         .load_latest()
         .expect("expected the debounced save to have happened");
     assert_eq!(
-        saved.sessions.first().active_window().panes().len(),
+        saved.active_window(saved.sessions().first()).panes().len(),
         2,
         "the save should reflect the split that triggered it"
     );
@@ -194,14 +194,20 @@ fn run_over_a_login_server(
     let prior = IsolatedTmux::new(&format!("{name}-prior"));
     prior.build();
     let mut prior_client = connect(&prior, &StructureActivity::new());
-    let prior_state =
-        phoenix_capture::capture(&mut prior_client, phoenix_capture::ContentCapture::Off)
-            .expect("failed to capture the prior state");
+    let prior_state = phoenix_capture::capture(
+        &mut prior_client,
+        &phoenix_capture::Previous::default(),
+        &phoenix_core::Shells::default(),
+    )
+    .expect("failed to capture the prior state");
     prior_client.close();
     store
         .save(
             &prior_state,
-            std::num::NonZeroUsize::new(5).unwrap(),
+            None,
+            phoenix_store::Retention {
+                keep_untagged: std::num::NonZeroUsize::new(5).unwrap(),
+            },
             Duration::ZERO,
         )
         .expect("failed to seed the prior state");
@@ -252,12 +258,7 @@ fn a_bootstrap_only_server_never_replaces_latest_and_reopens_a_declined_boot() {
 
     assert!(errors.is_empty(), "unexpected daemon errors: {errors:?}");
     assert!(
-        matches!(
-            result,
-            Err(phoenix_daemon::DaemonError::Store(
-                phoenix_store::StoreError::BootstrapOnly
-            ))
-        ),
+        matches!(result, Err(phoenix_daemon::DaemonError::BootstrapOnly)),
         "the declined save should end the run: {result:?}"
     );
 }
